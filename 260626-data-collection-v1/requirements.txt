@@ -1,0 +1,11 @@
+# Install PyTorch separately on Raspberry Pi 4 arm64:
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# Then install the remaining experiment dependencies:
+# pip3 install -r requirements.txt
+
+datasets>=5.0.0
+flwr>=1.32.0
+numpy>=2.0.0
+pillow>=10.0.0
+psutil>=7.0.0

@@ -19,7 +19,7 @@ DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_NUM_CLIENTS = 10
 DEFAULT_BASE_SEED = 260626
 DEFAULT_SERVER_ADDRESS = "0.0.0.0:8080"
-DEFAULT_REMOTE_PROJECT_DIR = "/home/pi/260626-data-collection-v1"
+DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/260626-data-collection-v1"
 
 DEVICES = [
     {"client_id": "client_0", "host": "192.168.0.112"},
@@ -36,7 +36,7 @@ DEVICES = [
 
 DEFAULT_AUGMENT = {
     "enabled": True,
-    "resize": [64, 64],
+    "resize": [224, 224],
     "horizontal_flip": True,
     "normalize": True,
 }
