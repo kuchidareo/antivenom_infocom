@@ -14,6 +14,7 @@ from experiment_config import (
     set_all_seeds,
 )
 from hardware_logger import HardwareLogger, TrainingState
+from metrics_logger import MetricsLogger
 from models import get_model
 from training_utils import evaluate_model, get_parameters, set_parameters, train_model
 
@@ -25,6 +26,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
         self.augment = augment_from_args(args)
         self.num_classes = get_num_classes(args.data_dir)
         self.model = get_model(args.model, num_classes=self.num_classes)
+        self.metrics_logger = None
 
     def get_parameters(self, config: Dict[str, str]) -> List:
         return get_parameters(self.model)
@@ -51,6 +53,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
             learning_rate=float(config.get("learning_rate", self.args.learning_rate)),
             state=self.state,
             round_id=current_round,
+            metrics_logger=self.metrics_logger,
         )
         metrics.update({"client_id": self.args.client_id, "poisoning_method": poisoning_method})
         return get_parameters(self.model), len(train_loader.dataset), metrics
@@ -69,7 +72,13 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
             batch_size=self.args.batch_size,
             shuffle=False,
         )
-        metrics = evaluate_model(model=self.model, data_loader=eval_loader, state=self.state, round_id=current_round)
+        metrics = evaluate_model(
+            model=self.model,
+            data_loader=eval_loader,
+            state=self.state,
+            round_id=current_round,
+            metrics_logger=self.metrics_logger,
+        )
         return float(metrics["loss"]), len(eval_loader.dataset), {"accuracy": float(metrics["accuracy"])}
 
 
@@ -114,7 +123,11 @@ def main() -> None:
         attack_name="adaptive_min_min_samplewise" if is_poisoned else "",
     )
     client = TrashNetFlowerClient(args, state)
-    with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state):
+    with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state) as logger:
+        client.metrics_logger = MetricsLogger(
+            path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
+            condition=condition,
+        )
         fl.client.start_numpy_client(server_address=args.server_address, client=client)
 
 

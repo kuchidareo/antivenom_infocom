@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 import psutil
 
-from experiment_config import CSV_COLUMNS, yyyymmss_log_path
+from experiment_config import CSV_COLUMNS, yyyymmddhhmmss_log_path
 
 
 PHASES = {
@@ -92,7 +92,7 @@ class HardwareLogger:
         self.training_state = training_state or TrainingState()
         self.pid = pid or os.getpid()
         self.interval = 1.0 / fps
-        self.path = yyyymmss_log_path(log_dir)
+        self.path = yyyymmddhhmmss_log_path(log_dir)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._process = psutil.Process(self.pid)

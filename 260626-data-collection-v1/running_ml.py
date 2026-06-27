@@ -2,6 +2,10 @@ import argparse
 
 from dataset_preparation import get_dataloader, get_num_classes, prepare_dataset
 from experiment_config import (
+    DEFAULT_LOCAL_ML_LOG_DIR,
+    DEFAULT_LOCAL_ML_ANALYSIS_TRIALS,
+    DEFAULT_LOCAL_ML_EPOCHS,
+    DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS,
     add_common_args,
     augment_from_args,
     condition_columns,
@@ -9,6 +13,7 @@ from experiment_config import (
     set_all_seeds,
 )
 from hardware_logger import HardwareLogger, TrainingState
+from metrics_logger import MetricsLogger
 from models import get_model
 from training_utils import evaluate_model, train_model
 
@@ -56,6 +61,10 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         attack_name="adaptive_min_min_samplewise" if poisoning_method == "adaptive" else "",
     )
     with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state) as logger:
+        metrics_logger = MetricsLogger(
+            path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
+            condition=condition,
+        )
         train_model(
             model=model,
             train_loader=train_loader,
@@ -63,16 +72,25 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
             learning_rate=args.learning_rate,
             state=state,
             round_id=0,
+            metrics_logger=metrics_logger,
         )
-        evaluate_model(model=model, data_loader=eval_loader, state=state, round_id=0)
+        evaluate_model(
+            model=model,
+            data_loader=eval_loader,
+            state=state,
+            round_id=0,
+            metrics_logger=metrics_logger,
+        )
     return str(logger.path)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_args(parser)
+    parser.set_defaults(local_epochs=DEFAULT_LOCAL_ML_EPOCHS, log_dir=DEFAULT_LOCAL_ML_LOG_DIR)
     parser.add_argument("--poisoning-method", choices=["clean", "adaptive", "both"], default="both")
-    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--reference-trials", type=int, default=DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS)
+    parser.add_argument("--trials", type=int, default=DEFAULT_LOCAL_ML_ANALYSIS_TRIALS)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 
@@ -96,10 +114,19 @@ def main() -> None:
 
     methods = ["clean", "adaptive"] if args.poisoning_method == "both" else [args.poisoning_method]
     base_seed = args.seed
+
+    for reference_idx in range(args.reference_trials):
+        args.trial_id = f"reference_{reference_idx}"
+        args.seed = base_seed + reference_idx
+        args.run_role = "global_clean_reference"
+        run_one_local(args, "clean")
+
+    analysis_seed_offset = 1000
     for trial in range(args.trials):
         for method in methods:
-            args.trial_id = trial
-            args.seed = base_seed + trial
+            args.trial_id = f"trial_{trial}"
+            args.seed = base_seed + analysis_seed_offset + trial
+            args.run_role = "analysis"
             run_one_local(args, method)
 
 

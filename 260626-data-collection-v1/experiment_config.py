@@ -11,15 +11,30 @@ import numpy as np
 DATASET_NAME = "kuchidareo/small_trashnet"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_LOG_DIR = "logs"
+DEFAULT_LOCAL_ML_LOG_DIR = "logs/local_ml"
+DEFAULT_FL_LOG_DIR = "logs/fl"
 DEFAULT_MODEL = "simple_cnn"
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_LOCAL_EPOCHS = 1
-DEFAULT_NUM_ROUNDS = 5
+DEFAULT_NUM_ROUNDS = 10
+DEFAULT_LOCAL_ML_EPOCHS = 10
+DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS = 5
+DEFAULT_LOCAL_ML_ANALYSIS_TRIALS = 5
+DEFAULT_LOCAL_ML_TRIALS = DEFAULT_LOCAL_ML_ANALYSIS_TRIALS
+DEFAULT_CLEAN_REFERENCE_TRIALS = DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS
+DEFAULT_OT_REFERENCE_TRIAL_IDS = [f"reference_{idx}" for idx in range(DEFAULT_CLEAN_REFERENCE_TRIALS)]
+DEFAULT_FL_LOCAL_EPOCHS = 1
+DEFAULT_FL_NUM_ROUNDS = 10
+DEFAULT_FL_TRIALS = 5
 DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_NUM_CLIENTS = 10
 DEFAULT_BASE_SEED = 260626
-DEFAULT_SERVER_ADDRESS = "0.0.0.0:8080"
-DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/260626-data-collection-v1"
+DEFAULT_SERVER_ADDRESS = "192.168.0.110:8080"
+DEFAULT_FL_SERVER_BIND_ADDRESS = "0.0.0.0:8080"
+DEFAULT_FL_CLIENT_SERVER_ADDRESS = "192.168.0.110:8080"
+DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/kuchida/antivenom_infocom/260626-data-collection-v1"
+DEFAULT_REMOTE_PYTHON = "/home/rasheed/kuchida/antivenom_infocom/venv/bin/python"
+DEFAULT_SSH_USER = "rasheed"
 
 DEVICES = [
     {"client_id": "client_0", "host": "192.168.0.112"},
@@ -46,6 +61,7 @@ CSV_COLUMNS = [
     "timestamp_unix",
     "experiment_id",
     "run_type",
+    "run_role",
     "device_id",
     "client_id",
     "host",
@@ -89,6 +105,52 @@ CSV_COLUMNS = [
     "process_ctx_switches_voluntary",
     "process_ctx_switches_involuntary",
     "process_minor_faults",
+]
+
+CONDITION_COLUMNS = [
+    "experiment_id",
+    "run_type",
+    "run_role",
+    "device_id",
+    "client_id",
+    "host",
+    "trial_id",
+    "seed",
+    "dataset",
+    "dataset_split",
+    "partition_method",
+    "num_clients",
+    "client_partition_id",
+    "model",
+    "batch_size",
+    "local_epochs",
+    "num_rounds",
+    "learning_rate",
+    "augment_enabled",
+    "augment_resize",
+    "augment_horizontal_flip",
+    "augment_normalize",
+    "poisoning_method",
+    "is_poisoned_client",
+    "poisoned_client_count",
+    "poisoned_client_ids",
+    "poison_fraction",
+    "attack_name",
+]
+
+METRIC_COLUMNS = [
+    "timestamp",
+    "timestamp_unix",
+    *CONDITION_COLUMNS,
+    "round",
+    "epoch",
+    "batch_idx",
+    "phase",
+    "metric_event",
+    "metric_split",
+    "loss",
+    "accuracy",
+    "num_examples",
 ]
 
 
@@ -142,13 +204,9 @@ def set_all_seeds(seed: int) -> None:
         pass
 
 
-def yyyymmss_log_path(log_dir: str, suffix: str = ".csv") -> Path:
-    """Return a collision-resistant path using the requested yyyymmss format.
-
-    The requested format is implemented literally as YYYY + MM + SS. Since it
-    omits day/hour/minute, repeated runs can collide; suffixes preserve all logs.
-    """
-    base = datetime.now().strftime("%Y%m%S")
+def yyyymmddhhmmss_log_path(log_dir: str, suffix: str = ".csv") -> Path:
+    """Return a collision-resistant path using yyyymmddhhmmss format."""
+    base = datetime.now().strftime("%Y%m%d%H%M%S")
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
     candidate = directory / f"{base}{suffix}"
@@ -171,7 +229,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-rounds", type=int, default=DEFAULT_NUM_ROUNDS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--num-clients", type=int, default=DEFAULT_NUM_CLIENTS)
-    parser.add_argument("--trial-id", type=int, default=0)
+    parser.add_argument("--trial-id", default="trial_0")
     parser.add_argument("--seed", type=int, default=DEFAULT_BASE_SEED)
     parser.add_argument("--device-id", default="")
     parser.add_argument("--client-id", default="client_0")
@@ -201,17 +259,19 @@ def condition_columns(
     augment = augment_from_args(args)
     client_id = getattr(args, "client_id", "")
     host = getattr(args, "host", "") or get_device(client_id).get("host", "")
+    trial_id = getattr(args, "trial_id", "trial_0")
     experiment_id = getattr(args, "experiment_id", "") or (
-        f"{run_type}_{poisoning_method}_trial{getattr(args, 'trial_id', 0)}_{client_id}"
+        f"{run_type}_{poisoning_method}_{trial_id}_{client_id}"
     )
     poisoned_ids = list(poisoned_client_ids or [])
     return {
         "experiment_id": experiment_id,
         "run_type": run_type,
+        "run_role": getattr(args, "run_role", ""),
         "device_id": getattr(args, "device_id", "") or host,
         "client_id": client_id,
         "host": host,
-        "trial_id": getattr(args, "trial_id", 0),
+        "trial_id": trial_id,
         "seed": getattr(args, "seed", DEFAULT_BASE_SEED),
         "dataset": getattr(args, "dataset", DATASET_NAME),
         "dataset_split": getattr(args, "dataset_split", "train"),

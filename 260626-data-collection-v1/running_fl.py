@@ -9,8 +9,15 @@ from typing import List
 
 from dataset_preparation import prepare_dataset
 from experiment_config import (
+    DEFAULT_FL_CLIENT_SERVER_ADDRESS,
+    DEFAULT_FL_LOG_DIR,
+    DEFAULT_FL_LOCAL_EPOCHS,
+    DEFAULT_FL_NUM_ROUNDS,
+    DEFAULT_FL_SERVER_BIND_ADDRESS,
+    DEFAULT_FL_TRIALS,
+    DEFAULT_REMOTE_PYTHON,
     DEFAULT_REMOTE_PROJECT_DIR,
-    DEFAULT_SERVER_ADDRESS,
+    DEFAULT_SSH_USER,
     DEVICES,
     add_common_args,
     augment_from_args,
@@ -78,9 +85,22 @@ def _start_clients(args: argparse.Namespace, seed: int, poisoned_ids: List[str])
     processes = []
     for device in DEVICES[: args.num_clients]:
         remote_command = _client_command(args, device, seed, poisoned_ids)
-        command = ["ssh", device["host"], remote_command]
+        target = f"{args.ssh_user}@{device['host']}" if args.ssh_user else device["host"]
+        command = ["ssh", target, remote_command]
+        if args.ssh_password:
+            command = [
+                "sshpass",
+                "-p",
+                args.ssh_password,
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                target,
+                remote_command,
+            ]
         if args.dry_run:
-            print(" ".join(shlex.quote(part) for part in command))
+            redacted = ["******" if part == args.ssh_password else part for part in command]
+            print(" ".join(shlex.quote(part) for part in redacted))
             continue
         processes.append(subprocess.Popen(command))
     return processes
@@ -127,12 +147,19 @@ def run_trial(args: argparse.Namespace, poisoned_client_count: int, trial_id: in
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_args(parser)
-    parser.add_argument("--server-address", default=DEFAULT_SERVER_ADDRESS)
-    parser.add_argument("--client-server-address", required=True)
+    parser.set_defaults(
+        local_epochs=DEFAULT_FL_LOCAL_EPOCHS,
+        num_rounds=DEFAULT_FL_NUM_ROUNDS,
+        log_dir=DEFAULT_FL_LOG_DIR,
+    )
+    parser.add_argument("--server-address", default=DEFAULT_FL_SERVER_BIND_ADDRESS)
+    parser.add_argument("--client-server-address", default=DEFAULT_FL_CLIENT_SERVER_ADDRESS)
     parser.add_argument("--remote-project-dir", default=DEFAULT_REMOTE_PROJECT_DIR)
-    parser.add_argument("--remote-python", default="python3")
+    parser.add_argument("--remote-python", default=DEFAULT_REMOTE_PYTHON)
+    parser.add_argument("--ssh-user", default=DEFAULT_SSH_USER)
+    parser.add_argument("--ssh-password", default="")
     parser.add_argument("--poisoned-client-counts", default="1,4")
-    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--trials", type=int, default=DEFAULT_FL_TRIALS)
     parser.add_argument("--client-start-delay", type=float, default=3.0)
     parser.add_argument("--server-log-hardware", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
