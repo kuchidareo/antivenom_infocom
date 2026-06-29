@@ -2,7 +2,9 @@ import argparse
 import csv
 import json
 import os
+import random
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -14,6 +16,13 @@ from experiment_config import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_DATA_DIR,
     DEFAULT_NUM_CLIENTS,
+    DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
+    DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
+    DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
+    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_CLEAN,
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+    POISONING_METHOD_TARGET_LABEL_FLIPPING,
     add_common_args,
     augment_from_args,
     client_index,
@@ -45,7 +54,12 @@ def prepared_data_exists(data_dir: str, num_clients: int = DEFAULT_NUM_CLIENTS) 
     root = _dataset_root(data_dir)
     if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
         return False
-    for mode in ("clean", "poisoned/adaptive"):
+    for mode in (
+        "clean",
+        "poisoned/adaptive",
+        "poisoned/random_label_flipping",
+        "poisoned/target_label_flipping",
+    ):
         for idx in range(num_clients):
             if not (root / mode / f"client_{idx}").exists():
                 return False
@@ -208,6 +222,77 @@ def _fallback_min_min(images: Any, labels: Any, model: Any, criterion: Any, epsi
     return perturbed
 
 
+def _copy_clean_image(record: Dict[str, Any], output_root: Path) -> Path:
+    out_path = output_root / record["client_id"] / record["relative_path"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(record["clean_path"], out_path)
+    return out_path
+
+
+def _class_name_for_label(class_names: Sequence[str], label: int) -> str:
+    return class_names[label] if 0 <= label < len(class_names) else str(label)
+
+
+def _make_label_flip_rows(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    method: str,
+    output_root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    random_flip_fraction: float,
+    target_label: int,
+    replacement_label: int,
+) -> List[Dict[str, Any]]:
+    labels = sorted({int(record["label"]) for record in clean_records})
+    if len(labels) < 2:
+        raise ValueError("Label flipping requires at least two classes.")
+
+    rng = random.Random(seed)
+    selected_random_indices = set()
+    if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING:
+        if not 0.0 <= random_flip_fraction <= 1.0:
+            raise ValueError(f"random_flip_fraction must be in [0, 1], got {random_flip_fraction}")
+        flip_count = int(len(clean_records) * random_flip_fraction)
+        selected_random_indices = set(rng.sample(range(len(clean_records)), flip_count))
+
+    rows: List[Dict[str, Any]] = []
+    for idx, record in enumerate(clean_records):
+        original_label = int(record["label"])
+        new_label = original_label
+        label_changed = False
+
+        if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING and idx in selected_random_indices:
+            choices = [label for label in labels if label != original_label]
+            new_label = rng.choice(choices)
+            label_changed = True
+        elif method == POISONING_METHOD_TARGET_LABEL_FLIPPING and original_label == target_label:
+            if replacement_label == target_label:
+                raise ValueError("target_label and replacement_label must differ for target label flipping.")
+            new_label = replacement_label
+            label_changed = True
+
+        image_path = _copy_clean_image(record, output_root)
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(image_path),
+                "label": new_label,
+                "class_name": _class_name_for_label(class_names, new_label),
+                "is_poisoned": label_changed,
+                "poisoning_method": method,
+                "original_label": original_label,
+                "original_class_name": record["class_name"],
+                "label_changed": label_changed,
+                "label_flip_fraction": random_flip_fraction if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING else "",
+                "target_label": target_label if method == POISONING_METHOD_TARGET_LABEL_FLIPPING else "",
+                "replacement_label": replacement_label if method == POISONING_METHOD_TARGET_LABEL_FLIPPING else "",
+            }
+        )
+        rows.append(poisoned)
+    return rows
+
+
 def prepare_dataset(
     *,
     data_dir: str = DEFAULT_DATA_DIR,
@@ -221,6 +306,9 @@ def prepare_dataset(
     poison_step_size: float = 0.8,
     batch_size: int = DEFAULT_BATCH_SIZE,
     unlearnable_repo: str = "../Unlearnable-Examples",
+    random_label_flip_fraction: float = DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
+    target_label: int = DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
+    replacement_label: int = DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
 ) -> Path:
     if prepared_data_exists(data_dir, num_clients) and not force:
         return _dataset_root(data_dir)
@@ -232,9 +320,12 @@ def prepare_dataset(
     dataset_dict = load_dataset(dataset_name)
     metadata_rows: List[Dict[str, Any]] = []
     clean_records: List[Dict[str, Any]] = []
+    class_names: List[str] = []
 
     for split, ds in _iter_splits(dataset_dict):
         names = _class_names(ds)
+        if not class_names:
+            class_names = names
         assignments = _assign_iid_partitions(ds, num_clients, seed)
         for idx, example in enumerate(ds):
             image, label = _extract_image_label(example)
@@ -250,18 +341,24 @@ def prepare_dataset(
                 "relative_path": str(relative_path),
                 "label": label,
                 "class_name": class_name,
+                "original_label": label,
+                "original_class_name": class_name,
+                "label_changed": False,
+                "label_flip_fraction": "",
+                "target_label": "",
+                "replacement_label": "",
                 "client_id": client_id,
                 "partition_id": client_id,
                 "dataset_split": split,
                 "is_poisoned": False,
-                "poisoning_method": "clean",
+                "poisoning_method": POISONING_METHOD_CLEAN,
             }
             clean_records.append(record)
             metadata_rows.append(record)
 
     _build_adaptive_images(
         clean_records,
-        output_root=root / "poisoned" / "adaptive",
+        output_root=root / "poisoned" / POISONING_METHOD_ADAPTIVE,
         num_classes=len({int(row["label"]) for row in clean_records}),
         resize=resize,
         seed=seed,
@@ -273,21 +370,52 @@ def prepare_dataset(
     )
 
     for record in clean_records:
-        poisoned_path = root / "poisoned" / "adaptive" / record["client_id"] / record["relative_path"]
+        poisoned_path = root / "poisoned" / POISONING_METHOD_ADAPTIVE / record["client_id"] / record["relative_path"]
         poisoned = dict(record)
         poisoned.update(
             {
                 "image_path": str(poisoned_path),
                 "is_poisoned": True,
-                "poisoning_method": "adaptive",
+                "poisoning_method": POISONING_METHOD_ADAPTIVE,
             }
         )
         metadata_rows.append(poisoned)
+
+    metadata_rows.extend(
+        _make_label_flip_rows(
+            clean_records,
+            method=POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+            output_root=root / "poisoned" / POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+            class_names=class_names,
+            seed=seed + 17,
+            random_flip_fraction=random_label_flip_fraction,
+            target_label=target_label,
+            replacement_label=replacement_label,
+        )
+    )
+    metadata_rows.extend(
+        _make_label_flip_rows(
+            clean_records,
+            method=POISONING_METHOD_TARGET_LABEL_FLIPPING,
+            output_root=root / "poisoned" / POISONING_METHOD_TARGET_LABEL_FLIPPING,
+            class_names=class_names,
+            seed=seed + 31,
+            random_flip_fraction=random_label_flip_fraction,
+            target_label=target_label,
+            replacement_label=replacement_label,
+        )
+    )
 
     fieldnames = [
         "image_path",
         "label",
         "class_name",
+        "original_label",
+        "original_class_name",
+        "label_changed",
+        "label_flip_fraction",
+        "target_label",
+        "replacement_label",
         "client_id",
         "partition_id",
         "dataset_split",
@@ -387,6 +515,30 @@ def load_metadata_records(
     ]
 
 
+def get_poison_fraction(
+    *,
+    data_dir: str,
+    client_id: str,
+    poisoning_method: str,
+    split: str = "train",
+) -> float:
+    records = load_metadata_records(
+        data_dir=data_dir,
+        client_id=client_id,
+        poisoning_method=poisoning_method,
+        split=split,
+    )
+    if not records:
+        return 0.0
+    poisoned = 0
+    for record in records:
+        is_poisoned = str(record.get("is_poisoned", "")).lower() == "true"
+        label_changed = str(record.get("label_changed", "")).lower() == "true"
+        if is_poisoned or label_changed:
+            poisoned += 1
+    return poisoned / len(records)
+
+
 def get_num_classes(data_dir: str) -> int:
     path = _dataset_root(data_dir) / METADATA_NAME
     if not path.exists():
@@ -424,6 +576,9 @@ def main() -> None:
     parser.add_argument("--poison-steps", type=int, default=5)
     parser.add_argument("--poison-step-size", type=float, default=0.8)
     parser.add_argument("--unlearnable-repo", default="../Unlearnable-Examples")
+    parser.add_argument("--random-label-flip-fraction", type=float, default=DEFAULT_RANDOM_LABEL_FLIP_FRACTION)
+    parser.add_argument("--target-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL)
+    parser.add_argument("--replacement-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL)
     args = parser.parse_args()
     augment = augment_from_args(args)
     resize = augment.get("resize", [64, 64])
@@ -439,6 +594,9 @@ def main() -> None:
         poison_step_size=args.poison_step_size,
         batch_size=args.batch_size,
         unlearnable_repo=args.unlearnable_repo,
+        random_label_flip_fraction=args.random_label_flip_fraction,
+        target_label=args.target_label,
+        replacement_label=args.replacement_label,
     )
     print(root)
 

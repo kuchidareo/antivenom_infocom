@@ -21,6 +21,74 @@ REMOTE_REPO_DIR="${REMOTE_PROJECT_DIR:h}"
 REMOTE_PYTHON="$(config_value DEFAULT_REMOTE_PYTHON)"
 SSH_USER="$(config_value DEFAULT_SSH_USER)"
 
+normalize_method_token() {
+  local token="${1:l}"
+  token="${token//-/_}"
+  token="${token// /}"
+  case "$token" in
+    clean|c)
+      print -- "clean"
+      ;;
+    adaptive|adapt)
+      print -- "adaptive"
+      ;;
+    random|random_label|random_labelflip|random_label_flip|random_label_flipping|label_random)
+      print -- "random_label_flipping"
+      ;;
+    target|target_label|target_labelflip|target_label_flip|target_label_flipping|label_target)
+      print -- "target_label_flipping"
+      ;;
+    all|both)
+      print -- "all"
+      ;;
+    "")
+      print -- ""
+      ;;
+    *)
+      print "Unknown condition '$1'." >&2
+      print "Allowed: clean, adaptive, random_label_flipping, target_label_flipping, all" >&2
+      exit 1
+      ;;
+  esac
+}
+
+normalize_conditions() {
+  local allow_clean="${1:-yes}"
+  shift || true
+  local raw="$*"
+  raw="${raw//,/ }"
+  raw="${raw//;/ }"
+  if [[ -z "${raw// /}" ]]; then
+    print -- ""
+    return
+  fi
+
+  local -a methods
+  local -A seen
+  local token method
+  for token in ${(z)raw}; do
+    method="$(normalize_method_token "$token")"
+    [[ -z "$method" ]] && continue
+    if [[ "$method" == "all" ]]; then
+      if [[ "$allow_clean" == "yes" ]]; then
+        print -- "all"
+      else
+        print -- "adaptive,random_label_flipping,target_label_flipping"
+      fi
+      return
+    fi
+    if [[ "$allow_clean" != "yes" && "$method" == "clean" ]]; then
+      print "Skipping clean for FL because FL conditions are attack methods only." >&2
+      continue
+    fi
+    if [[ -z "${seen[$method]:-}" ]]; then
+      methods+=("$method")
+      seen[$method]=1
+    fi
+  done
+  print -- "${(j:,:)methods}"
+}
+
 ssh_target() {
   local host="$1"
   if [[ -n "$SSH_USER" ]]; then
@@ -64,7 +132,21 @@ pull_remote_repos() {
 }
 
 run_local_ml() {
-  print "Starting local ML on all devices..."
+  local methods="${1:-}"
+  local method_option=""
+  local reference_option=""
+  local extra_options=""
+  if [[ -n "$methods" ]]; then
+    method_option="--poisoning-method '$methods'"
+    print "Starting local ML on all devices for conditions: $methods"
+    if [[ "$methods" != "all" && ",$methods," != *",clean,"* ]]; then
+      reference_option="--reference-trials 0"
+      print "Skipping local ML global clean reference runs for this subset."
+    fi
+  else
+    print "Starting local ML on all devices using experiment_config.py defaults..."
+  fi
+  extra_options="$reference_option $method_option"
   for device in "${(@f)$(device_lines)}"; do
     local client_id="${device%%:*}"
     local host="${device#*:}"
@@ -73,7 +155,7 @@ run_local_ml() {
       '$REMOTE_PYTHON' running_ml.py \
         --client-id '$client_id' \
         --device-id '$host' \
-        --host '$host'
+        --host '$host' $extra_options
     " &
   done
   wait
@@ -81,19 +163,37 @@ run_local_ml() {
 }
 
 dry_run_fl() {
-  print "Previewing FL SSH commands..."
+  local methods="${1:-}"
+  local -a method_args
+  if [[ -n "$methods" ]]; then
+    method_args=(--poisoning-methods "$methods")
+    print "Previewing FL SSH commands for attack conditions: $methods"
+  else
+    method_args=()
+    print "Previewing FL SSH commands using experiment_config.py defaults..."
+  fi
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
     --dry-run \
-    --ssh-password "$SSH_PASSWORD"
+    --ssh-password "$SSH_PASSWORD" \
+    "${method_args[@]}"
 }
 
 run_fl() {
-  print "Starting FL experiments..."
+  local methods="${1:-}"
+  local -a method_args
+  if [[ -n "$methods" ]]; then
+    method_args=(--poisoning-methods "$methods")
+    print "Starting FL experiments for attack conditions: $methods"
+  else
+    method_args=()
+    print "Starting FL experiments using experiment_config.py defaults..."
+  fi
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
     --ssh-password "$SSH_PASSWORD" \
-    --server-log-hardware
+    --server-log-hardware \
+    "${method_args[@]}"
   print "FL finished."
 }
 
@@ -101,12 +201,22 @@ usage() {
   cat <<'EOF'
 Usage:
   ./run_experiments.zsh check
-  ./run_experiments.zsh ml
-  ./run_experiments.zsh fl-dry-run
-  ./run_experiments.zsh fl
-  ./run_experiments.zsh both
+  ./run_experiments.zsh ml [conditions]
+  ./run_experiments.zsh fl-dry-run [attack_conditions]
+  ./run_experiments.zsh fl [attack_conditions]
+  ./run_experiments.zsh both [conditions]
+  ./run_experiments.zsh [conditions]
+
+Examples:
+  ./run_experiments.zsh ml random_label_flipping,target_label_flipping
+  ./run_experiments.zsh ml clean target_labelflip
+  ./run_experiments.zsh fl target_labelflip
+  ./run_experiments.zsh random_labelflip target_labelflip
 
 Experiment settings are read from experiment_config.py.
+Condition aliases:
+  random_labelflip  -> random_label_flipping
+  target_labelflip  -> target_label_flipping
 For password-based SSH:
   export SSH_PASSWORD='your_password'
 Do not run local ML and FL at the same time.
@@ -115,30 +225,70 @@ EOF
 
 main() {
   local mode="${1:-}"
+  local -a condition_args
+  case "$mode" in
+    check|ml|fl-dry-run|fl|both|"")
+      shift || true
+      condition_args=("$@")
+      ;;
+    *)
+      condition_args=("$@")
+      mode="ml"
+      ;;
+  esac
+
+  local ml_methods=""
+  local fl_methods=""
+
   case "$mode" in
     check)
       check_remote_python
       ;;
     ml)
+      if (( ${#condition_args[@]} > 0 )); then
+        ml_methods="$(normalize_conditions yes "${condition_args[@]}")"
+      fi
       check_remote_python
       pull_remote_repos
-      run_local_ml
+      run_local_ml "$ml_methods"
       ;;
     fl-dry-run)
-      dry_run_fl
+      if (( ${#condition_args[@]} > 0 )); then
+        fl_methods="$(normalize_conditions no "${condition_args[@]}")"
+        if [[ -z "$fl_methods" ]]; then
+          print "No FL attack conditions selected." >&2
+          exit 1
+        fi
+      fi
+      dry_run_fl "$fl_methods"
       ;;
     fl)
-      dry_run_fl
+      if (( ${#condition_args[@]} > 0 )); then
+        fl_methods="$(normalize_conditions no "${condition_args[@]}")"
+        if [[ -z "$fl_methods" ]]; then
+          print "No FL attack conditions selected." >&2
+          exit 1
+        fi
+      fi
+      dry_run_fl "$fl_methods"
       pull_remote_repos
-      run_fl
+      run_fl "$fl_methods"
       ;;
     both)
+      if (( ${#condition_args[@]} > 0 )); then
+        ml_methods="$(normalize_conditions yes "${condition_args[@]}")"
+        fl_methods="$(normalize_conditions no "${condition_args[@]}")"
+        if [[ -z "$fl_methods" ]]; then
+          print "No FL attack conditions selected." >&2
+          exit 1
+        fi
+      fi
       check_remote_python
       pull_remote_repos
-      run_local_ml
-      dry_run_fl
+      run_local_ml "$ml_methods"
+      dry_run_fl "$fl_methods"
       pull_remote_repos
-      run_fl
+      run_fl "$fl_methods"
       ;;
     *)
       usage

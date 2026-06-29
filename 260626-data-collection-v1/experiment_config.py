@@ -35,6 +35,33 @@ DEFAULT_FL_CLIENT_SERVER_ADDRESS = "192.168.0.110:8080"
 DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/kuchida/antivenom_infocom/260626-data-collection-v1"
 DEFAULT_REMOTE_PYTHON = "/home/rasheed/kuchida/antivenom_infocom/venv/bin/python"
 DEFAULT_SSH_USER = "rasheed"
+POISONING_METHOD_CLEAN = "clean"
+POISONING_METHOD_ADAPTIVE = "adaptive"
+POISONING_METHOD_RANDOM_LABEL_FLIPPING = "random_label_flipping"
+POISONING_METHOD_TARGET_LABEL_FLIPPING = "target_label_flipping"
+POISONING_METHODS = [
+    POISONING_METHOD_CLEAN,
+    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+    POISONING_METHOD_TARGET_LABEL_FLIPPING,
+]
+POISONING_ATTACK_METHODS = [
+    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+    POISONING_METHOD_TARGET_LABEL_FLIPPING,
+]
+DEFAULT_LOCAL_ML_POISONING_METHODS = POISONING_METHODS
+DEFAULT_FL_POISONING_METHODS = POISONING_ATTACK_METHODS
+DEFAULT_RANDOM_LABEL_FLIP_FRACTION = 1.0 / 6.0
+DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL = 5
+DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL = 3
+
+ATTACK_NAME_BY_POISONING_METHOD = {
+    POISONING_METHOD_CLEAN: "",
+    POISONING_METHOD_ADAPTIVE: "adaptive_min_min_samplewise",
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING: "random_label_flipping_1_over_6",
+    POISONING_METHOD_TARGET_LABEL_FLIPPING: "target_label_flipping_5_to_3",
+}
 
 DEVICES = [
     {"client_id": "client_0", "host": "192.168.0.112"},
@@ -189,6 +216,25 @@ def select_poisoned_clients(num_clients: int, poisoned_client_count: int, seed: 
     rng = random.Random(seed)
     selected = rng.sample(range(num_clients), poisoned_client_count)
     return [f"client_{idx}" for idx in sorted(selected)]
+
+
+def parse_poisoning_methods(value: Optional[str], *, include_clean: bool = True) -> List[str]:
+    if value is None or value == "" or value == "all":
+        return list(POISONING_METHODS if include_clean else POISONING_ATTACK_METHODS)
+    if value == "both":
+        return list(POISONING_METHODS if include_clean else POISONING_ATTACK_METHODS)
+    methods = [item.strip() for item in value.split(",") if item.strip()]
+    allowed = set(POISONING_METHODS if include_clean else POISONING_ATTACK_METHODS)
+    invalid = [method for method in methods if method not in allowed]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unknown poisoning method(s): {','.join(invalid)}. Allowed: {','.join(sorted(allowed))}"
+        )
+    return methods
+
+
+def attack_name_for_poisoning_method(poisoning_method: str) -> str:
+    return ATTACK_NAME_BY_POISONING_METHOD.get(poisoning_method, poisoning_method)
 
 
 def set_all_seeds(seed: int) -> None:

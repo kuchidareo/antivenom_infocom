@@ -15,12 +15,15 @@ from experiment_config import (
     DEFAULT_FL_NUM_ROUNDS,
     DEFAULT_FL_SERVER_BIND_ADDRESS,
     DEFAULT_FL_TRIALS,
+    DEFAULT_FL_POISONING_METHODS,
     DEFAULT_REMOTE_PYTHON,
     DEFAULT_REMOTE_PROJECT_DIR,
     DEFAULT_SSH_USER,
     DEVICES,
+    POISONING_ATTACK_METHODS,
     add_common_args,
     augment_from_args,
+    parse_poisoning_methods,
     select_poisoned_clients,
 )
 
@@ -51,6 +54,7 @@ def _client_command(args: argparse.Namespace, device: dict, seed: int, poisoned_
         *_arg("--augment", args.augment),
         *_arg("--poisoned-client-count", len(poisoned_ids)),
         *_arg("--poisoned-client-ids", ",".join(poisoned_ids)),
+        *_arg("--poisoning-method", args.poisoning_method),
     ]
     quoted = " ".join(shlex.quote(part) for part in client_args)
     return f"cd {shlex.quote(args.remote_project_dir)} && {quoted}"
@@ -75,6 +79,7 @@ def _start_server(args: argparse.Namespace, seed: int, poisoned_ids: List[str]) 
         *_arg("--augment", args.augment),
         *_arg("--poisoned-client-count", len(poisoned_ids)),
         *_arg("--poisoned-client-ids", ",".join(poisoned_ids)),
+        *_arg("--poisoning-method", args.poisoning_method),
     ]
     if args.server_log_hardware:
         command.append("--server-log-hardware")
@@ -119,11 +124,15 @@ def _terminate(processes: List[subprocess.Popen]) -> None:
             process.kill()
 
 
-def run_trial(args: argparse.Namespace, poisoned_client_count: int, trial_id: int) -> None:
+def run_trial(args: argparse.Namespace, poisoned_client_count: int, poisoning_method: str, trial_id: int) -> None:
     seed = args.seed + trial_id
     poisoned_ids = select_poisoned_clients(args.num_clients, poisoned_client_count, seed)
     args.trial_id = trial_id
-    print(f"trial={trial_id} seed={seed} poisoned_client_count={poisoned_client_count} ids={poisoned_ids}")
+    args.poisoning_method = poisoning_method
+    print(
+        f"trial={trial_id} seed={seed} poisoning_method={poisoning_method} "
+        f"poisoned_client_count={poisoned_client_count} ids={poisoned_ids}"
+    )
     if args.dry_run:
         _start_clients(args, seed, poisoned_ids)
         return
@@ -159,6 +168,11 @@ def main() -> None:
     parser.add_argument("--ssh-user", default=DEFAULT_SSH_USER)
     parser.add_argument("--ssh-password", default="")
     parser.add_argument("--poisoned-client-counts", default="1,4")
+    parser.add_argument(
+        "--poisoning-methods",
+        default=",".join(DEFAULT_FL_POISONING_METHODS),
+        help=f"Comma-separated attack methods. Allowed: {','.join(POISONING_ATTACK_METHODS)}",
+    )
     parser.add_argument("--trials", type=int, default=DEFAULT_FL_TRIALS)
     parser.add_argument("--client-start-delay", type=float, default=3.0)
     parser.add_argument("--server-log-hardware", action="store_true")
@@ -176,9 +190,11 @@ def main() -> None:
             batch_size=args.batch_size,
         )
     counts = [int(item.strip()) for item in args.poisoned_client_counts.split(",") if item.strip()]
+    poisoning_methods = parse_poisoning_methods(args.poisoning_methods, include_clean=False)
     for count in counts:
-        for trial_id in range(args.trials):
-            run_trial(args, count, trial_id)
+        for poisoning_method in poisoning_methods:
+            for trial_id in range(args.trials):
+                run_trial(args, count, poisoning_method, trial_id)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,13 @@ from typing import Dict, List
 
 import flwr as fl
 
-from dataset_preparation import get_dataloader, get_num_classes, prepare_dataset
+from dataset_preparation import get_dataloader, get_num_classes, get_poison_fraction, prepare_dataset
 from experiment_config import (
     DEFAULT_SERVER_ADDRESS,
+    POISONING_ATTACK_METHODS,
+    POISONING_METHOD_CLEAN,
     add_common_args,
+    attack_name_for_poisoning_method,
     augment_from_args,
     condition_columns,
     get_device as get_device_config,
@@ -34,7 +37,8 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
     def fit(self, parameters: List, config: Dict[str, str]):
         current_round = int(config.get("round", 0))
         poisoned_ids = parse_client_ids(str(config.get("poisoned_client_ids", self.args.poisoned_client_ids)))
-        poisoning_method = "adaptive" if self.args.client_id in poisoned_ids else "clean"
+        configured_poisoning_method = str(config.get("poisoning_method", self.args.poisoning_method))
+        poisoning_method = configured_poisoning_method if self.args.client_id in poisoned_ids else POISONING_METHOD_CLEAN
         set_all_seeds(int(config.get("seed", self.args.seed)))
         set_parameters(self.model, parameters)
         train_loader = get_dataloader(
@@ -61,7 +65,8 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
     def evaluate(self, parameters: List, config: Dict[str, str]):
         current_round = int(config.get("round", 0))
         poisoned_ids = parse_client_ids(str(config.get("poisoned_client_ids", self.args.poisoned_client_ids)))
-        poisoning_method = "adaptive" if self.args.client_id in poisoned_ids else "clean"
+        configured_poisoning_method = str(config.get("poisoning_method", self.args.poisoning_method))
+        poisoning_method = configured_poisoning_method if self.args.client_id in poisoned_ids else POISONING_METHOD_CLEAN
         set_parameters(self.model, parameters)
         eval_loader = get_dataloader(
             data_dir=self.args.data_dir,
@@ -89,6 +94,7 @@ def main() -> None:
     parser.add_argument("--poisoned-client-count", type=int, default=0)
     parser.add_argument("--poisoned-client-ids", default="")
     parser.add_argument("--poison-fraction", type=float, default=1.0)
+    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default="adaptive")
     args = parser.parse_args()
 
     device = get_device_config(args.client_id)
@@ -98,7 +104,7 @@ def main() -> None:
         args.device_id = args.host
     poisoned_ids = parse_client_ids(args.poisoned_client_ids)
     is_poisoned = args.client_id in poisoned_ids
-    poisoning_method = "adaptive" if is_poisoned else "clean"
+    poisoning_method = args.poisoning_method if is_poisoned else POISONING_METHOD_CLEAN
 
     set_all_seeds(args.seed)
     augment = augment_from_args(args)
@@ -112,6 +118,12 @@ def main() -> None:
     )
 
     state = TrainingState(round=0, epoch=0, batch_idx=0, phase="idle")
+    poison_fraction = get_poison_fraction(
+        data_dir=args.data_dir,
+        client_id=args.client_id,
+        poisoning_method=poisoning_method,
+        split=args.dataset_split,
+    )
     condition = condition_columns(
         args=args,
         run_type="fl_client",
@@ -119,8 +131,8 @@ def main() -> None:
         is_poisoned_client=is_poisoned,
         poisoned_client_count=args.poisoned_client_count,
         poisoned_client_ids=poisoned_ids,
-        poison_fraction=args.poison_fraction if is_poisoned else 0.0,
-        attack_name="adaptive_min_min_samplewise" if is_poisoned else "",
+        poison_fraction=poison_fraction if is_poisoned else 0.0,
+        attack_name=attack_name_for_poisoning_method(poisoning_method) if is_poisoned else "",
     )
     client = TrashNetFlowerClient(args, state)
     with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state) as logger:

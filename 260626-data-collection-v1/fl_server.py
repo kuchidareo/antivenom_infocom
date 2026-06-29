@@ -11,7 +11,9 @@ from flwr.server.client_proxy import ClientProxy
 from dataset_preparation import get_num_classes, prepare_dataset
 from experiment_config import (
     DEFAULT_SERVER_ADDRESS,
+    POISONING_ATTACK_METHODS,
     add_common_args,
+    attack_name_for_poisoning_method,
     augment_from_args,
     condition_columns,
     parse_client_ids,
@@ -66,10 +68,15 @@ def make_strategy(args: argparse.Namespace, poisoned_ids: List[str], state: Trai
             "learning_rate": args.learning_rate,
             "poisoned_client_ids": ",".join(poisoned_ids),
             "poisoned_client_count": len(poisoned_ids),
+            "poisoning_method": args.poisoning_method,
         }
 
     def evaluate_config(server_round: int) -> Dict[str, Scalar]:
-        return {"round": server_round, "poisoned_client_ids": ",".join(poisoned_ids)}
+        return {
+            "round": server_round,
+            "poisoned_client_ids": ",".join(poisoned_ids),
+            "poisoning_method": args.poisoning_method,
+        }
 
     return AnnotatedFedAvg(
         fraction_fit=1.0,
@@ -92,6 +99,7 @@ def main() -> None:
     parser.add_argument("--server-address", default=DEFAULT_SERVER_ADDRESS)
     parser.add_argument("--poisoned-client-count", type=int, default=1)
     parser.add_argument("--poisoned-client-ids", default="")
+    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default="adaptive")
     parser.add_argument("--server-log-hardware", action="store_true")
     parser.add_argument("--metadata-dir", default="logs/server_metadata")
     args = parser.parse_args()
@@ -115,8 +123,16 @@ def main() -> None:
 
     metadata_dir = Path(args.metadata_dir)
     metadata_dir.mkdir(parents=True, exist_ok=True)
-    (metadata_dir / f"fl_trial_{args.trial_id}_poisoned_{len(poisoned_ids)}.json").write_text(
-        json.dumps({"trial_id": args.trial_id, "seed": args.seed, "poisoned_client_ids": poisoned_ids}, indent=2)
+    (metadata_dir / f"fl_trial_{args.trial_id}_{args.poisoning_method}_poisoned_{len(poisoned_ids)}.json").write_text(
+        json.dumps(
+            {
+                "trial_id": args.trial_id,
+                "seed": args.seed,
+                "poisoning_method": args.poisoning_method,
+                "poisoned_client_ids": poisoned_ids,
+            },
+            indent=2,
+        )
     )
 
     state = TrainingState(round=0, phase="idle")
@@ -129,7 +145,7 @@ def main() -> None:
         poisoned_client_count=len(poisoned_ids),
         poisoned_client_ids=poisoned_ids,
         poison_fraction=0.0,
-        attack_name="adaptive_min_min_samplewise",
+        attack_name=attack_name_for_poisoning_method(args.poisoning_method),
     )
 
     if args.server_log_hardware:
