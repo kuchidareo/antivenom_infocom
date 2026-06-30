@@ -36,31 +36,37 @@ DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/kuchida/antivenom_infocom/260626-dat
 DEFAULT_REMOTE_PYTHON = "/home/rasheed/kuchida/antivenom_infocom/venv/bin/python"
 DEFAULT_SSH_USER = "rasheed"
 POISONING_METHOD_CLEAN = "clean"
-POISONING_METHOD_ADAPTIVE = "adaptive"
+POISONING_METHOD_UNLEARNABLE_EXAMPLES = "unlearnable_examples"
 POISONING_METHOD_RANDOM_LABEL_FLIPPING = "random_label_flipping"
 POISONING_METHOD_TARGET_LABEL_FLIPPING = "target_label_flipping"
+POISONING_METHOD_AVAILABILITY_SHORTCUTS = "availability_shortcuts"
 POISONING_METHODS = [
     POISONING_METHOD_CLEAN,
-    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES,
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS,
 ]
 POISONING_ATTACK_METHODS = [
-    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES,
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS,
 ]
 DEFAULT_LOCAL_ML_POISONING_METHODS = POISONING_METHODS
 DEFAULT_FL_POISONING_METHODS = POISONING_ATTACK_METHODS
 DEFAULT_RANDOM_LABEL_FLIP_FRACTION = 1.0 / 6.0
 DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL = 5
 DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL = 3
+DEFAULT_AVAILABILITY_SHORTCUT_EPS = 6.0
+DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = 8
 
 ATTACK_NAME_BY_POISONING_METHOD = {
     POISONING_METHOD_CLEAN: "",
-    POISONING_METHOD_ADAPTIVE: "adaptive_min_min_samplewise",
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES: "unlearnable_examples_min_min_samplewise",
     POISONING_METHOD_RANDOM_LABEL_FLIPPING: "random_label_flipping_1_over_6",
     POISONING_METHOD_TARGET_LABEL_FLIPPING: "target_label_flipping_5_to_3",
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS: "availability_shortcuts_synthetic_classwise",
 }
 
 DEVICES = [
@@ -230,7 +236,11 @@ def parse_poisoning_methods(value: Optional[str], *, include_clean: bool = True)
         raise argparse.ArgumentTypeError(
             f"Unknown poisoning method(s): {','.join(invalid)}. Allowed: {','.join(sorted(allowed))}"
         )
-    return methods
+    deduped: List[str] = []
+    for method in methods:
+        if method not in deduped:
+            deduped.append(method)
+    return deduped
 
 
 def attack_name_for_poisoning_method(poisoning_method: str) -> str:

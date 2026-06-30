@@ -13,16 +13,19 @@ from PIL import Image
 from experiment_config import (
     DATASET_NAME,
     DEFAULT_AUGMENT,
+    DEFAULT_AVAILABILITY_SHORTCUT_EPS,
+    DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE,
     DEFAULT_BATCH_SIZE,
     DEFAULT_DATA_DIR,
     DEFAULT_NUM_CLIENTS,
     DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
     DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
     DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
-    POISONING_METHOD_ADAPTIVE,
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS,
     POISONING_METHOD_CLEAN,
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES,
     add_common_args,
     augment_from_args,
     client_index,
@@ -32,6 +35,27 @@ from experiment_config import (
 
 METADATA_NAME = "partition_metadata.csv"
 PREPARED_MARKER = "PREPARED"
+
+METADATA_FIELDNAMES = [
+    "image_path",
+    "label",
+    "class_name",
+    "original_label",
+    "original_class_name",
+    "label_changed",
+    "label_flip_fraction",
+    "target_label",
+    "replacement_label",
+    "shortcut_eps",
+    "shortcut_patch_size",
+    "client_id",
+    "partition_id",
+    "dataset_split",
+    "is_poisoned",
+    "poisoning_method",
+    "source_index",
+    "relative_path",
+]
 
 
 def _require_torch():
@@ -54,14 +78,16 @@ def prepared_data_exists(data_dir: str, num_clients: int = DEFAULT_NUM_CLIENTS) 
     root = _dataset_root(data_dir)
     if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
         return False
-    for mode in (
-        "clean",
-        "poisoned/adaptive",
-        "poisoned/random_label_flipping",
-        "poisoned/target_label_flipping",
-    ):
+    required_modes = [
+        ("clean",),
+        (f"poisoned/{POISONING_METHOD_UNLEARNABLE_EXAMPLES}",),
+        (f"poisoned/{POISONING_METHOD_RANDOM_LABEL_FLIPPING}",),
+        (f"poisoned/{POISONING_METHOD_TARGET_LABEL_FLIPPING}",),
+        (f"poisoned/{POISONING_METHOD_AVAILABILITY_SHORTCUTS}",),
+    ]
+    for mode_options in required_modes:
         for idx in range(num_clients):
-            if not (root / mode / f"client_{idx}").exists():
+            if not any((root / mode / f"client_{idx}").exists() for mode in mode_options):
                 return False
     return True
 
@@ -123,13 +149,51 @@ def _save_jpeg(image: Image.Image, path: Path) -> None:
     image.convert("RGB").save(path, format="JPEG", quality=95)
 
 
+def _read_metadata_rows(root: Path) -> List[Dict[str, Any]]:
+    path = root / METADATA_NAME
+    if not path.exists():
+        return []
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_metadata_rows(root: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    with (root / METADATA_NAME).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=METADATA_FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _mode_complete(root: Path, mode: str, num_clients: int) -> bool:
+    return all((root / mode / f"client_{idx}").exists() for idx in range(num_clients))
+
+
+def _metadata_has_method(rows: Sequence[Dict[str, Any]], poisoning_method: str) -> bool:
+    return any(row.get("poisoning_method") == poisoning_method for row in rows)
+
+
+def _clean_records_from_metadata(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    records = [dict(row) for row in rows if row.get("poisoning_method") == POISONING_METHOD_CLEAN]
+    for record in records:
+        record["clean_path"] = record.get("clean_path") or record["image_path"]
+    return records
+
+
+def _class_names_from_records(records: Sequence[Dict[str, Any]]) -> List[str]:
+    label_to_name = {
+        int(record["label"]): str(record.get("class_name", record["label"]))
+        for record in records
+    }
+    return [label_to_name[label] for label in sorted(label_to_name)]
+
+
 def _pil_from_tensor(tensor: Any) -> Image.Image:
     import torchvision.transforms.functional as TF
 
     return TF.to_pil_image(tensor.detach().cpu().clamp(0, 1))
 
 
-def _build_adaptive_images(
+def _build_unlearnable_example_images(
     clean_records: Sequence[Dict[str, Any]],
     *,
     output_root: Path,
@@ -174,7 +238,7 @@ def _build_adaptive_images(
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
-    # One light surrogate pass keeps the adaptive perturbation deterministic
+    # One light surrogate pass keeps the unlearnable-example perturbation deterministic
     # without turning data preparation into a full training run.
     model.train()
     for images, labels, _ in loader:
@@ -293,6 +357,84 @@ def _make_label_flip_rows(
     return rows
 
 
+def _l2norm_limit_from_linf(linf: float, feature_dim: int) -> float:
+    # Same projection scale used by Availability-Attacks-Create-Shortcuts.
+    return float((linf**2 * feature_dim) ** 0.5)
+
+
+def _normalize_l2norm(data: Any, norm_limit: float) -> Any:
+    import numpy as np
+
+    flat = data.reshape(data.shape[0], -1)
+    norms = np.linalg.norm(flat, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    return (flat / norms * norm_limit).reshape(data.shape)
+
+
+def _make_availability_shortcut_rows(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    output_root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    resize: Sequence[int],
+    eps: float,
+    patch_size: int,
+) -> List[Dict[str, Any]]:
+    import numpy as np
+
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be > 0, got {patch_size}")
+    height = int(resize[0])
+    width = int(resize[1]) if len(resize) > 1 else height
+    labels = sorted({int(record["label"]) for record in clean_records})
+    label_to_index = {label: idx for idx, label in enumerate(labels)}
+    num_classes = len(labels)
+    grid_h = (height + patch_size - 1) // patch_size
+    grid_w = (width + patch_size - 1) // patch_size
+
+    rng = np.random.default_rng(seed)
+    class_grids = rng.normal(loc=0.0, scale=1.0, size=(num_classes, grid_h, grid_w, 3)).astype(np.float32)
+    linf = float(eps) / 255.0
+    l2_limit = _l2norm_limit_from_linf(linf, height * width * 3)
+
+    rows: List[Dict[str, Any]] = []
+    for record in clean_records:
+        label = int(record["label"])
+        class_idx = label_to_index[label]
+        # Synthetic shortcuts are class-correlated low-frequency grids. A tiny
+        # sample-specific jitter prevents every image in a class from receiving
+        # an identical perturbation while preserving the class shortcut.
+        low_res = class_grids[class_idx] + rng.normal(0.0, 0.05, size=(grid_h, grid_w, 3)).astype(np.float32)
+        shortcut = np.repeat(np.repeat(low_res, patch_size, axis=0), patch_size, axis=1)[:height, :width, :]
+        shortcut = _normalize_l2norm(shortcut[None, ...], l2_limit)[0]
+
+        image = Image.open(record["clean_path"]).convert("RGB").resize((width, height))
+        image_array = np.asarray(image, dtype=np.float32) / 255.0
+        poisoned_array = np.clip(image_array + shortcut, 0.0, 1.0)
+        poisoned_image = Image.fromarray((poisoned_array * 255.0).round().astype(np.uint8), mode="RGB")
+
+        out_path = output_root / record["client_id"] / record["relative_path"]
+        _save_jpeg(poisoned_image, out_path)
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(out_path),
+                "label": label,
+                "class_name": _class_name_for_label(class_names, label),
+                "is_poisoned": True,
+                "poisoning_method": POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                "original_label": label,
+                "original_class_name": record["class_name"],
+                "label_changed": False,
+                "shortcut_eps": eps,
+                "shortcut_patch_size": patch_size,
+            }
+        )
+        rows.append(poisoned)
+    return rows
+
+
 def prepare_dataset(
     *,
     data_dir: str = DEFAULT_DATA_DIR,
@@ -309,13 +451,39 @@ def prepare_dataset(
     random_label_flip_fraction: float = DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
     target_label: int = DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
     replacement_label: int = DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
+    shortcut_eps: float = DEFAULT_AVAILABILITY_SHORTCUT_EPS,
+    shortcut_patch_size: int = DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE,
 ) -> Path:
+    root = _dataset_root(data_dir)
     if prepared_data_exists(data_dir, num_clients) and not force:
-        return _dataset_root(data_dir)
+        return root
+
+    existing_rows = _read_metadata_rows(root)
+    clean_records_from_existing = _clean_records_from_metadata(existing_rows)
+    if not force and clean_records_from_existing and _mode_complete(root, "clean", num_clients):
+        metadata_rows = [
+            row
+            for row in existing_rows
+            if row.get("poisoning_method") != POISONING_METHOD_AVAILABILITY_SHORTCUTS
+        ]
+        class_names = _class_names_from_records(clean_records_from_existing)
+        metadata_rows.extend(
+            _make_availability_shortcut_rows(
+                clean_records_from_existing,
+                output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                class_names=class_names,
+                seed=seed + 47,
+                resize=resize,
+                eps=shortcut_eps,
+                patch_size=shortcut_patch_size,
+            )
+        )
+        _write_metadata_rows(root, metadata_rows)
+        (root / PREPARED_MARKER).write_text(json.dumps({"dataset": dataset_name, "num_clients": num_clients, "seed": seed}))
+        return root
 
     from datasets import load_dataset
 
-    root = _dataset_root(data_dir)
     root.mkdir(parents=True, exist_ok=True)
     dataset_dict = load_dataset(dataset_name)
     metadata_rows: List[Dict[str, Any]] = []
@@ -347,6 +515,8 @@ def prepare_dataset(
                 "label_flip_fraction": "",
                 "target_label": "",
                 "replacement_label": "",
+                "shortcut_eps": "",
+                "shortcut_patch_size": "",
                 "client_id": client_id,
                 "partition_id": client_id,
                 "dataset_split": split,
@@ -356,9 +526,9 @@ def prepare_dataset(
             clean_records.append(record)
             metadata_rows.append(record)
 
-    _build_adaptive_images(
+    _build_unlearnable_example_images(
         clean_records,
-        output_root=root / "poisoned" / POISONING_METHOD_ADAPTIVE,
+        output_root=root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
         num_classes=len({int(row["label"]) for row in clean_records}),
         resize=resize,
         seed=seed,
@@ -370,13 +540,13 @@ def prepare_dataset(
     )
 
     for record in clean_records:
-        poisoned_path = root / "poisoned" / POISONING_METHOD_ADAPTIVE / record["client_id"] / record["relative_path"]
+        poisoned_path = root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES / record["client_id"] / record["relative_path"]
         poisoned = dict(record)
         poisoned.update(
             {
                 "image_path": str(poisoned_path),
                 "is_poisoned": True,
-                "poisoning_method": POISONING_METHOD_ADAPTIVE,
+                "poisoning_method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
             }
         )
         metadata_rows.append(poisoned)
@@ -405,29 +575,19 @@ def prepare_dataset(
             replacement_label=replacement_label,
         )
     )
+    metadata_rows.extend(
+        _make_availability_shortcut_rows(
+            clean_records,
+            output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+            class_names=class_names,
+            seed=seed + 47,
+            resize=resize,
+            eps=shortcut_eps,
+            patch_size=shortcut_patch_size,
+        )
+    )
 
-    fieldnames = [
-        "image_path",
-        "label",
-        "class_name",
-        "original_label",
-        "original_class_name",
-        "label_changed",
-        "label_flip_fraction",
-        "target_label",
-        "replacement_label",
-        "client_id",
-        "partition_id",
-        "dataset_split",
-        "is_poisoned",
-        "poisoning_method",
-        "source_index",
-        "relative_path",
-    ]
-    with (root / METADATA_NAME).open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(metadata_rows)
+    _write_metadata_rows(root, metadata_rows)
     (root / PREPARED_MARKER).write_text(json.dumps({"dataset": dataset_name, "num_clients": num_clients, "seed": seed}))
     return root
 
@@ -579,6 +739,8 @@ def main() -> None:
     parser.add_argument("--random-label-flip-fraction", type=float, default=DEFAULT_RANDOM_LABEL_FLIP_FRACTION)
     parser.add_argument("--target-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL)
     parser.add_argument("--replacement-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL)
+    parser.add_argument("--shortcut-eps", type=float, default=DEFAULT_AVAILABILITY_SHORTCUT_EPS)
+    parser.add_argument("--shortcut-patch-size", type=int, default=DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE)
     args = parser.parse_args()
     augment = augment_from_args(args)
     resize = augment.get("resize", [64, 64])
@@ -597,6 +759,8 @@ def main() -> None:
         random_label_flip_fraction=args.random_label_flip_fraction,
         target_label=args.target_label,
         replacement_label=args.replacement_label,
+        shortcut_eps=args.shortcut_eps,
+        shortcut_patch_size=args.shortcut_patch_size,
     )
     print(root)
 

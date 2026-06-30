@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--server-address", default=DEFAULT_SERVER_ADDRESS)
     parser.add_argument("--poisoned-client-count", type=int, default=1)
     parser.add_argument("--poisoned-client-ids", default="")
-    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default="adaptive")
+    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default=POISONING_ATTACK_METHODS[0])
     parser.add_argument("--server-log-hardware", action="store_true")
     parser.add_argument("--metadata-dir", default="logs/server_metadata")
     args = parser.parse_args()

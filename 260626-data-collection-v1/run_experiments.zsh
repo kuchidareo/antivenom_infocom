@@ -29,14 +29,17 @@ normalize_method_token() {
     clean|c)
       print -- "clean"
       ;;
-    adaptive|adapt)
-      print -- "adaptive"
+    unlearnable_examples)
+      print -- "unlearnable_examples"
       ;;
-    random|random_label|random_labelflip|random_label_flip|random_label_flipping|label_random)
+    random_label_flipping)
       print -- "random_label_flipping"
       ;;
-    target|target_label|target_labelflip|target_label_flip|target_label_flipping|label_target)
+    target_label_flipping)
       print -- "target_label_flipping"
+      ;;
+    availability_shortcuts)
+      print -- "availability_shortcuts"
       ;;
     all|both)
       print -- "all"
@@ -46,7 +49,7 @@ normalize_method_token() {
       ;;
     *)
       print "Unknown condition '$1'." >&2
-      print "Allowed: clean, adaptive, random_label_flipping, target_label_flipping, all" >&2
+      print "Allowed: clean, unlearnable_examples, random_label_flipping, target_label_flipping, availability_shortcuts, all" >&2
       exit 1
       ;;
   esac
@@ -73,7 +76,7 @@ normalize_conditions() {
       if [[ "$allow_clean" == "yes" ]]; then
         print -- "all"
       else
-        print -- "adaptive,random_label_flipping,target_label_flipping"
+        print -- "unlearnable_examples,random_label_flipping,target_label_flipping,availability_shortcuts"
       fi
       return
     fi
@@ -209,14 +212,13 @@ Usage:
 
 Examples:
   ./run_experiments.zsh ml random_label_flipping,target_label_flipping
-  ./run_experiments.zsh ml clean target_labelflip
-  ./run_experiments.zsh fl target_labelflip
-  ./run_experiments.zsh random_labelflip target_labelflip
+  ./run_experiments.zsh ml clean unlearnable_examples
+  ./run_experiments.zsh ml availability_shortcuts
+  ./run_experiments.zsh fl target_label_flipping
+  ./run_experiments.zsh fl availability_shortcuts
+  ./run_experiments.zsh random_label_flipping target_label_flipping
 
 Experiment settings are read from experiment_config.py.
-Condition aliases:
-  random_labelflip  -> random_label_flipping
-  target_labelflip  -> target_label_flipping
 For password-based SSH:
   export SSH_PASSWORD='your_password'
 Do not run local ML and FL at the same time.

@@ -94,7 +94,7 @@ def main() -> None:
     parser.add_argument("--poisoned-client-count", type=int, default=0)
     parser.add_argument("--poisoned-client-ids", default="")
     parser.add_argument("--poison-fraction", type=float, default=1.0)
-    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default="adaptive")
+    parser.add_argument("--poisoning-method", choices=POISONING_ATTACK_METHODS, default=POISONING_ATTACK_METHODS[0])
     args = parser.parse_args()
 
     device = get_device_config(args.client_id)
