@@ -101,7 +101,7 @@ def pca_2d(x: np.ndarray) -> np.ndarray:
 
 
 def cost_types_in_order(df: pd.DataFrame) -> List[str]:
-    preferred = ["c1_time", "c2_value", "c3_window_abs", "c3_window_shape"]
+    preferred = ["c1_time", "c2_value", "c2_value_shape", "c3_window_abs", "c3_window_shape"]
     found = list(df["cost_type"].dropna().unique())
     ordered = [cost for cost in preferred if cost in found]
     ordered.extend(cost for cost in found if cost not in ordered)
@@ -133,10 +133,10 @@ def safe_name(value: object) -> str:
 def color_for_condition(condition: str) -> str:
     colors = {
         "clean": "tab:blue",
-        "adaptive": "tab:red",
-        "blurring": "tab:orange",
-        "label_flip": "tab:green",
-        "backdoor": "tab:purple",
+        "unlearnable_examples": "tab:red",
+        "random_label_flipping": "tab:green",
+        "target_label_flipping": "tab:purple",
+        "availability_shortcuts": "tab:orange",
     }
     return colors.get(str(condition), "tab:gray")
 

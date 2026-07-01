@@ -5,8 +5,9 @@ Interpretation notes:
 - ot_cost measures how far a target run is from a clean reference run under a selected cost.
 - c1_time captures phase/time alignment differences.
 - c2_value captures resource-value distribution shifts.
+- c2_value_shape captures value-distribution shape after removing each run's mean and scale.
 - c3_window_abs captures local waveform differences including level, amplitude, and shape.
-- c3_window_shape is implemented but not enabled by default because it z-normalizes local windows.
+- c3_window_shape captures local waveform shape differences after local normalization.
 - tangent embedding captures the OT-induced direction of distributional change from the clean reference to the target.
 - residual_norm captures how much of that displacement is not explained by clean-to-clean shifts across trials.
 - High ot_cost and high residual_norm means the target is far from the reference and moves in a direction not typical of clean trial variation.
@@ -27,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 
-COST_TYPES = ("c1_time", "c2_value", "c3_window_abs")
+COST_TYPES = ("c1_time", "c2_value", "c2_value_shape", "c3_window_abs", "c3_window_shape")
 DEFAULT_GLOBAL_REFERENCE_TRIAL_ID = "reference_0"
 LEGACY_GLOBAL_REFERENCE_TRIAL_ID = "trial_0"
 DEFAULT_CLEAN_BASELINE_TRIAL_IDS = tuple(f"reference_{idx}" for idx in range(5))
@@ -245,9 +246,9 @@ def parse_cost_types(value: str) -> List[str]:
     cost_types = [item.strip() for item in value.split(",") if item.strip()]
     if not cost_types:
         raise ValueError("At least one cost type is required.")
-    unknown = [cost_type for cost_type in cost_types if cost_type not in COST_TYPES and cost_type != "c3_window_shape"]
+    unknown = [cost_type for cost_type in cost_types if cost_type not in COST_TYPES]
     if unknown:
-        raise ValueError(f"Unknown cost types: {unknown}. Valid values: {COST_TYPES + ('c3_window_shape',)}")
+        raise ValueError(f"Unknown cost types: {unknown}. Valid values: {COST_TYPES}")
     return cost_types
 
 
@@ -335,6 +336,14 @@ def make_value_features(run: np.ndarray) -> np.ndarray:
     return np.asarray(run, dtype=np.float32)
 
 
+def make_value_shape_features(run: np.ndarray) -> np.ndarray:
+    x = np.asarray(run, dtype=np.float32)
+    mean = x.mean(axis=0, keepdims=True)
+    std = x.std(axis=0, keepdims=True)
+    std[std < 1e-12] = 1.0
+    return (x - mean) / std
+
+
 def make_window_features(run: np.ndarray, window_size: int = 5, z_normalize_window: bool = False) -> np.ndarray:
     h = int(window_size)
     if h < 0:
@@ -358,6 +367,8 @@ def build_features_for_cost(run: np.ndarray, cost_type: str, window_size: int) -
         return make_time_features(run)
     if cost_type == "c2_value":
         return make_value_features(run)
+    if cost_type == "c2_value_shape":
+        return make_value_shape_features(run)
     if cost_type == "c3_window_abs":
         return make_window_features(run, window_size=window_size, z_normalize_window=False)
     if cost_type == "c3_window_shape":
@@ -668,10 +679,10 @@ def _plot_color(row: pd.Series) -> str:
     if row["target_group"] == "clean":
         return "tab:blue"
     palette = {
-        "adaptive": "tab:red",
-        "blurring": "tab:orange",
-        "label_flip": "tab:green",
-        "backdoor": "tab:purple",
+        "unlearnable_examples": "tab:red",
+        "random_label_flipping": "tab:green",
+        "target_label_flipping": "tab:purple",
+        "availability_shortcuts": "tab:orange",
     }
     return palette.get(str(row["poisoning_type"]), "tab:red")
 
@@ -837,7 +848,7 @@ def discover_input_groups(input_dir: Path) -> List[Tuple[str, Path]]:
     Passing a single device directory such as ``collected_logs/192.168.0.112/local_ml``
     is treated as one group. Passing the whole ``collected_logs`` directory is split
     into one local-ML group per device, because FL logs contain many clients per
-    trial and should not be merged with local ML clean/adaptive runs.
+    trial and should not be merged with local ML clean/poisoned runs.
     """
     if not input_dir.exists():
         raise ValueError(f"input_dir does not exist: {input_dir}")

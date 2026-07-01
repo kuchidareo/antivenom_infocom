@@ -35,6 +35,14 @@ from experiment_config import (
 
 METADATA_NAME = "partition_metadata.csv"
 PREPARED_MARKER = "PREPARED"
+PREPARE_SCENARIO_ALL = "all"
+PREPARE_SCENARIOS = [
+    POISONING_METHOD_CLEAN,
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+    POISONING_METHOD_TARGET_LABEL_FLIPPING,
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+]
 
 METADATA_FIELDNAMES = [
     "image_path",
@@ -170,6 +178,38 @@ def _mode_complete(root: Path, mode: str, num_clients: int) -> bool:
 
 def _metadata_has_method(rows: Sequence[Dict[str, Any]], poisoning_method: str) -> bool:
     return any(row.get("poisoning_method") == poisoning_method for row in rows)
+
+
+def _parse_prepare_scenarios(value: Optional[Any]) -> List[str]:
+    if value is None or value == "" or value == PREPARE_SCENARIO_ALL:
+        return list(PREPARE_SCENARIOS)
+    if isinstance(value, str):
+        scenarios = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        scenarios = [str(item).strip() for item in value if str(item).strip()]
+    if not scenarios:
+        return list(PREPARE_SCENARIOS)
+    if PREPARE_SCENARIO_ALL in scenarios:
+        if len(scenarios) > 1:
+            raise ValueError(f"{PREPARE_SCENARIO_ALL!r} cannot be combined with specific scenarios.")
+        return list(PREPARE_SCENARIOS)
+    unknown = [scenario for scenario in scenarios if scenario not in PREPARE_SCENARIOS]
+    if unknown:
+        raise ValueError(
+            f"Unknown prepare scenario(s): {unknown}. "
+            f"Use {PREPARE_SCENARIO_ALL!r} or one or more of: {', '.join(PREPARE_SCENARIOS)}"
+        )
+    return scenarios
+
+
+def _scenario_mode(scenario: str) -> str:
+    if scenario == POISONING_METHOD_CLEAN:
+        return "clean"
+    return f"poisoned/{scenario}"
+
+
+def _scenario_complete(root: Path, scenario: str, rows: Sequence[Dict[str, Any]], num_clients: int) -> bool:
+    return _mode_complete(root, _scenario_mode(scenario), num_clients) and _metadata_has_method(rows, scenario)
 
 
 def _clean_records_from_metadata(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -435,6 +475,129 @@ def _make_availability_shortcut_rows(
     return rows
 
 
+def _append_unlearnable_example_rows(
+    metadata_rows: List[Dict[str, Any]],
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    root: Path,
+    num_classes: int,
+    resize: Sequence[int],
+    seed: int,
+    poison_epsilon: float,
+    poison_steps: int,
+    poison_step_size: float,
+    batch_size: int,
+    unlearnable_repo: str,
+) -> None:
+    _build_unlearnable_example_images(
+        clean_records,
+        output_root=root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+        num_classes=num_classes,
+        resize=resize,
+        seed=seed,
+        epsilon=poison_epsilon,
+        num_steps=poison_steps,
+        step_size=poison_step_size,
+        batch_size=batch_size,
+        unlearnable_repo=unlearnable_repo,
+    )
+
+    for record in clean_records:
+        poisoned_path = (
+            root
+            / "poisoned"
+            / POISONING_METHOD_UNLEARNABLE_EXAMPLES
+            / record["client_id"]
+            / record["relative_path"]
+        )
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(poisoned_path),
+                "is_poisoned": True,
+                "poisoning_method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+            }
+        )
+        metadata_rows.append(poisoned)
+
+
+def _append_requested_poisoning_rows(
+    metadata_rows: List[Dict[str, Any]],
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    requested_scenarios: Sequence[str],
+    root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    resize: Sequence[int],
+    poison_epsilon: float,
+    poison_steps: int,
+    poison_step_size: float,
+    batch_size: int,
+    unlearnable_repo: str,
+    random_label_flip_fraction: float,
+    target_label: int,
+    replacement_label: int,
+    shortcut_eps: float,
+    shortcut_patch_size: int,
+) -> None:
+    if POISONING_METHOD_UNLEARNABLE_EXAMPLES in requested_scenarios:
+        _append_unlearnable_example_rows(
+            metadata_rows,
+            clean_records,
+            root=root,
+            num_classes=len({int(row["label"]) for row in clean_records}),
+            resize=resize,
+            seed=seed,
+            poison_epsilon=poison_epsilon,
+            poison_steps=poison_steps,
+            poison_step_size=poison_step_size,
+            batch_size=batch_size,
+            unlearnable_repo=unlearnable_repo,
+        )
+
+    if POISONING_METHOD_RANDOM_LABEL_FLIPPING in requested_scenarios:
+        metadata_rows.extend(
+            _make_label_flip_rows(
+                clean_records,
+                method=POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+                output_root=root / "poisoned" / POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+                class_names=class_names,
+                seed=seed + 17,
+                random_flip_fraction=random_label_flip_fraction,
+                target_label=target_label,
+                replacement_label=replacement_label,
+            )
+        )
+
+    if POISONING_METHOD_TARGET_LABEL_FLIPPING in requested_scenarios:
+        metadata_rows.extend(
+            _make_label_flip_rows(
+                clean_records,
+                method=POISONING_METHOD_TARGET_LABEL_FLIPPING,
+                output_root=root / "poisoned" / POISONING_METHOD_TARGET_LABEL_FLIPPING,
+                class_names=class_names,
+                seed=seed + 31,
+                random_flip_fraction=random_label_flip_fraction,
+                target_label=target_label,
+                replacement_label=replacement_label,
+            )
+        )
+
+    if POISONING_METHOD_AVAILABILITY_SHORTCUTS in requested_scenarios:
+        metadata_rows.extend(
+            _make_availability_shortcut_rows(
+                clean_records,
+                output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                class_names=class_names,
+                seed=seed + 47,
+                resize=resize,
+                eps=shortcut_eps,
+                patch_size=shortcut_patch_size,
+            )
+        )
+
+
 def prepare_dataset(
     *,
     data_dir: str = DEFAULT_DATA_DIR,
@@ -453,34 +616,56 @@ def prepare_dataset(
     replacement_label: int = DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
     shortcut_eps: float = DEFAULT_AVAILABILITY_SHORTCUT_EPS,
     shortcut_patch_size: int = DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE,
+    prepare_scenarios: Optional[Any] = PREPARE_SCENARIO_ALL,
 ) -> Path:
     root = _dataset_root(data_dir)
-    if prepared_data_exists(data_dir, num_clients) and not force:
+    requested_scenarios = _parse_prepare_scenarios(prepare_scenarios)
+    if prepared_data_exists(data_dir, num_clients) and not force and set(requested_scenarios) == set(PREPARE_SCENARIOS):
         return root
 
     existing_rows = _read_metadata_rows(root)
     clean_records_from_existing = _clean_records_from_metadata(existing_rows)
-    if not force and clean_records_from_existing and _mode_complete(root, "clean", num_clients):
-        metadata_rows = [
-            row
-            for row in existing_rows
-            if row.get("poisoning_method") != POISONING_METHOD_AVAILABILITY_SHORTCUTS
+    if clean_records_from_existing and _mode_complete(root, "clean", num_clients) and (
+        not force or POISONING_METHOD_CLEAN not in requested_scenarios
+    ):
+        missing_or_requested = [
+            scenario
+            for scenario in requested_scenarios
+            if scenario != POISONING_METHOD_CLEAN
+            and (force or not _scenario_complete(root, scenario, existing_rows, num_clients))
         ]
+        if not missing_or_requested:
+            return root
+        metadata_rows = [row for row in existing_rows if row.get("poisoning_method") not in set(missing_or_requested)]
         class_names = _class_names_from_records(clean_records_from_existing)
-        metadata_rows.extend(
-            _make_availability_shortcut_rows(
-                clean_records_from_existing,
-                output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
-                class_names=class_names,
-                seed=seed + 47,
-                resize=resize,
-                eps=shortcut_eps,
-                patch_size=shortcut_patch_size,
-            )
+        _append_requested_poisoning_rows(
+            metadata_rows,
+            clean_records_from_existing,
+            requested_scenarios=missing_or_requested,
+            root=root,
+            class_names=class_names,
+            seed=seed,
+            resize=resize,
+            poison_epsilon=poison_epsilon,
+            poison_steps=poison_steps,
+            poison_step_size=poison_step_size,
+            batch_size=batch_size,
+            unlearnable_repo=unlearnable_repo,
+            random_label_flip_fraction=random_label_flip_fraction,
+            target_label=target_label,
+            replacement_label=replacement_label,
+            shortcut_eps=shortcut_eps,
+            shortcut_patch_size=shortcut_patch_size,
         )
         _write_metadata_rows(root, metadata_rows)
         (root / PREPARED_MARKER).write_text(json.dumps({"dataset": dataset_name, "num_clients": num_clients, "seed": seed}))
         return root
+
+    if POISONING_METHOD_CLEAN not in requested_scenarios:
+        raise FileNotFoundError(
+            "Clean prepared data is required before generating poisoning-only scenarios. "
+            f"Run with --prepare-scenarios {POISONING_METHOD_CLEAN} or --prepare-scenarios {PREPARE_SCENARIO_ALL} first."
+        )
 
     from datasets import load_dataset
 
@@ -526,65 +711,24 @@ def prepare_dataset(
             clean_records.append(record)
             metadata_rows.append(record)
 
-    _build_unlearnable_example_images(
+    _append_requested_poisoning_rows(
+        metadata_rows,
         clean_records,
-        output_root=root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
-        num_classes=len({int(row["label"]) for row in clean_records}),
-        resize=resize,
+        requested_scenarios=[scenario for scenario in requested_scenarios if scenario != POISONING_METHOD_CLEAN],
+        root=root,
+        class_names=class_names,
         seed=seed,
-        epsilon=poison_epsilon,
-        num_steps=poison_steps,
-        step_size=poison_step_size,
+        resize=resize,
+        poison_epsilon=poison_epsilon,
+        poison_steps=poison_steps,
+        poison_step_size=poison_step_size,
         batch_size=batch_size,
         unlearnable_repo=unlearnable_repo,
-    )
-
-    for record in clean_records:
-        poisoned_path = root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES / record["client_id"] / record["relative_path"]
-        poisoned = dict(record)
-        poisoned.update(
-            {
-                "image_path": str(poisoned_path),
-                "is_poisoned": True,
-                "poisoning_method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
-            }
-        )
-        metadata_rows.append(poisoned)
-
-    metadata_rows.extend(
-        _make_label_flip_rows(
-            clean_records,
-            method=POISONING_METHOD_RANDOM_LABEL_FLIPPING,
-            output_root=root / "poisoned" / POISONING_METHOD_RANDOM_LABEL_FLIPPING,
-            class_names=class_names,
-            seed=seed + 17,
-            random_flip_fraction=random_label_flip_fraction,
-            target_label=target_label,
-            replacement_label=replacement_label,
-        )
-    )
-    metadata_rows.extend(
-        _make_label_flip_rows(
-            clean_records,
-            method=POISONING_METHOD_TARGET_LABEL_FLIPPING,
-            output_root=root / "poisoned" / POISONING_METHOD_TARGET_LABEL_FLIPPING,
-            class_names=class_names,
-            seed=seed + 31,
-            random_flip_fraction=random_label_flip_fraction,
-            target_label=target_label,
-            replacement_label=replacement_label,
-        )
-    )
-    metadata_rows.extend(
-        _make_availability_shortcut_rows(
-            clean_records,
-            output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
-            class_names=class_names,
-            seed=seed + 47,
-            resize=resize,
-            eps=shortcut_eps,
-            patch_size=shortcut_patch_size,
-        )
+        random_label_flip_fraction=random_label_flip_fraction,
+        target_label=target_label,
+        replacement_label=replacement_label,
+        shortcut_eps=shortcut_eps,
+        shortcut_patch_size=shortcut_patch_size,
     )
 
     _write_metadata_rows(root, metadata_rows)
@@ -732,6 +876,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_args(parser)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--prepare-scenarios",
+        default=PREPARE_SCENARIO_ALL,
+        help=(
+            "Comma-separated dataset scenarios to generate. "
+            f"Use {PREPARE_SCENARIO_ALL!r} or exact names: {', '.join(PREPARE_SCENARIOS)}. "
+            f"Example: --prepare-scenarios {POISONING_METHOD_AVAILABILITY_SHORTCUTS}"
+        ),
+    )
     parser.add_argument("--poison-epsilon", type=float, default=8.0)
     parser.add_argument("--poison-steps", type=int, default=5)
     parser.add_argument("--poison-step-size", type=float, default=0.8)
@@ -761,6 +914,7 @@ def main() -> None:
         replacement_label=args.replacement_label,
         shortcut_eps=args.shortcut_eps,
         shortcut_patch_size=args.shortcut_patch_size,
+        prepare_scenarios=args.prepare_scenarios,
     )
     print(root)
 
