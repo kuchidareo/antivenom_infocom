@@ -250,8 +250,8 @@ main() {
       if (( ${#condition_args[@]} > 0 )); then
         ml_methods="$(normalize_conditions yes "${condition_args[@]}")"
       fi
-      check_remote_python
       pull_remote_repos
+      check_remote_python
       run_local_ml "$ml_methods"
       ;;
     fl-dry-run)
@@ -272,8 +272,8 @@ main() {
           exit 1
         fi
       fi
-      dry_run_fl "$fl_methods"
       pull_remote_repos
+      dry_run_fl "$fl_methods"
       run_fl "$fl_methods"
       ;;
     both)
@@ -285,11 +285,11 @@ main() {
           exit 1
         fi
       fi
+      pull_remote_repos
       check_remote_python
-      pull_remote_repos
       run_local_ml "$ml_methods"
-      dry_run_fl "$fl_methods"
       pull_remote_repos
+      dry_run_fl "$fl_methods"
       run_fl "$fl_methods"
       ;;
     *)

@@ -20,6 +20,13 @@ REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
 REMOTE_REPO_DIR="${REMOTE_PROJECT_DIR:h}"
 REMOTE_PYTHON="$(config_value DEFAULT_REMOTE_PYTHON)"
 SSH_USER="$(config_value DEFAULT_SSH_USER)"
+BG_WORKLOAD_ENABLED="${BG_WORKLOAD_ENABLED:-1}"
+BG_WORKLOAD_GROUP="${BG_WORKLOAD_GROUP:-$(config_value DEFAULT_BACKGROUND_WORKLOAD_GROUP)}"
+BG_WORKLOAD_PROFILE="${BG_WORKLOAD_PROFILE:-$(config_value DEFAULT_BACKGROUND_WORKLOAD_PROFILE)}"
+BG_WORKLOAD_TEST_DURATION="${BG_WORKLOAD_TEST_DURATION:-10}"
+BG_WORKLOAD_PID_FILE="${BG_WORKLOAD_PID_FILE:-/tmp/antivenom_bg_workload.pid}"
+BG_WORKLOAD_PYTHON="${BG_WORKLOAD_PYTHON:-/home/rasheed/kuchida/antivenom_infocom/venv/bin/python}"
+BG_WORKLOAD_CHECKED=0
 
 normalize_method_token() {
   local token="${1:l}"
@@ -134,6 +141,116 @@ pull_remote_repos() {
   done
 }
 
+bg_args_for_python() {
+  if [[ "$BG_WORKLOAD_ENABLED" != "1" ]]; then
+    print -- ""
+    return
+  fi
+  print -- "--background-workload-enabled --background-workload-group '$BG_WORKLOAD_GROUP' --background-workload-profile '$BG_WORKLOAD_PROFILE'"
+}
+
+bg_requires_perception() {
+  case "$BG_WORKLOAD_GROUP" in
+    group1|perception|both|all)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+check_bg_workloads() {
+  if [[ "$BG_WORKLOAD_ENABLED" != "1" || "$BG_WORKLOAD_CHECKED" == "1" ]]; then
+    return
+  fi
+  print "Checking background workload dependencies on all devices..."
+  local perception_check=""
+  if bg_requires_perception; then
+    perception_check="test -x '$BG_WORKLOAD_PYTHON' && '$BG_WORKLOAD_PYTHON' -c 'import cv2, numpy'"
+  else
+    perception_check="true"
+  fi
+  for device in "${(@f)$(device_lines)}"; do
+    local host="${device#*:}"
+    print "Checking bg workload on ${host}..."
+    ssh_run "$host" "
+      cd '$REMOTE_PROJECT_DIR' &&
+      test -x ./run_bg_workloads.sh &&
+      $perception_check &&
+      if ! command -v iperf3 >/dev/null 2>&1; then
+        echo '[bg][warn] iperf3 not found; communication workload will be skipped.'
+      fi &&
+      cd '$REMOTE_PROJECT_DIR' &&
+      PYTHON_BIN='$BG_WORKLOAD_PYTHON' ./run_bg_workloads.sh --group '$BG_WORKLOAD_GROUP' --profile '$BG_WORKLOAD_PROFILE' --dry-run &&
+      PYTHON_BIN='$BG_WORKLOAD_PYTHON' ./run_bg_workloads.sh --group '$BG_WORKLOAD_GROUP' --profile '$BG_WORKLOAD_PROFILE' --test --duration-sec '$BG_WORKLOAD_TEST_DURATION'
+    "
+  done
+  BG_WORKLOAD_CHECKED=1
+}
+
+start_bg_workloads() {
+  if [[ "$BG_WORKLOAD_ENABLED" != "1" ]]; then
+    return
+  fi
+  print "Starting background workloads on all devices: group=${BG_WORKLOAD_GROUP}, profile=${BG_WORKLOAD_PROFILE}"
+  for device in "${(@f)$(device_lines)}"; do
+    local host="${device#*:}"
+    ssh_run "$host" "
+      cd '$REMOTE_PROJECT_DIR' &&
+      mkdir -p logs/bg_workloads &&
+      if [ -f '$BG_WORKLOAD_PID_FILE' ] && kill -0 \$(cat '$BG_WORKLOAD_PID_FILE') 2>/dev/null; then
+        echo 'bg workload already running on ${host}: pid='\"\$(cat '$BG_WORKLOAD_PID_FILE')\";
+      else
+        nohup env PYTHON_BIN='$BG_WORKLOAD_PYTHON' ./run_bg_workloads.sh --group '$BG_WORKLOAD_GROUP' --profile '$BG_WORKLOAD_PROFILE' > logs/bg_workloads/run_bg_workloads.out 2>&1 < /dev/null &
+        echo \$! > '$BG_WORKLOAD_PID_FILE'
+        sleep 2
+        if ! kill -0 \$(cat '$BG_WORKLOAD_PID_FILE') 2>/dev/null; then
+          echo 'bg workload failed to stay running on ${host}' >&2
+          tail -n 80 logs/bg_workloads/run_bg_workloads.out >&2 || true
+          exit 1
+        fi
+        echo 'bg workload started on ${host}: pid='\"\$(cat '$BG_WORKLOAD_PID_FILE')\";
+      fi
+    "
+  done
+}
+
+stop_bg_workloads() {
+  if [[ "$BG_WORKLOAD_ENABLED" != "1" ]]; then
+    return
+  fi
+  print "Stopping background workloads on all devices..."
+  for device in "${(@f)$(device_lines)}"; do
+    local host="${device#*:}"
+    ssh_run "$host" "
+      if [ -f '$BG_WORKLOAD_PID_FILE' ]; then
+        pid=\$(cat '$BG_WORKLOAD_PID_FILE')
+        kill \"\$pid\" 2>/dev/null || true
+        sleep 1
+        kill -9 \"\$pid\" 2>/dev/null || true
+        rm -f '$BG_WORKLOAD_PID_FILE'
+        echo 'bg workload stopped on ${host}'
+      else
+        echo 'no bg workload pid file on ${host}'
+      fi
+    " || true
+  done
+}
+
+run_with_bg_workloads() {
+  local status=0
+  check_bg_workloads
+  start_bg_workloads || {
+    status=$?
+    stop_bg_workloads
+    return "$status"
+  }
+  "$@" || status=$?
+  stop_bg_workloads
+  return "$status"
+}
+
 run_local_ml() {
   local methods="${1:-}"
   local method_option=""
@@ -149,7 +266,7 @@ run_local_ml() {
   else
     print "Starting local ML on all devices using experiment_config.py defaults..."
   fi
-  extra_options="$reference_option $method_option"
+  extra_options="$reference_option $method_option $(bg_args_for_python)"
   for device in "${(@f)$(device_lines)}"; do
     local client_id="${device%%:*}"
     local host="${device#*:}"
@@ -167,7 +284,11 @@ run_local_ml() {
 
 dry_run_fl() {
   local methods="${1:-}"
-  local -a method_args
+  local -a method_args bg_args
+  bg_args=()
+  if [[ "$BG_WORKLOAD_ENABLED" == "1" ]]; then
+    bg_args=(--background-workload-enabled --background-workload-group "$BG_WORKLOAD_GROUP" --background-workload-profile "$BG_WORKLOAD_PROFILE")
+  fi
   if [[ -n "$methods" ]]; then
     method_args=(--poisoning-methods "$methods")
     print "Previewing FL SSH commands for attack conditions: $methods"
@@ -179,12 +300,17 @@ dry_run_fl() {
   "$SERVER_PYTHON" running_fl.py \
     --dry-run \
     --ssh-password "$SSH_PASSWORD" \
+    "${bg_args[@]}" \
     "${method_args[@]}"
 }
 
 run_fl() {
   local methods="${1:-}"
-  local -a method_args
+  local -a method_args bg_args
+  bg_args=()
+  if [[ "$BG_WORKLOAD_ENABLED" == "1" ]]; then
+    bg_args=(--background-workload-enabled --background-workload-group "$BG_WORKLOAD_GROUP" --background-workload-profile "$BG_WORKLOAD_PROFILE")
+  fi
   if [[ -n "$methods" ]]; then
     method_args=(--poisoning-methods "$methods")
     print "Starting FL experiments for attack conditions: $methods"
@@ -196,6 +322,7 @@ run_fl() {
   "$SERVER_PYTHON" running_fl.py \
     --ssh-password "$SSH_PASSWORD" \
     --server-log-hardware \
+    "${bg_args[@]}" \
     "${method_args[@]}"
   print "FL finished."
 }
@@ -221,6 +348,12 @@ Examples:
 Experiment settings are read from experiment_config.py.
 For password-based SSH:
   export SSH_PASSWORD='your_password'
+Background workload defaults for this bg-noise directory:
+  BG_WORKLOAD_ENABLED=1
+  BG_WORKLOAD_GROUP=both
+  BG_WORKLOAD_PROFILE=medium
+  BG_WORKLOAD_TEST_DURATION=10
+  BG_WORKLOAD_PYTHON=/home/rasheed/kuchida/antivenom_infocom/venv/bin/python
 Do not run local ML and FL at the same time.
 EOF
 }
@@ -245,6 +378,7 @@ main() {
   case "$mode" in
     check)
       check_remote_python
+      check_bg_workloads
       ;;
     ml)
       if (( ${#condition_args[@]} > 0 )); then
@@ -252,7 +386,7 @@ main() {
       fi
       pull_remote_repos
       check_remote_python
-      run_local_ml "$ml_methods"
+      run_with_bg_workloads run_local_ml "$ml_methods"
       ;;
     fl-dry-run)
       if (( ${#condition_args[@]} > 0 )); then
@@ -274,7 +408,7 @@ main() {
       fi
       pull_remote_repos
       dry_run_fl "$fl_methods"
-      run_fl "$fl_methods"
+      run_with_bg_workloads run_fl "$fl_methods"
       ;;
     both)
       if (( ${#condition_args[@]} > 0 )); then
@@ -287,10 +421,10 @@ main() {
       fi
       pull_remote_repos
       check_remote_python
-      run_local_ml "$ml_methods"
+      run_with_bg_workloads run_local_ml "$ml_methods"
       pull_remote_repos
       dry_run_fl "$fl_methods"
-      run_fl "$fl_methods"
+      run_with_bg_workloads run_fl "$fl_methods"
       ;;
     *)
       usage

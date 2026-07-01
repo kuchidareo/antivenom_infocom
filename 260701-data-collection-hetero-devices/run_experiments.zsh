@@ -13,7 +13,7 @@ config_value() {
 
 device_lines() {
   cd "$SERVER_PROJECT_DIR"
-  "$SERVER_PYTHON" -c "import experiment_config as c; [print(f\"{d['client_id']}:{d['host']}\") for d in c.DEVICES]"
+  "$SERVER_PYTHON" -c "import experiment_config as c; [print('|'.join([d['client_id'], d['host'], c.device_ssh_user(d), c.device_remote_project_dir(d), c.device_remote_python(d), d.get('device_type', ''), d.get('source_host', d['host'])])) for d in c.DEVICES]"
 }
 
 REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
@@ -92,10 +92,16 @@ normalize_conditions() {
   print -- "${(j:,:)methods}"
 }
 
+split_device_line() {
+  local line="$1"
+  device_fields=("${(@ps:|:)line}")
+}
+
 ssh_target() {
-  local host="$1"
-  if [[ -n "$SSH_USER" ]]; then
-    print -- "${SSH_USER}@${host}"
+  local user="$1"
+  local host="$2"
+  if [[ -n "$user" ]]; then
+    print -- "${user}@${host}"
   else
     print -- "$host"
   fi
@@ -104,8 +110,9 @@ ssh_target() {
 ssh_run() {
   local host="$1"
   local remote_command="$2"
+  local user="${3:-$SSH_USER}"
   local target
-  target="$(ssh_target "$host")"
+  target="$(ssh_target "$user" "$host")"
   if [[ -n "$SSH_PASSWORD" ]]; then
     if ! command -v sshpass >/dev/null 2>&1; then
       print "SSH_PASSWORD is set, but sshpass is not installed." >&2
@@ -121,16 +128,26 @@ ssh_run() {
 check_remote_python() {
   print "Checking remote Python on all devices..."
   for device in "${(@f)$(device_lines)}"; do
-    local host="${device#*:}"
-    ssh_run "$host" "cd '$REMOTE_PROJECT_DIR' && '$REMOTE_PYTHON' --version"
+    local -a device_fields
+    split_device_line "$device"
+    local host="${device_fields[2]}"
+    local ssh_user="${device_fields[3]}"
+    local remote_project_dir="${device_fields[4]}"
+    local remote_python="${device_fields[5]}"
+    ssh_run "$host" "cd '$remote_project_dir' && '$remote_python' --version" "$ssh_user"
   done
 }
 
 pull_remote_repos() {
   print "Updating remote repositories with git pull --rebase..."
   for device in "${(@f)$(device_lines)}"; do
-    local host="${device#*:}"
-    ssh_run "$host" "cd '$REMOTE_REPO_DIR' && git pull --rebase"
+    local -a device_fields
+    split_device_line "$device"
+    local host="${device_fields[2]}"
+    local ssh_user="${device_fields[3]}"
+    local remote_project_dir="${device_fields[4]}"
+    local remote_repo_dir="${remote_project_dir:h}"
+    ssh_run "$host" "cd '$remote_repo_dir' && git pull --rebase" "$ssh_user"
   done
 }
 
@@ -151,15 +168,24 @@ run_local_ml() {
   fi
   extra_options="$reference_option $method_option"
   for device in "${(@f)$(device_lines)}"; do
-    local client_id="${device%%:*}"
-    local host="${device#*:}"
+    local -a device_fields
+    split_device_line "$device"
+    local client_id="${device_fields[1]}"
+    local host="${device_fields[2]}"
+    local ssh_user="${device_fields[3]}"
+    local remote_project_dir="${device_fields[4]}"
+    local remote_python="${device_fields[5]}"
+    local device_type="${device_fields[6]}"
+    local source_host="${device_fields[7]}"
     ssh_run "$host" "
-      cd '$REMOTE_PROJECT_DIR' &&
-      '$REMOTE_PYTHON' running_ml.py \
+      cd '$remote_project_dir' &&
+      '$remote_python' running_ml.py \
         --client-id '$client_id' \
         --device-id '$host' \
-        --host '$host' $extra_options
-    " &
+        --host '$host' \
+        --device-type '$device_type' \
+        --source-host '$source_host' $extra_options
+    " "$ssh_user" &
   done
   wait
   print "Local ML finished."
