@@ -47,8 +47,9 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
             poisoning_method=poisoning_method,
             split=self.args.dataset_split,
             augment=self.augment,
-            batch_size=int(config.get("batch_size", self.args.batch_size)),
+            batch_size=self.args.batch_size,
             shuffle=True,
+            max_samples=self.args.max_samples,
         )
         metrics = train_model(
             model=self.model,
@@ -76,6 +77,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
             augment=self.augment,
             batch_size=self.args.batch_size,
             shuffle=False,
+            max_samples=self.args.max_samples,
         )
         metrics = evaluate_model(
             model=self.model,
@@ -127,6 +129,7 @@ def main() -> None:
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,
+        max_samples=args.max_samples,
     )
     condition = condition_columns(
         args=args,

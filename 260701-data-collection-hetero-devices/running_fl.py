@@ -23,6 +23,8 @@ from experiment_config import (
     POISONING_ATTACK_METHODS,
     add_common_args,
     augment_from_args,
+    device_batch_size,
+    device_max_samples,
     device_remote_project_dir,
     device_remote_python,
     device_ssh_user,
@@ -38,6 +40,8 @@ def _arg(name: str, value: object) -> List[str]:
 def _client_command(args: argparse.Namespace, device: dict, seed: int, poisoned_ids: List[str]) -> str:
     remote_python = device_remote_python(device)
     remote_project_dir = device_remote_project_dir(device)
+    batch_size = device_batch_size(device)
+    max_samples = device_max_samples(device)
     client_args = [
         remote_python,
         "fl_client.py",
@@ -46,7 +50,8 @@ def _client_command(args: argparse.Namespace, device: dict, seed: int, poisoned_
         *_arg("--data-dir", args.data_dir),
         *_arg("--log-dir", args.log_dir),
         *_arg("--model", args.model),
-        *_arg("--batch-size", args.batch_size),
+        *_arg("--batch-size", batch_size),
+        *_arg("--max-samples", max_samples),
         *_arg("--local-epochs", args.local_epochs),
         *_arg("--num-rounds", args.num_rounds),
         *_arg("--learning-rate", args.learning_rate),

@@ -26,6 +26,10 @@ BG_WORKLOAD_PROFILE="${BG_WORKLOAD_PROFILE:-$(config_value DEFAULT_BACKGROUND_WO
 BG_WORKLOAD_TEST_DURATION="${BG_WORKLOAD_TEST_DURATION:-10}"
 BG_WORKLOAD_PID_FILE="${BG_WORKLOAD_PID_FILE:-/tmp/antivenom_bg_workload.pid}"
 BG_WORKLOAD_PYTHON="${BG_WORKLOAD_PYTHON:-/home/rasheed/kuchida/antivenom_infocom/venv/bin/python}"
+BG_INSTALL_DEPENDENCIES="${BG_INSTALL_DEPENDENCIES:-1}"
+BG_INSTALL_OPENCV="${BG_INSTALL_OPENCV:-1}"
+BG_INSTALL_IPERF3="${BG_INSTALL_IPERF3:-1}"
+BG_OPENCV_PIP_PACKAGE="${BG_OPENCV_PIP_PACKAGE:-opencv-python-headless}"
 BG_WORKLOAD_CHECKED=0
 
 normalize_method_token() {
@@ -160,10 +164,75 @@ bg_requires_perception() {
   esac
 }
 
+bg_requires_comms() {
+  case "$BG_WORKLOAD_GROUP" in
+    group2|aux|both|all)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_bg_dependencies() {
+  if [[ "$BG_WORKLOAD_ENABLED" != "1" || "$BG_INSTALL_DEPENDENCIES" != "1" ]]; then
+    return
+  fi
+
+  local need_opencv=0
+  local need_iperf3=0
+  if bg_requires_perception && [[ "$BG_INSTALL_OPENCV" == "1" ]]; then
+    need_opencv=1
+  fi
+  if bg_requires_comms && [[ "$BG_INSTALL_IPERF3" == "1" ]]; then
+    need_iperf3=1
+  fi
+  if [[ "$need_opencv" != "1" && "$need_iperf3" != "1" ]]; then
+    return
+  fi
+
+  print "Installing missing background workload dependencies on all devices..."
+  for device in "${(@f)$(device_lines)}"; do
+    local host="${device#*:}"
+    print "Ensuring bg dependencies on ${host}..."
+    ssh_run "$host" "
+      set -e
+      cd '$REMOTE_PROJECT_DIR'
+      if [ '$need_opencv' = '1' ]; then
+        if '$BG_WORKLOAD_PYTHON' -c 'import cv2, numpy' >/dev/null 2>&1; then
+          echo '[bg][deps] cv2/numpy already available'
+        else
+          echo '[bg][deps] installing $BG_OPENCV_PIP_PACKAGE into $BG_WORKLOAD_PYTHON'
+          '$BG_WORKLOAD_PYTHON' -m pip install --upgrade '$BG_OPENCV_PIP_PACKAGE'
+          '$BG_WORKLOAD_PYTHON' -c 'import cv2, numpy; print(\"[bg][deps] cv2/numpy import ok\")'
+        fi
+      fi
+      if [ '$need_iperf3' = '1' ]; then
+        if command -v iperf3 >/dev/null 2>&1; then
+          echo '[bg][deps] iperf3 already installed'
+        else
+          echo '[bg][deps] installing iperf3 with apt-get'
+          if [ -n '$SSH_PASSWORD' ]; then
+            printf '%s\n' '$SSH_PASSWORD' | sudo -S env DEBIAN_FRONTEND=noninteractive apt-get update
+            printf '%s\n' '$SSH_PASSWORD' | sudo -S env DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3
+          else
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3
+          fi
+          command -v iperf3 >/dev/null 2>&1
+          echo '[bg][deps] iperf3 install ok'
+        fi
+      fi
+    "
+  done
+}
+
 check_bg_workloads() {
   if [[ "$BG_WORKLOAD_ENABLED" != "1" || "$BG_WORKLOAD_CHECKED" == "1" ]]; then
     return
   fi
+  install_bg_dependencies
   print "Checking background workload dependencies on all devices..."
   local perception_check=""
   if bg_requires_perception; then
@@ -354,6 +423,10 @@ Background workload defaults for this bg-noise directory:
   BG_WORKLOAD_PROFILE=medium
   BG_WORKLOAD_TEST_DURATION=10
   BG_WORKLOAD_PYTHON=/home/rasheed/kuchida/antivenom_infocom/venv/bin/python
+  BG_INSTALL_DEPENDENCIES=1
+  BG_INSTALL_OPENCV=1
+  BG_INSTALL_IPERF3=1
+  BG_OPENCV_PIP_PACKAGE=opencv-python-headless
 Do not run local ML and FL at the same time.
 EOF
 }

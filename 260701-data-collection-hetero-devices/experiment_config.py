@@ -93,7 +93,15 @@ DEVICES = [
         "device_type": "jetson_orin",
         "source_host": "192.168.0.114",
     },
-    {"client_id": "client_3", "host": "192.168.0.115", "ssh_user": "rasheed", "device_type": "raspberry_pi_4", "source_host": "192.168.0.115"},
+    {
+        "client_id": "client_3",
+        "host": "192.168.0.115",
+        "ssh_user": "rasheed",
+        "device_type": "raspberry_pi_3",
+        "source_host": "192.168.0.115",
+        "batch_size": 4,
+        "max_samples": 64,
+    },
     {"client_id": "client_4", "host": "192.168.0.116", "ssh_user": "rasheed", "device_type": "raspberry_pi_4", "source_host": "192.168.0.116"},
     {"client_id": "client_5", "host": "192.168.0.117", "ssh_user": "rasheed", "device_type": "raspberry_pi_4", "source_host": "192.168.0.117"},
     {"client_id": "client_6", "host": "192.168.0.118", "ssh_user": "rasheed", "device_type": "raspberry_pi_4", "source_host": "192.168.0.118"},
@@ -129,6 +137,7 @@ CSV_COLUMNS = [
     "client_partition_id",
     "model",
     "batch_size",
+    "max_samples",
     "local_epochs",
     "num_rounds",
     "learning_rate",
@@ -180,6 +189,7 @@ CONDITION_COLUMNS = [
     "client_partition_id",
     "model",
     "batch_size",
+    "max_samples",
     "local_epochs",
     "num_rounds",
     "learning_rate",
@@ -258,6 +268,14 @@ def device_remote_python(device: Dict[str, str]) -> str:
     return device.get("remote_python", DEFAULT_REMOTE_PYTHON)
 
 
+def device_batch_size(device: Dict[str, Any]) -> int:
+    return int(device.get("batch_size", DEFAULT_BATCH_SIZE))
+
+
+def device_max_samples(device: Dict[str, Any]) -> int:
+    return int(device.get("max_samples", 0) or 0)
+
+
 def select_poisoned_clients(num_clients: int, poisoned_client_count: int, seed: int) -> List[str]:
     rng = random.Random(seed)
     selected = rng.sample(range(num_clients), poisoned_client_count)
@@ -321,6 +339,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--local-epochs", type=int, default=DEFAULT_LOCAL_EPOCHS)
     parser.add_argument("--num-rounds", type=int, default=DEFAULT_NUM_ROUNDS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
@@ -381,6 +400,7 @@ def condition_columns(
         "client_partition_id": client_id,
         "model": getattr(args, "model", DEFAULT_MODEL),
         "batch_size": getattr(args, "batch_size", DEFAULT_BATCH_SIZE),
+        "max_samples": getattr(args, "max_samples", 0),
         "local_epochs": getattr(args, "local_epochs", DEFAULT_LOCAL_EPOCHS),
         "num_rounds": getattr(args, "num_rounds", DEFAULT_NUM_ROUNDS),
         "learning_rate": getattr(args, "learning_rate", DEFAULT_LEARNING_RATE),

@@ -44,6 +44,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         augment=augment,
         batch_size=args.batch_size,
         shuffle=True,
+        max_samples=args.max_samples,
     )
     eval_loader = get_dataloader(
         data_dir=args.data_dir,
@@ -53,6 +54,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         augment=augment,
         batch_size=args.batch_size,
         shuffle=False,
+        max_samples=args.max_samples,
     )
     state = TrainingState(round=0, epoch=0, batch_idx=0, phase="idle")
     poison_fraction = get_poison_fraction(
@@ -60,6 +62,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,
+        max_samples=args.max_samples,
     )
     condition = condition_columns(
         args=args,

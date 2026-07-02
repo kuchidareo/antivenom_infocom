@@ -761,6 +761,7 @@ class LocalImageDataset:
         poisoning_method: str,
         split: str = "train",
         transform: Any = None,
+        max_samples: int = 0,
     ) -> None:
         torch, _, _, Dataset = _require_torch()
 
@@ -789,6 +790,8 @@ class LocalImageDataset:
             poisoning_method=poisoning_method,
             split=split,
         )
+        if max_samples and max_samples > 0:
+            self.records = self.records[:max_samples]
         self._dataset = _Dataset(self)
 
     def __len__(self) -> int:
@@ -825,6 +828,7 @@ def get_poison_fraction(
     client_id: str,
     poisoning_method: str,
     split: str = "train",
+    max_samples: int = 0,
 ) -> float:
     records = load_metadata_records(
         data_dir=data_dir,
@@ -832,6 +836,8 @@ def get_poison_fraction(
         poisoning_method=poisoning_method,
         split=split,
     )
+    if max_samples and max_samples > 0:
+        records = records[:max_samples]
     if not records:
         return 0.0
     poisoned = 0
@@ -860,6 +866,7 @@ def get_dataloader(
     augment: Dict[str, Any],
     batch_size: int,
     shuffle: bool,
+    max_samples: int = 0,
 ) -> Any:
     _, _, DataLoader, _ = _require_torch()
     dataset = LocalImageDataset(
@@ -868,6 +875,7 @@ def get_dataloader(
         poisoning_method=poisoning_method,
         split=split,
         transform=build_transform(augment),
+        max_samples=max_samples,
     )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 

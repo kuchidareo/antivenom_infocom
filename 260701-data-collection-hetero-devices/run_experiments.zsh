@@ -13,7 +13,7 @@ config_value() {
 
 device_lines() {
   cd "$SERVER_PROJECT_DIR"
-  "$SERVER_PYTHON" -c "import experiment_config as c; [print('|'.join([d['client_id'], d['host'], c.device_ssh_user(d), c.device_remote_project_dir(d), c.device_remote_python(d), d.get('device_type', ''), d.get('source_host', d['host'])])) for d in c.DEVICES]"
+  "$SERVER_PYTHON" -c "import experiment_config as c; [print('|'.join([d['client_id'], d['host'], c.device_ssh_user(d), c.device_remote_project_dir(d), c.device_remote_python(d), d.get('device_type', ''), d.get('source_host', d['host']), str(c.device_batch_size(d)), str(c.device_max_samples(d))])) for d in c.DEVICES]"
 }
 
 REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
@@ -177,6 +177,8 @@ run_local_ml() {
     local remote_python="${device_fields[5]}"
     local device_type="${device_fields[6]}"
     local source_host="${device_fields[7]}"
+    local batch_size="${device_fields[8]}"
+    local max_samples="${device_fields[9]}"
     ssh_run "$host" "
       cd '$remote_project_dir' &&
       '$remote_python' running_ml.py \
@@ -184,7 +186,9 @@ run_local_ml() {
         --device-id '$host' \
         --host '$host' \
         --device-type '$device_type' \
-        --source-host '$source_host' $extra_options
+        --source-host '$source_host' \
+        --batch-size '$batch_size' \
+        --max-samples '$max_samples' $extra_options
     " "$ssh_user" &
   done
   wait
