@@ -78,12 +78,53 @@ def _safe_class_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(name))
 
 
-def _dataset_root(data_dir: str) -> Path:
-    return Path(data_dir) / "small_trashnet"
+def dataset_slug(dataset_name: Optional[str] = None) -> str:
+    name = dataset_name or os.environ.get("DATASET_NAME", DATASET_NAME)
+    slug = name.rstrip("/").split("/")[-1]
+    return _safe_class_name(slug)
 
 
-def prepared_data_exists(data_dir: str, num_clients: int = DEFAULT_NUM_CLIENTS) -> bool:
-    root = _dataset_root(data_dir)
+def _dataset_root(data_dir: str, dataset_name: Optional[str] = None) -> Path:
+    return Path(data_dir) / dataset_slug(dataset_name)
+
+
+def _resolve_metadata_image_path(
+    image_path: str,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+) -> str:
+    """Resolve old metadata paths after moving data_dir.
+
+    Older metadata stores paths such as data/small_trashnet/clean/...
+    When data_dir is now ../iid-data, the correct path is
+    ../iid-data/small_trashnet/clean/...
+    """
+    root = _dataset_root(data_dir, dataset_name)
+    raw = Path(image_path)
+    slug = dataset_slug(dataset_name)
+    candidates: List[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        parts = raw.parts
+        if slug in parts:
+            slug_idx = parts.index(slug)
+            candidates.append(root.joinpath(*parts[slug_idx + 1 :]))
+        candidates.extend([root / raw, Path(data_dir) / raw, raw])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0] if candidates else raw)
+
+
+def prepared_data_exists(
+    data_dir: str,
+    num_clients: int = DEFAULT_NUM_CLIENTS,
+    dataset_name: Optional[str] = None,
+) -> bool:
+    root = _dataset_root(data_dir, dataset_name)
     if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
         return False
     required_modes = [
@@ -101,27 +142,48 @@ def prepared_data_exists(data_dir: str, num_clients: int = DEFAULT_NUM_CLIENTS) 
 
 
 def _extract_image_label(example: Dict[str, Any]) -> Tuple[Image.Image, int]:
-    image = example.get("image") or example.get("img")
+    image = None
+    for key in ("image", "img", "pixel_values"):
+        if key in example:
+            image = example[key]
+            break
     if image is None:
         for value in example.values():
             if isinstance(value, Image.Image):
                 image = value
                 break
-    label = example.get("label")
-    if label is None:
-        label = example.get("labels")
+    label = None
+    for key in ("label", "labels", "class", "target"):
+        if key in example:
+            label = example[key]
+            break
     if image is None or label is None:
         raise ValueError(f"Could not infer image/label fields from dataset example keys: {list(example.keys())}")
+    if not isinstance(image, Image.Image):
+        if isinstance(image, (str, os.PathLike)):
+            image = Image.open(image)
+        else:
+            try:
+                import numpy as np
+
+                image = Image.fromarray(np.asarray(image))
+            except Exception as exc:
+                raise ValueError(f"Could not convert image value of type {type(image)!r} to PIL.Image") from exc
     return image.convert("RGB"), int(label)
 
 
 def _class_names(ds: Any) -> List[str]:
     features = getattr(ds, "features", {})
-    label_feature = features.get("label") if hasattr(features, "get") else None
+    label_feature = None
+    if hasattr(features, "get"):
+        for key in ("label", "labels", "class", "target"):
+            label_feature = features.get(key)
+            if label_feature is not None:
+                break
     names = getattr(label_feature, "names", None)
     if names:
         return list(names)
-    labels = sorted({int(row["label"]) for row in ds if "label" in row})
+    labels = sorted({_extract_image_label(row)[1] for row in ds})
     return [str(label) for label in labels]
 
 
@@ -618,9 +680,14 @@ def prepare_dataset(
     shortcut_patch_size: int = DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE,
     prepare_scenarios: Optional[Any] = PREPARE_SCENARIO_ALL,
 ) -> Path:
-    root = _dataset_root(data_dir)
+    os.environ["DATASET_NAME"] = dataset_name
+    root = _dataset_root(data_dir, dataset_name)
     requested_scenarios = _parse_prepare_scenarios(prepare_scenarios)
-    if prepared_data_exists(data_dir, num_clients) and not force and set(requested_scenarios) == set(PREPARE_SCENARIOS):
+    if (
+        prepared_data_exists(data_dir, num_clients, dataset_name)
+        and not force
+        and set(requested_scenarios) == set(PREPARE_SCENARIOS)
+    ):
         return root
 
     existing_rows = _read_metadata_rows(root)
@@ -757,6 +824,7 @@ class LocalImageDataset:
         self,
         *,
         data_dir: str,
+        dataset_name: Optional[str] = None,
         client_id: str,
         poisoning_method: str,
         split: str = "train",
@@ -779,12 +847,14 @@ class LocalImageDataset:
                 return image, int(record["label"])
 
         self.data_dir = data_dir
+        self.dataset_name = dataset_name
         self.client_id = client_id
         self.poisoning_method = poisoning_method
         self.split = split
         self.transform = transform
         self.records = load_metadata_records(
             data_dir=data_dir,
+            dataset_name=dataset_name,
             client_id=client_id,
             poisoning_method=poisoning_method,
             split=split,
@@ -801,33 +871,40 @@ class LocalImageDataset:
 def load_metadata_records(
     *,
     data_dir: str,
+    dataset_name: Optional[str] = None,
     client_id: str,
     poisoning_method: str,
     split: str = "train",
 ) -> List[Dict[str, Any]]:
-    path = _dataset_root(data_dir) / METADATA_NAME
+    path = _dataset_root(data_dir, dataset_name) / METADATA_NAME
     if not path.exists():
         raise FileNotFoundError(f"Prepared metadata not found: {path}. Run dataset_preparation.py first.")
     with path.open(newline="") as f:
         rows = list(csv.DictReader(f))
-    return [
-        row
-        for row in rows
-        if row["client_id"] == client_id
-        and row["poisoning_method"] == poisoning_method
-        and row["dataset_split"] == split
-    ]
+    selected: List[Dict[str, Any]] = []
+    for row in rows:
+        if (
+            row["client_id"] == client_id
+            and row["poisoning_method"] == poisoning_method
+            and row["dataset_split"] == split
+        ):
+            row = dict(row)
+            row["image_path"] = _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
+            selected.append(row)
+    return selected
 
 
 def get_poison_fraction(
     *,
     data_dir: str,
+    dataset_name: Optional[str] = None,
     client_id: str,
     poisoning_method: str,
     split: str = "train",
 ) -> float:
     records = load_metadata_records(
         data_dir=data_dir,
+        dataset_name=dataset_name,
         client_id=client_id,
         poisoning_method=poisoning_method,
         split=split,
@@ -843,8 +920,8 @@ def get_poison_fraction(
     return poisoned / len(records)
 
 
-def get_num_classes(data_dir: str) -> int:
-    path = _dataset_root(data_dir) / METADATA_NAME
+def get_num_classes(data_dir: str, dataset_name: Optional[str] = None) -> int:
+    path = _dataset_root(data_dir, dataset_name) / METADATA_NAME
     if not path.exists():
         raise FileNotFoundError(f"Prepared metadata not found: {path}")
     with path.open(newline="") as f:
@@ -854,6 +931,7 @@ def get_num_classes(data_dir: str) -> int:
 def get_dataloader(
     *,
     data_dir: str,
+    dataset_name: Optional[str] = None,
     client_id: str,
     poisoning_method: str,
     split: str,
@@ -864,6 +942,7 @@ def get_dataloader(
     _, _, DataLoader, _ = _require_torch()
     dataset = LocalImageDataset(
         data_dir=data_dir,
+        dataset_name=dataset_name,
         client_id=client_id,
         poisoning_method=poisoning_method,
         split=split,

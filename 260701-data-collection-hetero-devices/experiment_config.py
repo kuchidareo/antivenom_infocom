@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -8,8 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 
 
-DATASET_NAME = "kuchidareo/small_trashnet"
-DEFAULT_DATA_DIR = "data"
+DATASET_NAME = os.environ.get("DATASET_NAME", "kuchidareo/small_trashnet")
+DEFAULT_DATA_DIR = os.environ.get("DATA_DIR", "../iid-data")
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOCAL_ML_LOG_DIR = "logs/local_ml"
 DEFAULT_FL_LOG_DIR = "logs/fl"

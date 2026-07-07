@@ -20,6 +20,7 @@ REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
 REMOTE_REPO_DIR="${REMOTE_PROJECT_DIR:h}"
 REMOTE_PYTHON="$(config_value DEFAULT_REMOTE_PYTHON)"
 SSH_USER="$(config_value DEFAULT_SSH_USER)"
+DATASET_NAME="$(config_value DATASET_NAME)"
 BG_WORKLOAD_ENABLED="${BG_WORKLOAD_ENABLED:-1}"
 BG_WORKLOAD_GROUP="${BG_WORKLOAD_GROUP:-$(config_value DEFAULT_BACKGROUND_WORKLOAD_GROUP)}"
 BG_WORKLOAD_PROFILE="${BG_WORKLOAD_PROFILE:-$(config_value DEFAULT_BACKGROUND_WORKLOAD_PROFILE)}"
@@ -308,16 +309,16 @@ stop_bg_workloads() {
 }
 
 run_with_bg_workloads() {
-  local status=0
+  local exit_code=0
   check_bg_workloads
   start_bg_workloads || {
-    status=$?
+    exit_code=$?
     stop_bg_workloads
-    return "$status"
+    return "$exit_code"
   }
-  "$@" || status=$?
+  "$@" || exit_code=$?
   stop_bg_workloads
-  return "$status"
+  return "$exit_code"
 }
 
 run_local_ml() {
@@ -342,6 +343,7 @@ run_local_ml() {
     ssh_run "$host" "
       cd '$REMOTE_PROJECT_DIR' &&
       '$REMOTE_PYTHON' running_ml.py \
+        --dataset '$DATASET_NAME' \
         --client-id '$client_id' \
         --device-id '$host' \
         --host '$host' $extra_options
@@ -368,6 +370,7 @@ dry_run_fl() {
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
     --dry-run \
+    --dataset "$DATASET_NAME" \
     --ssh-password "$SSH_PASSWORD" \
     "${bg_args[@]}" \
     "${method_args[@]}"
@@ -389,6 +392,7 @@ run_fl() {
   fi
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
+    --dataset "$DATASET_NAME" \
     --ssh-password "$SSH_PASSWORD" \
     --server-log-hardware \
     "${bg_args[@]}" \

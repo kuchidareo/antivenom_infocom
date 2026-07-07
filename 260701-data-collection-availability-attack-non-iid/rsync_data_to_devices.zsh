@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
-LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR}/data}"
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR:h}/non-iid-data}"
 REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/home/rasheed/kuchida/antivenom_infocom/260701-data-collection-availability-attack-non-iid}"
-REMOTE_DATA_DIR="${REMOTE_PROJECT_DIR}/data"
+REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-${REMOTE_PROJECT_DIR:h}/non-iid-data}"
 SSH_USER="${SSH_USER:-rasheed}"
 SSH_PASSWORD="${SSH_PASSWORD:-modenaottun}"
 SSH_PORT="${SSH_PORT:-22}"
@@ -50,7 +50,7 @@ for HOST in "${DEVICES[@]}"; do
   echo "==> ${REMOTE}"
 
   "${SSH_CMD[@]}" "${REMOTE}" \
-    "set -e; cd '${REMOTE_PROJECT_DIR}'; rm -rf data; mkdir -p data"
+    "set -e; rm -rf '${REMOTE_DATA_DIR}'; mkdir -p '${REMOTE_DATA_DIR}'"
 
   rsync -az --delete \
     -e "${RSYNC_RSH}" \

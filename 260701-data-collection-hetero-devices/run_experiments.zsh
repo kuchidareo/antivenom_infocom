@@ -20,6 +20,7 @@ REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
 REMOTE_REPO_DIR="${REMOTE_PROJECT_DIR:h}"
 REMOTE_PYTHON="$(config_value DEFAULT_REMOTE_PYTHON)"
 SSH_USER="$(config_value DEFAULT_SSH_USER)"
+DATASET_NAME="$(config_value DATASET_NAME)"
 
 normalize_method_token() {
   local token="${1:l}"
@@ -182,6 +183,7 @@ run_local_ml() {
     ssh_run "$host" "
       cd '$remote_project_dir' &&
       '$remote_python' running_ml.py \
+        --dataset '$DATASET_NAME' \
         --client-id '$client_id' \
         --device-id '$host' \
         --host '$host' \
@@ -208,6 +210,7 @@ dry_run_fl() {
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
     --dry-run \
+    --dataset "$DATASET_NAME" \
     --ssh-password "$SSH_PASSWORD" \
     "${method_args[@]}"
 }
@@ -224,6 +227,7 @@ run_fl() {
   fi
   cd "$SERVER_PROJECT_DIR"
   "$SERVER_PYTHON" running_fl.py \
+    --dataset "$DATASET_NAME" \
     --ssh-password "$SSH_PASSWORD" \
     --server-log-hardware \
     "${method_args[@]}"

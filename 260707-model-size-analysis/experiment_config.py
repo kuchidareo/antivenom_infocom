@@ -10,7 +10,7 @@ import numpy as np
 
 
 DATASET_NAME = os.environ.get("DATASET_NAME", "kuchidareo/small_trashnet")
-DEFAULT_DATA_DIR = "data"
+DEFAULT_DATA_DIR = os.environ.get("DATA_DIR", "../iid-data")
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOCAL_ML_LOG_DIR = "logs/local_ml"
 DEFAULT_FL_LOG_DIR = "logs/fl"

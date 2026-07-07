@@ -27,7 +27,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
         self.args = args
         self.state = state
         self.augment = augment_from_args(args)
-        self.num_classes = get_num_classes(args.data_dir)
+        self.num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
         self.model = get_model(args.model, num_classes=self.num_classes)
         self.metrics_logger = None
 
@@ -43,6 +43,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
         set_parameters(self.model, parameters)
         train_loader = get_dataloader(
             data_dir=self.args.data_dir,
+            dataset_name=self.args.dataset,
             client_id=self.args.client_id,
             poisoning_method=poisoning_method,
             split=self.args.dataset_split,
@@ -71,6 +72,7 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
         set_parameters(self.model, parameters)
         eval_loader = get_dataloader(
             data_dir=self.args.data_dir,
+            dataset_name=self.args.dataset,
             client_id=self.args.client_id,
             poisoning_method=poisoning_method,
             split=self.args.dataset_split,
@@ -126,6 +128,7 @@ def main() -> None:
     state = TrainingState(round=0, epoch=0, batch_idx=0, phase="idle")
     poison_fraction = get_poison_fraction(
         data_dir=args.data_dir,
+        dataset_name=args.dataset,
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,

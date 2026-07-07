@@ -34,10 +34,11 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         resize=augment.get("resize", [64, 64]),
         batch_size=args.batch_size,
     )
-    num_classes = get_num_classes(args.data_dir)
+    num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     model = get_model(args.model, num_classes=num_classes)
     train_loader = get_dataloader(
         data_dir=args.data_dir,
+        dataset_name=args.dataset,
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,
@@ -47,6 +48,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     )
     eval_loader = get_dataloader(
         data_dir=args.data_dir,
+        dataset_name=args.dataset,
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,
@@ -57,6 +59,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     state = TrainingState(round=0, epoch=0, batch_idx=0, phase="idle")
     poison_fraction = get_poison_fraction(
         data_dir=args.data_dir,
+        dataset_name=args.dataset,
         client_id=args.client_id,
         poisoning_method=poisoning_method,
         split=args.dataset_split,

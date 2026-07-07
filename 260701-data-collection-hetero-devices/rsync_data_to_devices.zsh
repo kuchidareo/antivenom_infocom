@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 SERVER_PYTHON="${PYTHON:-${SCRIPT_DIR:h}/venv/bin/python}"
-LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR}/data}"
+LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR:h}/iid-data}"
 SSH_PASSWORD="${SSH_PASSWORD:-modenaottun}"
 SSH_PORT="${SSH_PORT:-22}"
 
@@ -40,13 +40,13 @@ for device in "${(@f)$(device_lines)}"; do
   HOST="${fields[1]}"
   SSH_USER="${fields[2]}"
   REMOTE_PROJECT_DIR="${fields[3]}"
-  REMOTE_DATA_DIR="${REMOTE_PROJECT_DIR}/data"
+  REMOTE_DATA_DIR="${REMOTE_PROJECT_DIR:h}/iid-data"
   REMOTE="${SSH_USER}@${HOST}"
   echo "==> ${REMOTE}"
   echo "    ${REMOTE_DATA_DIR}/"
 
   "${SSH_CMD[@]}" "${REMOTE}" \
-    "set -e; cd '${REMOTE_PROJECT_DIR}'; rm -rf data; mkdir -p data"
+    "set -e; rm -rf '${REMOTE_DATA_DIR}'; mkdir -p '${REMOTE_DATA_DIR}'"
 
   rsync -az --delete \
     -e "${RSYNC_RSH}" \

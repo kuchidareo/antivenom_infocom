@@ -55,7 +55,7 @@ class AnnotatedFedAvg(fl.server.strategy.FedAvg):
 
 
 def make_strategy(args: argparse.Namespace, poisoned_ids: List[str], state: TrainingState) -> fl.server.strategy.Strategy:
-    num_classes = get_num_classes(args.data_dir)
+    num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     model = get_model(args.model, num_classes=num_classes)
     initial_parameters = fl.common.ndarrays_to_parameters(get_parameters(model))
 

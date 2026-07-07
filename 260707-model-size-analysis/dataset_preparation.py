@@ -88,6 +88,37 @@ def _dataset_root(data_dir: str, dataset_name: Optional[str] = None) -> Path:
     return Path(data_dir) / dataset_slug(dataset_name)
 
 
+def _resolve_metadata_image_path(
+    image_path: str,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+) -> str:
+    """Resolve old metadata paths after moving data_dir.
+
+    Older metadata stores paths such as data/small_trashnet/clean/...
+    When data_dir is now ../iid-data, the correct path is
+    ../iid-data/small_trashnet/clean/...
+    """
+    root = _dataset_root(data_dir, dataset_name)
+    raw = Path(image_path)
+    slug = dataset_slug(dataset_name)
+    candidates: List[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        parts = raw.parts
+        if slug in parts:
+            slug_idx = parts.index(slug)
+            candidates.append(root.joinpath(*parts[slug_idx + 1 :]))
+        candidates.extend([root / raw, Path(data_dir) / raw, raw])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0] if candidates else raw)
+
+
 def prepared_data_exists(
     data_dir: str,
     num_clients: int = DEFAULT_NUM_CLIENTS,
@@ -850,13 +881,17 @@ def load_metadata_records(
         raise FileNotFoundError(f"Prepared metadata not found: {path}. Run dataset_preparation.py first.")
     with path.open(newline="") as f:
         rows = list(csv.DictReader(f))
-    return [
-        row
-        for row in rows
-        if row["client_id"] == client_id
-        and row["poisoning_method"] == poisoning_method
-        and row["dataset_split"] == split
-    ]
+    selected: List[Dict[str, Any]] = []
+    for row in rows:
+        if (
+            row["client_id"] == client_id
+            and row["poisoning_method"] == poisoning_method
+            and row["dataset_split"] == split
+        ):
+            row = dict(row)
+            row["image_path"] = _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
+            selected.append(row)
+    return selected
 
 
 def get_poison_fraction(
