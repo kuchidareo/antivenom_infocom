@@ -13,7 +13,8 @@ REFERENCE_TRIALS="${REFERENCE_TRIALS:-0}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 MODEL_DEPTH="${MODEL_DEPTH:-5}"
-LARGE_MODEL_TARGET_PAM_MB="${LARGE_MODEL_TARGET_PAM_MB:-500}"
+RPI4_MODEL_TARGET_PAM_MB="${RPI4_MODEL_TARGET_PAM_MB:-400}"
+JETSON_CPU_MODEL_TARGET_PAM_MB="${JETSON_CPU_MODEL_TARGET_PAM_MB:-500}"
 PAM_CALIBRATION_STEPS="${PAM_CALIBRATION_STEPS:-8}"
 REMOTE_PYTHON_REL="${REMOTE_PYTHON_REL:-venv/bin/python}"
 REMOTE_PROJECT_NAME="${REMOTE_PROJECT_NAME:-260707-model-size-analysis}"
@@ -40,13 +41,8 @@ DEVICE_SPECS=(
 )
 
 RUN_DEVICE_SPECS=(
-  "rasheed|192.168.0.112|client_0|/home/rasheed/kuchida/antivenom_infocom|rpi4"
-  "rasheed|192.168.0.141|client_1|/home/rasheed/kuchida/antivenom_infocom|jetson_cpu"
-)
-
-MODEL_SPECS=(
-  "simple|simple_cnn|0"
-  "pam${LARGE_MODEL_TARGET_PAM_MB}mb|pam_cnn|${LARGE_MODEL_TARGET_PAM_MB}"
+  "rasheed|192.168.0.112|client_0|/home/rasheed/kuchida/antivenom_infocom|rpi4|${RPI4_MODEL_TARGET_PAM_MB}"
+  "rasheed|192.168.0.141|client_1|/home/rasheed/kuchida/antivenom_infocom|jetson_cpu|${JETSON_CPU_MODEL_TARGET_PAM_MB}"
 )
 
 usage() {
@@ -63,7 +59,8 @@ Environment overrides:
   LOCAL_EPOCHS=1
   BATCH_SIZE=16
   MODEL_DEPTH=5
-  LARGE_MODEL_TARGET_PAM_MB=500
+  RPI4_MODEL_TARGET_PAM_MB=400
+  JETSON_CPU_MODEL_TARGET_PAM_MB=500
   PAM_CALIBRATION_STEPS=8
   SSH_PASSWORD=modenaottun
   SYNC_DATA=yes
@@ -200,13 +197,18 @@ run_one_device_model_size_check() {
   local client_id="${spec_fields[3]}"
   local repo_dir="${spec_fields[4]}"
   local device_type="${spec_fields[5]}"
+  local device_target_pam_mb="${spec_fields[6]}"
   local project_dir="${repo_dir}/${REMOTE_PROJECT_NAME}"
   local data_dir="${repo_dir}/${REMOTE_DATA_DIR_NAME}"
   local remote_python="${repo_dir}/${REMOTE_PYTHON_REL}"
+  local -a model_specs=(
+    "simple|simple_cnn|0"
+    "pam${device_target_pam_mb}mb|pam_cnn|${device_target_pam_mb}"
+  )
   local model_spec
 
-  print "==> device start ${user}@${host} ${device_type}"
-  for model_spec in "${MODEL_SPECS[@]}"; do
+  print "==> device start ${user}@${host} ${device_type} pam_target=${device_target_pam_mb}MB"
+  for model_spec in "${model_specs[@]}"; do
     local -a model_fields
     model_fields=("${(@ps:|:)model_spec}")
     local model_label="${model_fields[1]}"
@@ -218,7 +220,7 @@ run_one_device_model_size_check() {
     ssh_run "$user" "$host" "
       set -e
       cd '$project_dir'
-      '$remote_python' running_ml.py \
+      CUDA_VISIBLE_DEVICES='' '$remote_python' running_ml.py \
         --dataset '$DATASET_NAME' \
         --data-dir '$data_dir' \
         --log-dir '$log_dir' \
@@ -244,7 +246,9 @@ run_quick_model_size_check() {
   print "  dataset: ${DATASET_NAME}"
   print "  conditions: ${CONDITIONS}"
   print "  trials: ${TRIALS}, reference_trials: ${REFERENCE_TRIALS}, local_epochs: ${LOCAL_EPOCHS}"
-  print "  models: simple_cnn and pam_cnn target ${LARGE_MODEL_TARGET_PAM_MB} MB"
+  print "  models:"
+  print "    192.168.0.112 rpi4: simple_cnn and pam_cnn target ${RPI4_MODEL_TARGET_PAM_MB} MB"
+  print "    192.168.0.141 jetson_cpu: simple_cnn and pam_cnn target ${JETSON_CPU_MODEL_TARGET_PAM_MB} MB"
   print "  parallelism: one worker per run device; each device runs its models/conditions sequentially"
 
   local spec

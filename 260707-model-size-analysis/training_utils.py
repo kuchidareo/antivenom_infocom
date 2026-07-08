@@ -7,7 +7,9 @@ from hardware_logger import TrainingState
 
 
 def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # This experiment compares device CPU behavior. Jetson devices expose CUDA,
+    # so automatic CUDA selection would invalidate the "Jetson-CPU" condition.
+    return torch.device("cpu")
 
 
 def train_model(
