@@ -79,11 +79,6 @@ This script:
 EOF
 }
 
-split_spec() {
-  local spec="$1"
-  spec_fields=("${(@ps:|:)spec}")
-}
-
 ssh_base_cmd() {
   if [[ -n "$SSH_PASSWORD" ]]; then
     if ! command -v sshpass >/dev/null 2>&1; then
@@ -124,7 +119,7 @@ pull_all_devices() {
   local spec
   for spec in "${DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local repo_dir="${spec_fields[4]}"
@@ -153,7 +148,7 @@ sync_data_to_run_devices() {
   local spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local repo_dir="${spec_fields[4]}"
@@ -170,7 +165,7 @@ check_run_devices() {
   local spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local repo_dir="${spec_fields[4]}"
@@ -196,57 +191,80 @@ check_run_devices() {
   done
 }
 
+run_one_device_model_size_check() {
+  local spec="$1"
+  local -a spec_fields
+  spec_fields=("${(@ps:|:)spec}")
+  local user="${spec_fields[1]}"
+  local host="${spec_fields[2]}"
+  local client_id="${spec_fields[3]}"
+  local repo_dir="${spec_fields[4]}"
+  local device_type="${spec_fields[5]}"
+  local project_dir="${repo_dir}/${REMOTE_PROJECT_NAME}"
+  local data_dir="${repo_dir}/${REMOTE_DATA_DIR_NAME}"
+  local remote_python="${repo_dir}/${REMOTE_PYTHON_REL}"
+  local model_spec
+
+  print "==> device start ${user}@${host} ${device_type}"
+  for model_spec in "${MODEL_SPECS[@]}"; do
+    local -a model_fields
+    model_fields=("${(@ps:|:)model_spec}")
+    local model_label="${model_fields[1]}"
+    local model_name="${model_fields[2]}"
+    local target_pam_mb="${model_fields[3]}"
+    local log_dir="${REMOTE_LOG_ROOT}/${host}/${model_label}"
+
+    print "==> run ${user}@${host} ${device_type} model=${model_name} target_pam=${target_pam_mb}"
+    ssh_run "$user" "$host" "
+      set -e
+      cd '$project_dir'
+      '$remote_python' running_ml.py \
+        --dataset '$DATASET_NAME' \
+        --data-dir '$data_dir' \
+        --log-dir '$log_dir' \
+        --client-id '$client_id' \
+        --device-id '$host' \
+        --host '$host' \
+        --poisoning-method '$CONDITIONS' \
+        --reference-trials '$REFERENCE_TRIALS' \
+        --trials '$TRIALS' \
+        --local-epochs '$LOCAL_EPOCHS' \
+        --batch-size '$BATCH_SIZE' \
+        --model '$model_name' \
+        --model-depth '$MODEL_DEPTH' \
+        --model-target-pam-mb '$target_pam_mb' \
+        --model-pam-calibration-steps '$PAM_CALIBRATION_STEPS'
+    "
+  done
+  print "==> device finished ${user}@${host} ${device_type}"
+}
+
 run_quick_model_size_check() {
   print "Running quick model-size local ML check..."
   print "  dataset: ${DATASET_NAME}"
   print "  conditions: ${CONDITIONS}"
   print "  trials: ${TRIALS}, reference_trials: ${REFERENCE_TRIALS}, local_epochs: ${LOCAL_EPOCHS}"
   print "  models: simple_cnn and pam_cnn target ${LARGE_MODEL_TARGET_PAM_MB} MB"
+  print "  parallelism: one worker per run device; each device runs its models/conditions sequentially"
 
-  local spec model_spec
+  local spec
+  local -a pids=()
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
-    local -a spec_fields
-    split_spec "$spec"
-    local user="${spec_fields[1]}"
-    local host="${spec_fields[2]}"
-    local client_id="${spec_fields[3]}"
-    local repo_dir="${spec_fields[4]}"
-    local device_type="${spec_fields[5]}"
-    local project_dir="${repo_dir}/${REMOTE_PROJECT_NAME}"
-    local data_dir="${repo_dir}/${REMOTE_DATA_DIR_NAME}"
-    local remote_python="${repo_dir}/${REMOTE_PYTHON_REL}"
-
-    for model_spec in "${MODEL_SPECS[@]}"; do
-      local -a model_fields
-      split_spec "$model_spec"
-      local model_label="${model_fields[1]}"
-      local model_name="${model_fields[2]}"
-      local target_pam_mb="${model_fields[3]}"
-      local log_dir="${REMOTE_LOG_ROOT}/${host}/${model_label}"
-
-      print "==> run ${user}@${host} ${device_type} model=${model_name} target_pam=${target_pam_mb}"
-      ssh_run "$user" "$host" "
-        set -e
-        cd '$project_dir'
-        '$remote_python' running_ml.py \
-          --dataset '$DATASET_NAME' \
-          --data-dir '$data_dir' \
-          --log-dir '$log_dir' \
-          --client-id '$client_id' \
-          --device-id '$host' \
-          --host '$host' \
-          --poisoning-method '$CONDITIONS' \
-          --reference-trials '$REFERENCE_TRIALS' \
-          --trials '$TRIALS' \
-          --local-epochs '$LOCAL_EPOCHS' \
-          --batch-size '$BATCH_SIZE' \
-          --model '$model_name' \
-          --model-depth '$MODEL_DEPTH' \
-          --model-target-pam-mb '$target_pam_mb' \
-          --model-pam-calibration-steps '$PAM_CALIBRATION_STEPS'
-      "
-    done
+    run_one_device_model_size_check "$spec" &
+    pids+=("$!")
   done
+
+  local exit_code=0
+  local pid
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      exit_code=1
+    fi
+  done
+  if (( exit_code != 0 )); then
+    print "One or more model-size device runs failed." >&2
+    return "$exit_code"
+  fi
   print "Quick model-size check finished."
 }
 

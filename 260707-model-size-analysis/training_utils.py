@@ -33,6 +33,7 @@ def train_model(
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_seen = 0
+        state.update(round=round_id, epoch=epoch, batch_idx=0, phase="dataloading")
         for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             state.update(round=round_id, epoch=epoch, batch_idx=batch_idx, phase="forward")
@@ -63,6 +64,7 @@ def train_model(
                     accuracy=batch_correct / max(batch_size, 1),
                     num_examples=float(batch_size),
                 )
+            state.update(round=round_id, epoch=epoch, batch_idx=batch_idx + 1, phase="dataloading")
         if metrics_logger is not None:
             metrics_logger.write(
                 state=state.snapshot(),
@@ -106,7 +108,7 @@ def evaluate_model(
     total_loss = 0.0
     total_correct = 0
     total_seen = 0
-    state.update(round=round_id, phase="evaluation")
+    state.update(round=round_id, batch_idx=0, phase="dataloading")
     for batch_idx, (images, labels) in enumerate(data_loader):
         state.update(round=round_id, batch_idx=batch_idx, phase="evaluation")
         images, labels = images.to(device), labels.to(device)
@@ -116,6 +118,7 @@ def evaluate_model(
         total_loss += float(loss.item()) * batch_size
         total_correct += int((outputs.argmax(dim=1) == labels).sum().item())
         total_seen += batch_size
+        state.update(round=round_id, batch_idx=batch_idx + 1, phase="dataloading")
     state.update(round=round_id, phase="idle")
     if metrics_logger is not None:
         metrics_logger.write(

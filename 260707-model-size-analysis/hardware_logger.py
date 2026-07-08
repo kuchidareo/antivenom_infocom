@@ -18,6 +18,7 @@ PHASES = {
     "forward",
     "backward",
     "optimizer_step",
+    "dataloading",
     "evaluation",
     "aggregation",
     "finished",
