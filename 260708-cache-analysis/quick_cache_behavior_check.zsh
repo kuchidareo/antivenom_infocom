@@ -16,46 +16,31 @@ MODEL_DEPTH="${MODEL_DEPTH:-5}"
 LARGE_MODEL_TARGET_PAM_MB="${LARGE_MODEL_TARGET_PAM_MB:-500}"
 PAM_CALIBRATION_STEPS="${PAM_CALIBRATION_STEPS:-8}"
 REMOTE_PYTHON_REL="${REMOTE_PYTHON_REL:-venv/bin/python}"
-REMOTE_PROJECT_NAME="${REMOTE_PROJECT_NAME:-260707-model-size-analysis}"
+REMOTE_PROJECT_NAME="${REMOTE_PROJECT_NAME:-260708-cache-analysis}"
 REMOTE_DATA_DIR_NAME="${REMOTE_DATA_DIR_NAME:-iid-data}"
-REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/model_size_quick}"
-SYNC_DATA="${SYNC_DATA:-yes}"
+REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/cache_quick}"
 
 ACTION="${1:-both}"
 
 DEVICE_SPECS=(
   "rasheed|192.168.0.112|client_0|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.113|client_1|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.114|client_2|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.115|client_3|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.116|client_4|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.117|client_5|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.118|client_6|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.119|client_7|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.120|client_8|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.121|client_9|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.141|client_1|/home/rasheed/kuchida/antivenom_infocom"
-  "rasheed|192.168.0.142|client_2|/home/rasheed/kuchida/antivenom_infocom"
-  "reo|192.168.0.131|client_0|/home/reo/kuchida/antivenom_infocom"
 )
 
 RUN_DEVICE_SPECS=(
   "rasheed|192.168.0.112|client_0|/home/rasheed/kuchida/antivenom_infocom|rpi4"
-  "rasheed|192.168.0.141|client_1|/home/rasheed/kuchida/antivenom_infocom|jetson_cpu"
 )
 
 MODEL_SPECS=(
   "simple|simple_cnn|0"
-  "pam${LARGE_MODEL_TARGET_PAM_MB}mb|pam_cnn|${LARGE_MODEL_TARGET_PAM_MB}"
 )
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./quick_model_size_check.zsh [pull|run|both|check]
+  ./quick_cache_behavior_check.zsh [pull|run|both|check]
 
 Default:
-  ./quick_model_size_check.zsh both
+  ./quick_cache_behavior_check.zsh both
 
 Environment overrides:
   CONDITIONS="clean,availability_shortcuts"
@@ -66,14 +51,12 @@ Environment overrides:
   LARGE_MODEL_TARGET_PAM_MB=500
   PAM_CALIBRATION_STEPS=8
   SSH_PASSWORD=modenaottun
-  SYNC_DATA=yes
 
 This script:
-  1. git pull --rebase on 192.168.0.112-121, 141, 142, 131
-  2. rsyncs <repo>/iid-data to the run devices when SYNC_DATA=yes
-  3. runs a quick local-ML check only on:
+  1. git pull --rebase on 192.168.0.112
+  2. sets kernel.perf_event_paranoid=-1 before training
+  3. runs a quick local-ML cache check only on:
        192.168.0.112 as client_0, RPI4
-       192.168.0.141 as client_1, Jetson-CPU
   4. uses data from:
        <repo>/iid-data
 EOF
@@ -91,22 +74,9 @@ ssh_base_cmd() {
       print "Install sshpass or configure SSH keys." >&2
       exit 1
     fi
-    print -- "sshpass -p ${(q)SSH_PASSWORD} ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+    print -- "sshpass -p ${(q)SSH_PASSWORD} ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new"
   else
-    print -- "ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
-  fi
-}
-
-rsync_rsh() {
-  if [[ -n "$SSH_PASSWORD" ]]; then
-    if ! command -v sshpass >/dev/null 2>&1; then
-      print "SSH_PASSWORD is set, but sshpass is not installed." >&2
-      print "Install sshpass or configure SSH keys." >&2
-      exit 1
-    fi
-    print -- "sshpass -p ${SSH_PASSWORD} ssh -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-  else
-    print -- "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+    print -- "ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new"
   fi
 }
 
@@ -133,40 +103,8 @@ pull_all_devices() {
   done
 }
 
-sync_data_to_run_devices() {
-  if [[ "$SYNC_DATA" != "yes" ]]; then
-    print "Skipping data sync because SYNC_DATA=${SYNC_DATA}."
-    return
-  fi
-  if ! command -v rsync >/dev/null 2>&1; then
-    print "rsync is required but was not found." >&2
-    exit 1
-  fi
-
-  local local_data_dir="${SERVER_REPO_DIR}/${REMOTE_DATA_DIR_NAME}"
-  if [[ ! -d "$local_data_dir/small_trashnet" ]]; then
-    print "Local shared data directory is missing: ${local_data_dir}/small_trashnet" >&2
-    exit 1
-  fi
-
-  print "Syncing shared data to run devices..."
-  local spec
-  for spec in "${RUN_DEVICE_SPECS[@]}"; do
-    local -a spec_fields
-    split_spec "$spec"
-    local user="${spec_fields[1]}"
-    local host="${spec_fields[2]}"
-    local repo_dir="${spec_fields[4]}"
-    local remote_data_dir="${repo_dir}/${REMOTE_DATA_DIR_NAME}"
-    local remote="${user}@${host}"
-    print "==> rsync ${local_data_dir}/ -> ${remote}:${remote_data_dir}/"
-    ssh_run "$user" "$host" "mkdir -p '$remote_data_dir'"
-    rsync -az --delete -e "$(rsync_rsh)" "${local_data_dir}/" "${remote}:${remote_data_dir}/"
-  done
-}
-
 check_run_devices() {
-  print "Checking Python, project dir, and shared iid-data on run devices..."
+  print "Checking Python, perf, project dir, and shared iid-data on run devices..."
   local spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
     local -a spec_fields
@@ -180,28 +118,25 @@ check_run_devices() {
     print "==> check ${user}@${host}"
     ssh_run "$user" "$host" "
       set -e
-      if [ ! -d '$project_dir' ]; then
-        echo 'missing project_dir: $project_dir' >&2
-        exit 2
-      fi
-      if [ ! -d '$data_dir/small_trashnet' ]; then
-        echo 'missing shared data: $data_dir/small_trashnet' >&2
-        echo 'run: SYNC_DATA=yes ./quick_model_size_check.zsh run' >&2
-        exit 3
-      fi
+      test -d '$project_dir'
+      test -d '$data_dir/small_trashnet'
       cd '$project_dir'
       '$remote_python' --version
-      '$remote_python' -c \"from dataset_preparation import get_num_classes; print('num_classes', get_num_classes('$data_dir', dataset_name='$DATASET_NAME'))\"
+      perf --version
+      '$remote_python' - <<'PY'
+from dataset_preparation import get_num_classes
+print('num_classes', get_num_classes('$data_dir', dataset_name='$DATASET_NAME'))
+PY
     "
   done
 }
 
-run_quick_model_size_check() {
-  print "Running quick model-size local ML check..."
+run_quick_cache_behavior_check() {
+  print "Running quick cache-behavior local ML check..."
   print "  dataset: ${DATASET_NAME}"
   print "  conditions: ${CONDITIONS}"
   print "  trials: ${TRIALS}, reference_trials: ${REFERENCE_TRIALS}, local_epochs: ${LOCAL_EPOCHS}"
-  print "  models: simple_cnn and pam_cnn target ${LARGE_MODEL_TARGET_PAM_MB} MB"
+  print "  perf: sudo sysctl kernel.perf_event_paranoid=-1 before each run"
 
   local spec model_spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
@@ -224,9 +159,10 @@ run_quick_model_size_check() {
       local target_pam_mb="${model_fields[3]}"
       local log_dir="${REMOTE_LOG_ROOT}/${host}/${model_label}"
 
-      print "==> run ${user}@${host} ${device_type} model=${model_name} target_pam=${target_pam_mb}"
+      print "==> run ${user}@${host} ${device_type} model=${model_name}"
       ssh_run "$user" "$host" "
         set -e
+        printf '%s\n' '$SSH_PASSWORD' | sudo -S sysctl kernel.perf_event_paranoid=-1
         cd '$project_dir'
         '$remote_python' running_ml.py \
           --dataset '$DATASET_NAME' \
@@ -247,7 +183,7 @@ run_quick_model_size_check() {
       "
     done
   done
-  print "Quick model-size check finished."
+  print "Quick cache-behavior check finished."
 }
 
 case "$ACTION" in
@@ -258,15 +194,13 @@ case "$ACTION" in
     check_run_devices
     ;;
   run)
-    sync_data_to_run_devices
     check_run_devices
-    run_quick_model_size_check
+    run_quick_cache_behavior_check
     ;;
   both)
     pull_all_devices
-    sync_data_to_run_devices
     check_run_devices
-    run_quick_model_size_check
+    run_quick_cache_behavior_check
     ;;
   -h|--help|help)
     usage
