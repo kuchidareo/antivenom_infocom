@@ -9,8 +9,9 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_NAME = os.environ.get("DATASET_NAME", "kuchidareo/small_trashnet")
-DEFAULT_DATA_DIR = os.environ.get("DATA_DIR", "../iid-data")
+DEFAULT_DATA_DIR = os.environ.get("DATA_DIR", str(PROJECT_ROOT / "iid-data"))
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOCAL_ML_LOG_DIR = "logs/local_ml"
 DEFAULT_FL_LOG_DIR = "logs/fl"
@@ -140,6 +141,11 @@ CSV_COLUMNS = [
     "system_cpu_core_1",
     "system_cpu_core_2",
     "system_cpu_core_3",
+    "system_cpu_freq_mhz",
+    "system_cpu_freq_core_0_mhz",
+    "system_cpu_freq_core_1_mhz",
+    "system_cpu_freq_core_2_mhz",
+    "system_cpu_freq_core_3_mhz",
     "system_memory_percent",
     "system_memory_used",
     "system_memory_available",

@@ -62,11 +62,6 @@ This script:
 EOF
 }
 
-split_spec() {
-  local spec="$1"
-  spec_fields=("${(@ps:|:)spec}")
-}
-
 ssh_base_cmd() {
   if [[ -n "$SSH_PASSWORD" ]]; then
     if ! command -v sshpass >/dev/null 2>&1; then
@@ -74,9 +69,9 @@ ssh_base_cmd() {
       print "Install sshpass or configure SSH keys." >&2
       exit 1
     fi
-    print -- "sshpass -p ${(q)SSH_PASSWORD} ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new"
+    print -- "sshpass -p ${(q)SSH_PASSWORD} ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
   else
-    print -- "ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new"
+    print -- "ssh -p ${(q)SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
   fi
 }
 
@@ -94,7 +89,7 @@ pull_all_devices() {
   local spec
   for spec in "${DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local repo_dir="${spec_fields[4]}"
@@ -108,7 +103,7 @@ check_run_devices() {
   local spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local repo_dir="${spec_fields[4]}"
@@ -118,15 +113,18 @@ check_run_devices() {
     print "==> check ${user}@${host}"
     ssh_run "$user" "$host" "
       set -e
-      test -d '$project_dir'
-      test -d '$data_dir/small_trashnet'
+      if [ ! -d '$project_dir' ]; then
+        echo 'missing project_dir: $project_dir' >&2
+        exit 2
+      fi
+      if [ ! -d '$data_dir/small_trashnet' ]; then
+        echo 'missing data_dir: $data_dir/small_trashnet' >&2
+        exit 3
+      fi
       cd '$project_dir'
       '$remote_python' --version
       perf --version
-      '$remote_python' - <<'PY'
-from dataset_preparation import get_num_classes
-print('num_classes', get_num_classes('$data_dir', dataset_name='$DATASET_NAME'))
-PY
+      '$remote_python' -c \"from dataset_preparation import get_num_classes; print('num_classes', get_num_classes('$data_dir', dataset_name='$DATASET_NAME'))\"
     "
   done
 }
@@ -141,7 +139,7 @@ run_quick_cache_behavior_check() {
   local spec model_spec
   for spec in "${RUN_DEVICE_SPECS[@]}"; do
     local -a spec_fields
-    split_spec "$spec"
+    spec_fields=("${(@ps:|:)spec}")
     local user="${spec_fields[1]}"
     local host="${spec_fields[2]}"
     local client_id="${spec_fields[3]}"
@@ -153,7 +151,7 @@ run_quick_cache_behavior_check() {
 
     for model_spec in "${MODEL_SPECS[@]}"; do
       local -a model_fields
-      split_spec "$model_spec"
+      model_fields=("${(@ps:|:)model_spec}")
       local model_label="${model_fields[1]}"
       local model_name="${model_fields[2]}"
       local target_pam_mb="${model_fields[3]}"

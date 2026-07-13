@@ -20,7 +20,7 @@ from experiment_config import (
 from hardware_logger import HardwareLogger, TrainingState
 from metrics_logger import MetricsLogger
 from models import get_model
-from perf_logger import PerfLogger
+from perf_logger import DEFAULT_PERF_EVENTS, PerfLogger
 from training_utils import evaluate_model, train_model
 
 
@@ -103,6 +103,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
             condition=condition,
             training_state=state,
             path=perf_path,
+            events=parse_perf_events(args.perf_events),
         ):
             train_model(
                 model=model,
@@ -123,6 +124,12 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     return str(logger.path)
 
 
+def parse_perf_events(value: str):
+    if not value:
+        return DEFAULT_PERF_EVENTS
+    return [event.strip() for event in value.split(",") if event.strip()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -137,6 +144,14 @@ def main() -> None:
     )
     parser.add_argument("--reference-trials", type=int, default=DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS)
     parser.add_argument("--trials", type=int, default=DEFAULT_LOCAL_ML_ANALYSIS_TRIALS)
+    parser.add_argument(
+        "--perf-events",
+        default="",
+        help=(
+            "Comma-separated perf event list. Defaults to the expanded cache-analysis event set: "
+            f"{','.join(DEFAULT_PERF_EVENTS)}"
+        ),
+    )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 

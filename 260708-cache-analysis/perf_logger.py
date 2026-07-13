@@ -17,6 +17,12 @@ from hardware_logger import TrainingState
 DEFAULT_PERF_EVENTS = [
     "cycles",
     "instructions",
+    "branches",
+    "branch-misses",
+    "task-clock",
+    "context-switches",
+    "cpu-migrations",
+    "page-faults",
     "l1d_cache_rd",
     "l1d_cache_refill_rd",
     "l1d_cache_wr",
@@ -27,6 +33,10 @@ DEFAULT_PERF_EVENTS = [
     "l2d_cache_refill_wr",
     "bus_access_rd",
     "bus_access_wr",
+    "mem_access",
+    "ase_spec",
+    "vfp_spec",
+    "inst_spec",
 ]
 
 
