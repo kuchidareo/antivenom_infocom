@@ -107,6 +107,31 @@ def count_parameters(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters())
 
 
+def _build_resnet18(num_classes: int, input_size: Tuple[int, int]) -> nn.Module:
+    """Build a randomly initialized torchvision ResNet18 for local training."""
+    try:
+        from torchvision.models import resnet18
+    except ImportError as exc:
+        raise RuntimeError(
+            "The resnet18 model requires torchvision. Install torch and torchvision "
+            "from the PyTorch CPU wheel index on Raspberry Pi."
+        ) from exc
+
+    # weights=None avoids an implicit network download and keeps every trial local.
+    model = resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    model.model_metadata = {
+        "model_depth": 18,
+        "model_width_multiplier": 1.0,
+        "model_target_pam_mb": "",
+        "model_estimated_pam_mb": "",
+        "model_parameter_count": count_parameters(model),
+        "input_size": f"{input_size[0]}x{input_size[1]}",
+        "pretrained": False,
+    }
+    return model
+
+
 def get_model(
     model_name: str,
     num_classes: int,
@@ -130,6 +155,8 @@ def get_model(
             "input_size": f"{input_size[0]}x{input_size[1]}",
         }
         return model
+    if model_name.lower() in {"resnet18", "resnet_18"}:
+        return _build_resnet18(num_classes=num_classes, input_size=input_size)
     if model_name in {"pam_cnn", "adaptive_cnn", "scalable_cnn", "ScalableCNN"}:
         image_size = int(input_size[0])
 

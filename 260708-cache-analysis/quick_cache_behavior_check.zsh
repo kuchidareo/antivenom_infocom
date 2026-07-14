@@ -7,11 +7,13 @@ SERVER_REPO_DIR="${SCRIPT_DIR:h}"
 SSH_PASSWORD="${SSH_PASSWORD:-modenaottun}"
 SSH_PORT="${SSH_PORT:-22}"
 DATASET_NAME="${DATASET_NAME:-kuchidareo/small_trashnet}"
-CONDITIONS="${CONDITIONS:-clean,availability_shortcuts}"
+DATASET_SLUG="${DATASET_NAME##*/}"
+CONDITIONS="${CONDITIONS:-clean,unlearnable_examples,availability_shortcuts}"
 TRIALS="${TRIALS:-1}"
 REFERENCE_TRIALS="${REFERENCE_TRIALS:-0}"
-LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
+LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
+MODEL_NAME="${MODEL_NAME:-simple_cnn}"
 MODEL_DEPTH="${MODEL_DEPTH:-5}"
 LARGE_MODEL_TARGET_PAM_MB="${LARGE_MODEL_TARGET_PAM_MB:-500}"
 PAM_CALIBRATION_STEPS="${PAM_CALIBRATION_STEPS:-8}"
@@ -19,6 +21,7 @@ REMOTE_PYTHON_REL="${REMOTE_PYTHON_REL:-venv/bin/python}"
 REMOTE_PROJECT_NAME="${REMOTE_PROJECT_NAME:-260708-cache-analysis}"
 REMOTE_DATA_DIR_NAME="${REMOTE_DATA_DIR_NAME:-iid-data}"
 REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/cache_quick}"
+AUGMENT_JSON="${AUGMENT_JSON:-{\"enabled\":true,\"resize\":[224,224],\"horizontal_flip\":true,\"normalize\":true}}"
 
 ACTION="${1:-both}"
 
@@ -31,7 +34,7 @@ RUN_DEVICE_SPECS=(
 )
 
 MODEL_SPECS=(
-  "simple|simple_cnn|0"
+  "${MODEL_NAME}|${MODEL_NAME}|0"
 )
 
 usage() {
@@ -43,9 +46,12 @@ Default:
   ./quick_cache_behavior_check.zsh both
 
 Environment overrides:
-  CONDITIONS="clean,availability_shortcuts"
+  CONDITIONS="clean,unlearnable_examples,availability_shortcuts"
+  DATASET_NAME="uoft-cs/cifar10"
+  MODEL_NAME="resnet18"
+  AUGMENT_JSON='{"enabled":true,"resize":[224,224],"horizontal_flip":true,"normalize":true}'
   TRIALS=1
-  LOCAL_EPOCHS=1
+  LOCAL_EPOCHS=10
   BATCH_SIZE=16
   MODEL_DEPTH=5
   LARGE_MODEL_TARGET_PAM_MB=500
@@ -117,8 +123,8 @@ check_run_devices() {
         echo 'missing project_dir: $project_dir' >&2
         exit 2
       fi
-      if [ ! -d '$data_dir/small_trashnet' ]; then
-        echo 'missing data_dir: $data_dir/small_trashnet' >&2
+      if [ ! -d '$data_dir/$DATASET_SLUG' ]; then
+        echo 'missing data_dir: $data_dir/$DATASET_SLUG' >&2
         exit 3
       fi
       cd '$project_dir'
@@ -132,6 +138,8 @@ check_run_devices() {
 run_quick_cache_behavior_check() {
   print "Running quick cache-behavior local ML check..."
   print "  dataset: ${DATASET_NAME}"
+  print "  model: ${MODEL_NAME}"
+  print "  augment: ${AUGMENT_JSON}"
   print "  conditions: ${CONDITIONS}"
   print "  trials: ${TRIALS}, reference_trials: ${REFERENCE_TRIALS}, local_epochs: ${LOCAL_EPOCHS}"
   print "  perf: sudo sysctl kernel.perf_event_paranoid=-1 before each run"
@@ -174,6 +182,7 @@ run_quick_cache_behavior_check() {
           --trials '$TRIALS' \
           --local-epochs '$LOCAL_EPOCHS' \
           --batch-size '$BATCH_SIZE' \
+          --augment '$AUGMENT_JSON' \
           --model '$model_name' \
           --model-depth '$MODEL_DEPTH' \
           --model-target-pam-mb '$target_pam_mb' \
