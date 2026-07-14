@@ -39,6 +39,7 @@ DEFAULT_SSH_USER = "rasheed"
 DEFAULT_BACKGROUND_WORKLOAD_ENABLED = False
 DEFAULT_BACKGROUND_WORKLOAD_GROUP = "group1"
 DEFAULT_BACKGROUND_WORKLOAD_PROFILE = "medium"
+DEFAULT_CPU_FREQ_SAMPLE_MS = 1.0
 POISONING_METHOD_CLEAN = "clean"
 POISONING_METHOD_UNLEARNABLE_EXAMPLES = "unlearnable_examples"
 POISONING_METHOD_RANDOM_LABEL_FLIPPING = "random_label_flipping"
@@ -127,6 +128,7 @@ CSV_COLUMNS = [
     "background_workload_enabled",
     "background_workload_group",
     "background_workload_profile",
+    "cpu_freq_sample_ms",
     "round",
     "epoch",
     "batch_idx",
@@ -183,6 +185,7 @@ CONDITION_COLUMNS = [
     "background_workload_enabled",
     "background_workload_group",
     "background_workload_profile",
+    "cpu_freq_sample_ms",
 ]
 
 METRIC_COLUMNS = [
@@ -310,6 +313,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--background-workload-enabled", action="store_true", default=DEFAULT_BACKGROUND_WORKLOAD_ENABLED)
     parser.add_argument("--background-workload-group", default=DEFAULT_BACKGROUND_WORKLOAD_GROUP)
     parser.add_argument("--background-workload-profile", default=DEFAULT_BACKGROUND_WORKLOAD_PROFILE)
+    parser.add_argument(
+        "--cpu-freq-sample-ms",
+        type=float,
+        default=DEFAULT_CPU_FREQ_SAMPLE_MS,
+        help=(
+            "Internal CPU-frequency sampling interval in milliseconds. Samples are averaged "
+            "into the 10 FPS hardware CSV; use 0 for one point per hardware row."
+        ),
+    )
 
 
 def augment_from_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -371,4 +383,5 @@ def condition_columns(
         ),
         "background_workload_group": getattr(args, "background_workload_group", DEFAULT_BACKGROUND_WORKLOAD_GROUP),
         "background_workload_profile": getattr(args, "background_workload_profile", DEFAULT_BACKGROUND_WORKLOAD_PROFILE),
+        "cpu_freq_sample_ms": getattr(args, "cpu_freq_sample_ms", DEFAULT_CPU_FREQ_SAMPLE_MS),
     }

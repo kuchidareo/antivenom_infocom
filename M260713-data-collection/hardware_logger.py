@@ -86,15 +86,25 @@ class HardwareLogger:
         training_state: Optional[TrainingState] = None,
         pid: Optional[int] = None,
         fps: float = 10.0,
+        cpu_freq_sample_ms: float = 1.0,
     ) -> None:
+        if fps <= 0:
+            raise ValueError("fps must be greater than zero")
+        if cpu_freq_sample_ms < 0:
+            raise ValueError("cpu_freq_sample_ms must be zero or greater")
         self.log_dir = log_dir
         self.condition = dict(condition)
         self.training_state = training_state or TrainingState()
         self.pid = pid or os.getpid()
         self.interval = 1.0 / fps
+        self.cpu_freq_interval = cpu_freq_sample_ms / 1000.0
         self.path = yyyymmddhhmmss_log_path(log_dir)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._cpu_freq_thread: Optional[threading.Thread] = None
+        self._cpu_freq_lock = threading.Lock()
+        self._cpu_freq_sums = [0.0, 0.0, 0.0, 0.0]
+        self._cpu_freq_counts = [0, 0, 0, 0]
         self._process = psutil.Process(self.pid)
 
     def __enter__(self) -> "HardwareLogger":
@@ -108,6 +118,13 @@ class HardwareLogger:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         self._process.cpu_percent(interval=None)
         psutil.cpu_percent(interval=None, percpu=True)
+        if self.cpu_freq_interval > 0:
+            self._cpu_freq_thread = threading.Thread(
+                target=self._run_cpu_frequency,
+                name="cpu-frequency-logger",
+                daemon=True,
+            )
+            self._cpu_freq_thread.start()
         self._thread = threading.Thread(target=self._run, name="hardware-logger", daemon=True)
         self._thread.start()
 
@@ -116,6 +133,8 @@ class HardwareLogger:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self._cpu_freq_thread is not None:
+            self._cpu_freq_thread.join(timeout=5)
 
     def _run(self) -> None:
         with self.path.open("w", newline="") as f:
@@ -128,10 +147,65 @@ class HardwareLogger:
             writer.writerow(self._sample())
             f.flush()
 
+    def _run_cpu_frequency(self) -> None:
+        """Accumulate high-rate samples for the next 10 FPS hardware row."""
+        interval_ns = max(1, int(self.cpu_freq_interval * 1_000_000_000))
+        next_deadline_ns = time.perf_counter_ns()
+
+        while not self._stop_event.is_set():
+            now_ns = time.perf_counter_ns()
+            if now_ns < next_deadline_ns:
+                wait_seconds = (next_deadline_ns - now_ns) / 1_000_000_000
+                if self._stop_event.wait(wait_seconds):
+                    break
+                continue
+
+            frequencies = self._read_cpu_frequencies()
+            with self._cpu_freq_lock:
+                for core_index, frequency in enumerate(frequencies):
+                    if frequency != "":
+                        self._cpu_freq_sums[core_index] += float(frequency)
+                        self._cpu_freq_counts[core_index] += 1
+
+            next_deadline_ns += interval_ns
+            current_ns = time.perf_counter_ns()
+            if current_ns > next_deadline_ns + interval_ns:
+                missed = (current_ns - next_deadline_ns) // interval_ns
+                next_deadline_ns += missed * interval_ns
+
+    @staticmethod
+    def _read_cpu_frequencies() -> list[Any]:
+        try:
+            frequencies = psutil.cpu_freq(percpu=True) or []
+        except (NotImplementedError, OSError):
+            frequencies = []
+        return [
+            frequencies[index].current if len(frequencies) > index else ""
+            for index in range(4)
+        ]
+
+    def _consume_cpu_frequency_averages(self) -> list[Any]:
+        if self.cpu_freq_interval <= 0:
+            return self._read_cpu_frequencies()
+
+        with self._cpu_freq_lock:
+            averages = [
+                self._cpu_freq_sums[index] / self._cpu_freq_counts[index]
+                if self._cpu_freq_counts[index] > 0
+                else ""
+                for index in range(4)
+            ]
+            self._cpu_freq_sums = [0.0, 0.0, 0.0, 0.0]
+            self._cpu_freq_counts = [0, 0, 0, 0]
+
+        if all(value == "" for value in averages):
+            return self._read_cpu_frequencies()
+        return averages
+
     def _sample(self) -> Dict[str, Any]:
         now = datetime.now()
         cpu = psutil.cpu_percent(interval=None, percpu=True)
-        cpu_freq = psutil.cpu_freq(percpu=True) or []
+        cpu_freq = self._consume_cpu_frequency_averages()
         mem = psutil.virtual_memory()
         try:
             proc_mem = self._process.memory_info()
@@ -152,10 +226,10 @@ class HardwareLogger:
             "system_cpu_core_1": cpu[1] if len(cpu) > 1 else "",
             "system_cpu_core_2": cpu[2] if len(cpu) > 2 else "",
             "system_cpu_core_3": cpu[3] if len(cpu) > 3 else "",
-            "system_cpu_freq_core_0": cpu_freq[0].current if len(cpu_freq) > 0 else "",
-            "system_cpu_freq_core_1": cpu_freq[1].current if len(cpu_freq) > 1 else "",
-            "system_cpu_freq_core_2": cpu_freq[2].current if len(cpu_freq) > 2 else "",
-            "system_cpu_freq_core_3": cpu_freq[3].current if len(cpu_freq) > 3 else "",
+            "system_cpu_freq_core_0": cpu_freq[0],
+            "system_cpu_freq_core_1": cpu_freq[1],
+            "system_cpu_freq_core_2": cpu_freq[2],
+            "system_cpu_freq_core_3": cpu_freq[3],
             "system_memory_percent": mem.percent,
             "system_memory_used": mem.used,
             "system_memory_available": mem.available,

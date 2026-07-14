@@ -74,7 +74,12 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         poison_fraction=poison_fraction,
         attack_name=attack_name_for_poisoning_method(poisoning_method),
     )
-    with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state) as logger:
+    with HardwareLogger(
+        log_dir=args.log_dir,
+        condition=condition,
+        training_state=state,
+        cpu_freq_sample_ms=args.cpu_freq_sample_ms,
+    ) as logger:
         metrics_logger = MetricsLogger(
             path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
             condition=condition,

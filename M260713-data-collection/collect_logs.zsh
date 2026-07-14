@@ -2,14 +2,15 @@
 set -euo pipefail
 
 # Server-side project path.
-SERVER_PROJECT_DIR="/home/user/kuchida/antivenom_infocom/260626-data-collection-v1"
+SERVER_PROJECT_DIR="/home/user/kuchida/antivenom_infocom/M260713-data-collection"
 
 # Remote Raspberry Pi project path.
-REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/260626-data-collection-v1"
+REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/M260713-data-collection"
 
 # SSH credentials. Password is read from SSH_PASSWORD env var.
 SSH_USER="rasheed"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
+PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-1}"
 
 DELETE_REMOTE=0
 DEST_DIR="${SERVER_PROJECT_DIR}/collected_logs"
@@ -51,6 +52,11 @@ DEVICES=(
   "192.168.0.120"
   "192.168.0.121"
 )
+
+host_is_reachable() {
+  local host="$1"
+  ping -c 1 -W "$PING_TIMEOUT_SEC" "$host" >/dev/null 2>&1
+}
 
 rsync_remote() {
   local host="$1"
@@ -99,6 +105,10 @@ main() {
   collect_server_logs
 
   for host in "${DEVICES[@]}"; do
+    if ! host_is_reachable "$host"; then
+      print "Skipping unreachable device: ${host}" >&2
+      continue
+    fi
     print "Collecting logs from ${host} into ${DEST_DIR}/${host}/"
     rsync_remote "$host"
     if [[ "$DELETE_REMOTE" -eq 1 ]]; then
