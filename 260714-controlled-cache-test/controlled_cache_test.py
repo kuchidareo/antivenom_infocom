@@ -96,7 +96,12 @@ def main():
 
     parser.add_argument(
         "--regime",
-        choices=["unstable", "stable-small"],
+        choices=[
+            "large-stable",
+            "large-unstable",
+            "small-stable",
+            "small-unstable",
+        ],
         required=True,
     )
 
@@ -112,8 +117,8 @@ def main():
 
     # Replace these with gradient standard deviations measured from the real
     # model when those values are available.
-    parser.add_argument("--unstable-scale", type=float, default=1e-1)
-    parser.add_argument("--stable-scale", type=float, default=1e-4)
+    parser.add_argument("--large-scale", type=float, default=1e-1)
+    parser.add_argument("--small-scale", type=float, default=1e-4)
 
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary-output")
@@ -172,21 +177,24 @@ def main():
     output_shape = tuple(y.shape)
     bank_size = args.gradient_bank_size
 
-    if args.regime == "stable-small":
-        # Every iteration uses the same small gradient direction.
+    scale = args.large_scale if args.regime.startswith("large-") else args.small_scale
+    is_stable = args.regime.endswith("-stable")
+
+    if is_stable:
+        # Every buffer contains the same direction and magnitude.
         direction = standardized_random(output_shape, generator)
-        direction.mul_(args.stable_scale)
+        direction.mul_(scale)
 
         gradient_bank = make_aligned_gradient_bank(
             [direction.clone() for _ in range(bank_size)]
         )
     else:
-        # Iterations cycle through independently generated gradient directions.
+        # Buffers contain independent directions at the selected magnitude.
         gradients = []
 
         for _ in range(bank_size):
             gradient = standardized_random(output_shape, generator)
-            gradient.mul_(args.unstable_scale)
+            gradient.mul_(scale)
             gradients.append(gradient)
 
         gradient_bank = make_aligned_gradient_bank(gradients)
@@ -269,6 +277,9 @@ def main():
 
     summary = {
         "regime": args.regime,
+        "gradient_magnitude": "large" if args.regime.startswith("large-") else "small",
+        "gradient_direction": "stable" if is_stable else "unstable",
+        "gradient_scale": scale,
         "steps": args.steps,
         "threads": args.threads,
         "gradient_mean": gradient_mean,
