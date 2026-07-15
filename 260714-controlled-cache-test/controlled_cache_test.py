@@ -16,6 +16,26 @@ def standardized_random(shape, generator):
     return tensor
 
 
+def make_aligned_gradient_bank(gradients, alignment_bytes=4096):
+    stacked = torch.stack(gradients)
+    element_size = stacked.element_size()
+    if alignment_bytes % element_size != 0:
+        raise ValueError("alignment_bytes must be divisible by the tensor element size")
+
+    padding_elements = alignment_bytes // element_size
+    backing = torch.empty(
+        stacked.numel() + padding_elements,
+        dtype=stacked.dtype,
+    )
+    offset_bytes = (-backing.data_ptr()) % alignment_bytes
+    offset_elements = offset_bytes // element_size
+    aligned = backing[offset_elements : offset_elements + stacked.numel()].view_as(stacked)
+    aligned.copy_(stacked)
+    if aligned.data_ptr() % alignment_bytes != 0:
+        raise RuntimeError("Could not align the gradient bank")
+    return aligned
+
+
 def percentile(values, q):
     ordered = sorted(values)
     index = round((len(ordered) - 1) * q)
@@ -157,7 +177,7 @@ def main():
         direction = standardized_random(output_shape, generator)
         direction.mul_(args.stable_scale)
 
-        gradient_bank = torch.stack(
+        gradient_bank = make_aligned_gradient_bank(
             [direction.clone() for _ in range(bank_size)]
         )
     else:
@@ -169,9 +189,22 @@ def main():
             gradient.mul_(args.unstable_scale)
             gradients.append(gradient)
 
-        gradient_bank = torch.stack(gradients)
+        gradient_bank = make_aligned_gradient_bank(gradients)
 
     flat_bank = gradient_bank.reshape(bank_size, -1)
+    buffer_addresses = [gradient_bank[index].data_ptr() for index in range(bank_size)]
+    buffer_bytes = gradient_bank[0].numel() * gradient_bank.element_size()
+    buffer_offsets_bytes = [address - buffer_addresses[0] for address in buffer_addresses]
+    expected_offsets_bytes = [index * buffer_bytes for index in range(bank_size)]
+
+    if not gradient_bank.is_contiguous():
+        raise RuntimeError("gradient_bank must be contiguous in both regimes")
+    if len(set(buffer_addresses)) != bank_size:
+        raise RuntimeError("Every gradient bank entry must use a distinct buffer address")
+    if buffer_offsets_bytes != expected_offsets_bytes:
+        raise RuntimeError(
+            "Gradient bank buffers are not laid out with the expected identical sequential access pattern"
+        )
 
     if bank_size > 1:
         adjacent_cosine = F.cosine_similarity(
@@ -184,6 +217,7 @@ def main():
 
     gradient_mean = flat_bank.mean().item()
     gradient_std = flat_bank.std(unbiased=False).item()
+    gradient_l2_values = torch.linalg.vector_norm(flat_bank, dim=1)
 
     # Initialize backward kernels and the thread pool before timing.
     result = None
@@ -239,7 +273,19 @@ def main():
         "threads": args.threads,
         "gradient_mean": gradient_mean,
         "gradient_std": gradient_std,
+        "gradient_l2_mean": gradient_l2_values.mean().item(),
+        "gradient_l2_min": gradient_l2_values.min().item(),
+        "gradient_l2_max": gradient_l2_values.max().item(),
         "adjacent_gradient_cosine": adjacent_cosine,
+        "gradient_bank_shape": list(gradient_bank.shape),
+        "gradient_bank_stride": list(gradient_bank.stride()),
+        "gradient_bank_contiguous": gradient_bank.is_contiguous(),
+        "gradient_bank_buffer_count": bank_size,
+        "gradient_bank_unique_buffer_addresses": len(set(buffer_addresses)),
+        "gradient_buffer_bytes": buffer_bytes,
+        "gradient_buffer_offsets_bytes": buffer_offsets_bytes,
+        "gradient_bank_base_ptr_mod64": buffer_addresses[0] % 64,
+        "gradient_bank_base_ptr_mod4096": buffer_addresses[0] % 4096,
         "backward_mean_ms": statistics.mean(backward_times_ms),
         "backward_median_ms": statistics.median(backward_times_ms),
         "backward_p95_ms": percentile(backward_times_ms, 0.95),
