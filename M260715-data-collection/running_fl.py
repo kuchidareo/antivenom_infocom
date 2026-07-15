@@ -1,4 +1,5 @@
 import argparse
+import random
 import shlex
 import signal
 import subprocess
@@ -21,15 +22,45 @@ from experiment_config import (
     DEFAULT_SSH_USER,
     DEVICES,
     POISONING_ATTACK_METHODS,
+    POISONING_METHOD_CLEAN,
     add_common_args,
     augment_from_args,
     parse_poisoning_methods,
-    select_poisoned_clients,
 )
 
 
 def _arg(name: str, value: object) -> List[str]:
     return [name, str(value)]
+
+
+def _active_devices(args: argparse.Namespace) -> List[dict]:
+    configured_devices = DEVICES[: args.num_clients]
+    requested = {
+        client_id.strip()
+        for client_id in args.active_client_ids.split(",")
+        if client_id.strip()
+    }
+    devices = [
+        device
+        for device in configured_devices
+        if not requested or device["client_id"] in requested
+    ]
+    unknown = requested - {device["client_id"] for device in devices}
+    if unknown:
+        raise ValueError(f"Unknown active client IDs: {','.join(sorted(unknown))}")
+    if not devices:
+        raise ValueError("No active FL clients were selected.")
+    return devices
+
+
+def _select_poisoned_clients(active_devices: List[dict], count: int, seed: int) -> List[str]:
+    if count < 0 or count > len(active_devices):
+        raise ValueError(
+            f"poisoned_client_count={count} is invalid for {len(active_devices)} active clients."
+        )
+    rng = random.Random(seed)
+    selected = rng.sample([device["client_id"] for device in active_devices], count)
+    return sorted(selected, key=lambda client_id: int(client_id.split("_")[-1]))
 
 
 def _client_command(args: argparse.Namespace, device: dict, seed: int, poisoned_ids: List[str]) -> str:
@@ -55,7 +86,12 @@ def _client_command(args: argparse.Namespace, device: dict, seed: int, poisoned_
         *_arg("--poisoned-client-count", len(poisoned_ids)),
         *_arg("--poisoned-client-ids", ",".join(poisoned_ids)),
         *_arg("--poisoning-method", args.poisoning_method),
+        *_arg("--run-role", args.run_role),
+        *_arg("--cpu-freq-sample-ms", args.cpu_freq_sample_ms),
+        *_arg("--perf-fps", args.perf_fps),
+        *_arg("--perf-events", args.perf_events),
     ]
+    client_args.append("--enable-perf" if args.enable_perf else "--disable-perf")
     quoted = " ".join(shlex.quote(part) for part in client_args)
     return f"cd {shlex.quote(args.remote_project_dir)} && {quoted}"
 
@@ -80,6 +116,9 @@ def _start_server(args: argparse.Namespace, seed: int, poisoned_ids: List[str]) 
         *_arg("--poisoned-client-count", len(poisoned_ids)),
         *_arg("--poisoned-client-ids", ",".join(poisoned_ids)),
         *_arg("--poisoning-method", args.poisoning_method),
+        *_arg("--run-role", args.run_role),
+        *_arg("--min-clients", len(_active_devices(args))),
+        *_arg("--cpu-freq-sample-ms", args.cpu_freq_sample_ms),
     ]
     if args.server_log_hardware:
         command.append("--server-log-hardware")
@@ -88,7 +127,7 @@ def _start_server(args: argparse.Namespace, seed: int, poisoned_ids: List[str]) 
 
 def _start_clients(args: argparse.Namespace, seed: int, poisoned_ids: List[str]) -> List[subprocess.Popen]:
     processes = []
-    for device in DEVICES[: args.num_clients]:
+    for device in _active_devices(args):
         remote_command = _client_command(args, device, seed, poisoned_ids)
         target = f"{args.ssh_user}@{device['host']}" if args.ssh_user else device["host"]
         command = ["ssh", target, remote_command]
@@ -126,11 +165,15 @@ def _terminate(processes: List[subprocess.Popen]) -> None:
 
 def run_trial(args: argparse.Namespace, poisoned_client_count: int, poisoning_method: str, trial_id: int) -> None:
     seed = args.seed + trial_id
-    poisoned_ids = select_poisoned_clients(args.num_clients, poisoned_client_count, seed)
+    active_devices = _active_devices(args)
+    poisoned_ids = _select_poisoned_clients(active_devices, poisoned_client_count, seed)
     args.trial_id = trial_id
     args.poisoning_method = poisoning_method
+    args.run_role = "clean_baseline" if poisoning_method == POISONING_METHOD_CLEAN else "attack_analysis"
     print(
         f"trial={trial_id} seed={seed} poisoning_method={poisoning_method} "
+        f"run_role={args.run_role} "
+        f"active_clients={[device['client_id'] for device in active_devices]} "
         f"poisoned_client_count={poisoned_client_count} ids={poisoned_ids}"
     )
     if args.dry_run:
@@ -167,15 +210,33 @@ def main() -> None:
     parser.add_argument("--remote-python", default=DEFAULT_REMOTE_PYTHON)
     parser.add_argument("--ssh-user", default=DEFAULT_SSH_USER)
     parser.add_argument("--ssh-password", default="")
+    parser.add_argument(
+        "--active-client-ids",
+        default="",
+        help="Comma-separated reachable client IDs. Empty uses every configured device.",
+    )
     parser.add_argument("--poisoned-client-counts", default="1,4")
     parser.add_argument(
         "--poisoning-methods",
         default=",".join(DEFAULT_FL_POISONING_METHODS),
-        help=f"Comma-separated attack methods. Allowed: {','.join(POISONING_ATTACK_METHODS)}",
+        help=(
+            "Comma-separated clean/attack methods. Clean runs once with zero poisoned clients. "
+            f"Allowed: {POISONING_METHOD_CLEAN},{','.join(POISONING_ATTACK_METHODS)}"
+        ),
     )
     parser.add_argument("--trials", type=int, default=DEFAULT_FL_TRIALS)
     parser.add_argument("--client-start-delay", type=float, default=3.0)
     parser.add_argument("--server-log-hardware", action="store_true")
+    perf_group = parser.add_mutually_exclusive_group()
+    perf_group.add_argument("--enable-perf", dest="enable_perf", action="store_true")
+    perf_group.add_argument("--disable-perf", dest="enable_perf", action="store_false")
+    parser.set_defaults(enable_perf=True)
+    parser.add_argument(
+        "--perf-events",
+        default="",
+        help="Client perf events. Empty lets each client select its host-specific profile.",
+    )
+    parser.add_argument("--perf-fps", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -190,9 +251,10 @@ def main() -> None:
             batch_size=args.batch_size,
         )
     counts = [int(item.strip()) for item in args.poisoned_client_counts.split(",") if item.strip()]
-    poisoning_methods = parse_poisoning_methods(args.poisoning_methods, include_clean=False)
-    for count in counts:
-        for poisoning_method in poisoning_methods:
+    poisoning_methods = parse_poisoning_methods(args.poisoning_methods, include_clean=True)
+    for poisoning_method in poisoning_methods:
+        method_counts = [0] if poisoning_method == POISONING_METHOD_CLEAN else counts
+        for count in method_counts:
             for trial_id in range(args.trials):
                 run_trial(args, count, poisoning_method, trial_id)
 

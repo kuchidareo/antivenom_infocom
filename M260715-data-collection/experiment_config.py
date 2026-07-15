@@ -25,15 +25,15 @@ DEFAULT_LOCAL_ML_TRIALS = DEFAULT_LOCAL_ML_ANALYSIS_TRIALS
 DEFAULT_CLEAN_REFERENCE_TRIALS = DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS
 DEFAULT_OT_REFERENCE_TRIAL_IDS = [f"reference_{idx}" for idx in range(DEFAULT_CLEAN_REFERENCE_TRIALS)]
 DEFAULT_FL_LOCAL_EPOCHS = 1
-DEFAULT_FL_NUM_ROUNDS = 10
-DEFAULT_FL_TRIALS = 5
+DEFAULT_FL_NUM_ROUNDS = 15
+DEFAULT_FL_TRIALS = 1
 DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_NUM_CLIENTS = 10
 DEFAULT_BASE_SEED = 260626
 DEFAULT_SERVER_ADDRESS = "192.168.0.110:8080"
 DEFAULT_FL_SERVER_BIND_ADDRESS = "0.0.0.0:8080"
 DEFAULT_FL_CLIENT_SERVER_ADDRESS = "192.168.0.110:8080"
-DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/kuchida/antivenom_infocom/M260713-data-collection"
+DEFAULT_REMOTE_PROJECT_DIR = "/home/rasheed/kuchida/antivenom_infocom/M260715-data-collection"
 DEFAULT_REMOTE_PYTHON = "/home/rasheed/kuchida/antivenom_infocom/venv/bin/python"
 DEFAULT_SSH_USER = "rasheed"
 DEFAULT_BACKGROUND_WORKLOAD_ENABLED = False
@@ -310,6 +310,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--augment", default=json.dumps(DEFAULT_AUGMENT))
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--experiment-id", default="")
+    parser.add_argument("--run-role", default="")
     parser.add_argument("--background-workload-enabled", action="store_true", default=DEFAULT_BACKGROUND_WORKLOAD_ENABLED)
     parser.add_argument("--background-workload-group", default=DEFAULT_BACKGROUND_WORKLOAD_GROUP)
     parser.add_argument("--background-workload-profile", default=DEFAULT_BACKGROUND_WORKLOAD_PROFILE)

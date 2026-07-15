@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 
 from dataset_preparation import get_dataloader, get_num_classes, get_poison_fraction, prepare_dataset
 from experiment_config import (
@@ -20,6 +21,7 @@ from experiment_config import (
 from hardware_logger import HardwareLogger, TrainingState
 from metrics_logger import MetricsLogger
 from models import get_model
+from perf_logger import DEFAULT_PERF_EVENTS, PerfLogger, default_perf_events_for_host
 from training_utils import evaluate_model, train_model
 
 
@@ -80,27 +82,44 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         training_state=state,
         cpu_freq_sample_ms=args.cpu_freq_sample_ms,
     ) as logger:
+        perf_context = nullcontext()
+        if args.enable_perf:
+            perf_context = PerfLogger(
+                log_dir=args.log_dir,
+                condition=condition,
+                training_state=state,
+                path=logger.path.with_name(f"{logger.path.stem}_perf.csv"),
+                events=parse_perf_events(args.perf_events, host=args.host),
+                fps=args.perf_fps,
+            )
         metrics_logger = MetricsLogger(
             path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
             condition=condition,
         )
-        train_model(
-            model=model,
-            train_loader=train_loader,
-            epochs=args.local_epochs,
-            learning_rate=args.learning_rate,
-            state=state,
-            round_id=0,
-            metrics_logger=metrics_logger,
-        )
-        evaluate_model(
-            model=model,
-            data_loader=eval_loader,
-            state=state,
-            round_id=0,
-            metrics_logger=metrics_logger,
-        )
+        with perf_context:
+            train_model(
+                model=model,
+                train_loader=train_loader,
+                epochs=args.local_epochs,
+                learning_rate=args.learning_rate,
+                state=state,
+                round_id=0,
+                metrics_logger=metrics_logger,
+            )
+            evaluate_model(
+                model=model,
+                data_loader=eval_loader,
+                state=state,
+                round_id=0,
+                metrics_logger=metrics_logger,
+            )
     return str(logger.path)
+
+
+def parse_perf_events(value: str, *, host: str = ""):
+    if not value:
+        return default_perf_events_for_host(host)
+    return [event.strip() for event in value.split(",") if event.strip()]
 
 
 def main() -> None:
@@ -117,6 +136,20 @@ def main() -> None:
     )
     parser.add_argument("--reference-trials", type=int, default=DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS)
     parser.add_argument("--trials", type=int, default=DEFAULT_LOCAL_ML_ANALYSIS_TRIALS)
+    perf_group = parser.add_mutually_exclusive_group()
+    perf_group.add_argument("--enable-perf", dest="enable_perf", action="store_true")
+    perf_group.add_argument("--disable-perf", dest="enable_perf", action="store_false")
+    parser.set_defaults(enable_perf=True)
+    parser.add_argument(
+        "--perf-events",
+        default="",
+        help=(
+            "Comma-separated perf event list. An empty value automatically selects "
+            "the Raspberry Pi or Jetson CPU event profile from --host. Raspberry Pi default: "
+            f"{','.join(DEFAULT_PERF_EVENTS)}"
+        ),
+    )
+    parser.add_argument("--perf-fps", type=float, default=10.0)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 

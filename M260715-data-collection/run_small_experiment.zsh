@@ -14,6 +14,9 @@ REFERENCE_TRIALS=0
 CPU_FREQ_SAMPLE_MS="${CPU_FREQ_SAMPLE_MS:-1}"
 PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-1}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
+PERF_ENABLED="${PERF_ENABLED:-1}"
+PERF_FPS="${PERF_FPS:-10}"
+PERF_EVENTS="${PERF_EVENTS:-}"
 
 usage() {
   cat <<'EOF'
@@ -35,6 +38,9 @@ Environment:
   SSH_PASSWORD=...          optional when SSH keys are configured
   CPU_FREQ_SAMPLE_MS=1     internal frequency sampling interval
   PING_TIMEOUT_SEC=1
+  PERF_ENABLED=1           collect a matching _perf.csv file
+  PERF_FPS=10
+  PERF_EVENTS=             empty uses perf_logger.py defaults
 EOF
 }
 
@@ -89,8 +95,22 @@ ssh_run "
   test -x '$REMOTE_PYTHON'
   test -d '$REMOTE_DATASET_DIR'
   '$REMOTE_PYTHON' --version
-  '$REMOTE_PYTHON' -c 'import torch, torchvision, psutil, numpy, PIL; print("dependencies: ok")'
+  '$REMOTE_PYTHON' -c 'import torch, torchvision, psutil, numpy, PIL'
+  if [ '$PERF_ENABLED' = '1' ]; then command -v perf; fi
+  echo 'dependencies: ok'
 "
+
+if [[ "$PERF_ENABLED" == "1" ]]; then
+  print "Configuring perf_event_paranoid=-1..."
+  if [[ -n "$SSH_PASSWORD" ]]; then
+    ssh_run "printf '%s\n' '$SSH_PASSWORD' | sudo -S sysctl kernel.perf_event_paranoid=-1"
+  else
+    ssh_run "sudo -n sysctl kernel.perf_event_paranoid=-1"
+  fi
+  PERF_OPTIONS="--enable-perf --perf-fps '$PERF_FPS' --perf-events '$PERF_EVENTS'"
+else
+  PERF_OPTIONS="--disable-perf"
+fi
 
 print "Running small local-ML experiment:"
 print "  device: ${SSH_TARGET} (${CLIENT_ID})"
@@ -114,7 +134,8 @@ ssh_run "
     --reference-trials '$REFERENCE_TRIALS' \
     --trials '$TRIALS' \
     --poisoning-method '$METHODS' \
-    --cpu-freq-sample-ms '$CPU_FREQ_SAMPLE_MS'
+    --cpu-freq-sample-ms '$CPU_FREQ_SAMPLE_MS' \
+    $PERF_OPTIONS
 "
 
 print "Small experiment finished on ${HOST}."

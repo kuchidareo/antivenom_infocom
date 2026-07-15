@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Server-side project path.
-SERVER_PROJECT_DIR="/home/user/kuchida/antivenom_infocom/M260713-data-collection"
+SERVER_PROJECT_DIR="${0:A:h}"
 
 # Remote Raspberry Pi project path.
-REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/M260713-data-collection"
+REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/M260715-data-collection"
 
 # SSH credentials. Password is read from SSH_PASSWORD env var.
 SSH_USER="rasheed"

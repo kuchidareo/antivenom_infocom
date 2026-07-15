@@ -9,6 +9,10 @@ SSH_PASSWORD="${SSH_PASSWORD:-}"
 SMALL_TRASHNET_DATASET="kuchidareo/small_trashnet"
 CIFAR10_DATASET="uoft-cs/cifar10"
 DEFAULT_METHODS="clean,unlearnable_examples,availability_shortcuts"
+DEFAULT_FL_METHODS="clean,unlearnable_examples,availability_shortcuts,random_label_flipping"
+FL_DATASET="${FL_DATASET:-$SMALL_TRASHNET_DATASET}"
+FL_POISONED_CLIENT_COUNTS="${FL_POISONED_CLIENT_COUNTS:-1,4,7,10}"
+FL_TRIALS="${FL_TRIALS:-1}"
 
 REFERENCE_TRIALS="${REFERENCE_TRIALS:-5}"
 ANALYSIS_TRIALS="${ANALYSIS_TRIALS:-5}"
@@ -23,6 +27,9 @@ BG_INSTALL_OPENCV="${BG_INSTALL_OPENCV:-1}"
 BG_OPENCV_PIP_PACKAGE="${BG_OPENCV_PIP_PACKAGE:-opencv-python-headless}"
 BG_WORKLOAD_CHECKED=0
 PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-1}"
+PERF_ENABLED="${PERF_ENABLED:-1}"
+PERF_FPS="${PERF_FPS:-10}"
+PERF_EVENTS="${PERF_EVENTS:-}"
 
 config_value() {
   local name="$1"
@@ -56,6 +63,9 @@ REMOTE_PROJECT_DIR="$(config_value DEFAULT_REMOTE_PROJECT_DIR)"
 REMOTE_REPO_DIR="${REMOTE_PROJECT_DIR:h}"
 REMOTE_PYTHON="$(config_value DEFAULT_REMOTE_PYTHON)"
 SSH_USER="$(config_value DEFAULT_SSH_USER)"
+FL_NUM_ROUNDS="${FL_NUM_ROUNDS:-$(config_value DEFAULT_FL_NUM_ROUNDS)}"
+FL_LOCAL_EPOCHS="${FL_LOCAL_EPOCHS:-$(config_value DEFAULT_FL_LOCAL_EPOCHS)}"
+FL_BATCH_SIZE="${FL_BATCH_SIZE:-$(config_value DEFAULT_BATCH_SIZE)}"
 
 ssh_target() {
   local host="$1"
@@ -104,8 +114,132 @@ check_remote_environment() {
       '$REMOTE_PYTHON' --version
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/small_trashnet'
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/cifar10'
+      if [ '$PERF_ENABLED' = '1' ]; then
+        command -v perf
+      fi
     "
   done
+}
+
+check_fl_environment() {
+  print "Checking Flower on the server and reachable clients..."
+  (
+    cd "$SERVER_PROJECT_DIR"
+    test -f fl_client.py
+    test -f fl_server.py
+    test -f running_fl.py
+    test -f perf_logger.py
+    "$SERVER_PYTHON" -c 'import datasets, flwr, numpy, PIL, psutil, torch, torchvision; print("server Flower", flwr.__version__)'
+    "$SERVER_PYTHON" -c 'import subprocess, sys; help_text = subprocess.check_output([sys.executable, "fl_client.py", "--help"], text=True); assert "{clean," in help_text, "local fl_client.py does not support clean FL"'
+    "$SERVER_PYTHON" -c 'import subprocess, sys; help_text = subprocess.check_output([sys.executable, "fl_server.py", "--help"], text=True); assert "{clean," in help_text, "local fl_server.py does not support clean FL"'
+  )
+  for device in "${(@f)$(reachable_device_lines)}"; do
+    local host="${device#*:}"
+    print "==> Flower check ${host}"
+    ssh_run "$host" "
+      set -e
+      cd '$REMOTE_PROJECT_DIR'
+      test -f fl_client.py
+      test -f fl_server.py
+      test -f perf_logger.py
+      '$REMOTE_PYTHON' -c 'import datasets, flwr, numpy, PIL, psutil, torch, torchvision; print(\"client Flower\", flwr.__version__)'
+      '$REMOTE_PYTHON' -c 'import subprocess, sys; help_text = subprocess.check_output([sys.executable, \"fl_client.py\", \"--help\"], text=True); assert \"{clean,\" in help_text, \"remote fl_client.py is stale and does not support clean FL\"'
+      '$REMOTE_PYTHON' -c 'import subprocess, sys; help_text = subprocess.check_output([sys.executable, \"fl_server.py\", \"--help\"], text=True); assert \"{clean,\" in help_text, \"remote fl_server.py is stale and does not support clean FL\"'
+    "
+  done
+}
+
+configure_remote_perf() {
+  if [[ "$PERF_ENABLED" != "1" ]]; then
+    return
+  fi
+
+  print "Configuring perf_event_paranoid=-1 on reachable devices..."
+  for device in "${(@f)$(reachable_device_lines)}"; do
+    local host="${device#*:}"
+    print "==> perf setup ${host}"
+    if [[ -n "$SSH_PASSWORD" ]]; then
+      ssh_run "$host" "printf '%s\n' '$SSH_PASSWORD' | sudo -S sysctl kernel.perf_event_paranoid=-1"
+    else
+      ssh_run "$host" "sudo -n sysctl kernel.perf_event_paranoid=-1"
+    fi
+  done
+}
+
+validate_remote_perf_events() {
+  if [[ "$PERF_ENABLED" != "1" ]]; then
+    print "Perf monitoring is disabled; skipping PMU event validation."
+    return
+  fi
+
+  print "Validating host-specific perf event profiles..."
+  for device in "${(@f)$(reachable_device_lines)}"; do
+    local host="${device#*:}"
+    local events
+    events="$(
+      cd "$SERVER_PROJECT_DIR"
+      "$SERVER_PYTHON" -c "from perf_logger import default_perf_events_for_host; print(','.join(default_perf_events_for_host('$host')))"
+    )"
+    print "==> perf events ${host}"
+    ssh_run "$host" "
+      set -e
+      output='/tmp/antivenom_perf_event_check.out'
+      if perf stat -e '$events' -- true >\"\$output\" 2>&1; then
+        rm -f \"\$output\"
+        echo 'perf event profile: ok'
+      else
+        cat \"\$output\" >&2
+        rm -f \"\$output\"
+        exit 1
+      fi
+    "
+  done
+}
+
+print_reachable_fl_clients() {
+  local -a configured_lines active_lines active_ids
+  local device
+  configured_lines=("${(@f)$(device_lines)}")
+  active_lines=("${(@f)$(reachable_device_lines)}")
+  for device in "${active_lines[@]}"; do
+    active_ids+=("${device%%:*}")
+  done
+  print "Reachable FL clients (${#active_ids[@]}/${#configured_lines[@]}): ${(j:,:)active_ids}"
+}
+
+perf_args_for_python() {
+  if [[ "$PERF_ENABLED" == "1" ]]; then
+    print -- "--enable-perf --perf-fps '$PERF_FPS' --perf-events '$PERF_EVENTS'"
+  else
+    print -- "--disable-perf"
+  fi
+}
+
+normalize_fl_methods() {
+  local raw="$1"
+  local -a selected
+  local token
+  raw="${raw//,/ }"
+
+  for token in ${(z)raw}; do
+    case "$token" in
+      clean|unlearnable_examples|random_label_flipping|target_label_flipping|availability_shortcuts)
+        if (( ${selected[(Ie)$token]} == 0 )); then
+          selected+=("$token")
+        fi
+        ;;
+      *)
+        print "Unknown FL condition: ${token}" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  if (( ${#selected[@]} == 0 )); then
+    print "No FL attack conditions remain after validation." >&2
+    return 1
+  fi
+  print -- "${(j:,:)selected}"
 }
 
 bg_args_for_python() {
@@ -248,6 +382,8 @@ run_local_ml_stage() {
   local trials_option="--trials '$analysis_trials'"
   local method_option="--poisoning-method '$methods'"
   local bg_option=""
+  local perf_option
+  perf_option="$(perf_args_for_python)"
 
   if [[ "$use_bg" == "1" ]]; then
     bg_option="$(bg_args_for_python)"
@@ -274,6 +410,7 @@ run_local_ml_stage() {
         $reference_option \
         $trials_option \
         $method_option \
+        $perf_option \
         $bg_option
     " &
   done
@@ -286,6 +423,7 @@ run_all_local_ml() {
 
   pull_remote_repos
   check_remote_environment
+  configure_remote_perf
 
   run_local_ml_stage \
     "small_trashnet_no_bg_reference_and_analysis" \
@@ -312,12 +450,91 @@ run_all_local_ml() {
     "1"
 }
 
+run_fl_experiments() {
+  local methods="${1:-$DEFAULT_FL_METHODS}"
+  local -a active_lines active_ids perf_args
+  local device
+
+  methods="$(normalize_fl_methods "$methods")"
+
+  active_lines=("${(@f)$(reachable_device_lines)}")
+  if (( ${#active_lines[@]} == 0 )); then
+    print "No reachable FL clients." >&2
+    return 1
+  fi
+  for device in "${active_lines[@]}"; do
+    active_ids+=("${device%%:*}")
+  done
+
+  local count
+  for count in ${(s:,:)FL_POISONED_CLIENT_COUNTS}; do
+    if [[ "$count" != <-> ]]; then
+      print "Invalid poisoned-client count: ${count}" >&2
+      return 1
+    fi
+    if (( count > ${#active_ids[@]} )); then
+      print "Cannot run poisoned_client_count=${count} with only ${#active_ids[@]} reachable FL clients." >&2
+      print "All 10 clients must be reachable for the poisoned_client_count=10 condition." >&2
+      return 1
+    fi
+  done
+
+  if [[ "$PERF_ENABLED" == "1" ]]; then
+    perf_args=(--enable-perf --perf-fps "$PERF_FPS" --perf-events "$PERF_EVENTS")
+  else
+    perf_args=(--disable-perf)
+  fi
+
+  print
+  print "Running Flower FL experiments:"
+  print "  dataset: ${FL_DATASET}"
+  print "  methods: ${methods}"
+  print "  clean baseline poisoned_client_count: 0"
+  print "  attack poisoned_client_counts: ${FL_POISONED_CLIENT_COUNTS}"
+  print "  trials: ${FL_TRIALS}"
+  print "  rounds per trial: ${FL_NUM_ROUNDS}"
+  print "  local epochs per client per round: ${FL_LOCAL_EPOCHS}"
+  print "  batch size: ${FL_BATCH_SIZE}"
+  print "  active_clients: ${(j:,:)active_ids}"
+  print "  client_perf: ${PERF_ENABLED}, fps=${PERF_FPS}"
+
+  cd "$SERVER_PROJECT_DIR"
+  "$SERVER_PYTHON" running_fl.py \
+    --dry-run \
+    --dataset "$FL_DATASET" \
+    --poisoning-methods "$methods" \
+    --poisoned-client-counts "$FL_POISONED_CLIENT_COUNTS" \
+    --trials "$FL_TRIALS" \
+    --num-rounds "$FL_NUM_ROUNDS" \
+    --local-epochs "$FL_LOCAL_EPOCHS" \
+    --batch-size "$FL_BATCH_SIZE" \
+    --active-client-ids "${(j:,:)active_ids}" \
+    --ssh-password "$SSH_PASSWORD" \
+    "${perf_args[@]}"
+
+  "$SERVER_PYTHON" running_fl.py \
+    --dataset "$FL_DATASET" \
+    --poisoning-methods "$methods" \
+    --poisoned-client-counts "$FL_POISONED_CLIENT_COUNTS" \
+    --trials "$FL_TRIALS" \
+    --num-rounds "$FL_NUM_ROUNDS" \
+    --local-epochs "$FL_LOCAL_EPOCHS" \
+    --batch-size "$FL_BATCH_SIZE" \
+    --active-client-ids "${(j:,:)active_ids}" \
+    --ssh-password "$SSH_PASSWORD" \
+    --server-log-hardware \
+    "${perf_args[@]}"
+  print "Flower FL experiments finished."
+}
+
 usage() {
   cat <<'EOF'
 Usage:
   ./run_experiments.zsh check
+  ./run_experiments.zsh fl-check
   ./run_experiments.zsh bg-check
   ./run_experiments.zsh all [conditions]
+  ./run_experiments.zsh fl [attack_conditions]
 
 Default experiment:
   1. small_trashnet without bg:
@@ -330,6 +547,7 @@ Default experiment:
 Examples:
   ./run_experiments.zsh all
   ./run_experiments.zsh all clean,unlearnable_examples,availability_shortcuts
+  ./run_experiments.zsh fl clean,unlearnable_examples,availability_shortcuts,random_label_flipping
 
 Environment:
   SSH_PASSWORD=...                 optional if SSH keys are configured
@@ -338,6 +556,15 @@ Environment:
   BG_WORKLOAD_GROUP=group1         type I/perception workload
   BG_WORKLOAD_PROFILE=medium
   BG_WORKLOAD_TEST_DURATION=10
+  PERF_ENABLED=1                   collect perf CSV files; use 0 to disable
+  PERF_FPS=10
+  PERF_EVENTS=                     empty uses perf_logger.py defaults
+  FL_DATASET=kuchidareo/small_trashnet
+  FL_POISONED_CLIENT_COUNTS=1,4,7,10
+  FL_TRIALS=1
+  FL_NUM_ROUNDS=15
+  FL_LOCAL_EPOCHS=1
+  FL_BATCH_SIZE=16
 EOF
 }
 
@@ -349,14 +576,33 @@ main() {
     check)
       pull_remote_repos
       check_remote_environment
+      configure_remote_perf
+      ;;
+    fl-check)
+      pull_remote_repos
+      check_remote_environment
+      check_fl_environment
+      configure_remote_perf
+      validate_remote_perf_events
+      print_reachable_fl_clients
+      print "FL environment check finished; no experiment was started."
       ;;
     bg-check)
       pull_remote_repos
       check_remote_environment
+      configure_remote_perf
       check_bg_workloads
       ;;
     all)
       run_all_local_ml "${1:-$DEFAULT_METHODS}"
+      ;;
+    fl)
+      pull_remote_repos
+      check_remote_environment
+      check_fl_environment
+      configure_remote_perf
+      validate_remote_perf_events
+      run_fl_experiments "${1:-$DEFAULT_FL_METHODS}"
       ;;
     -h|--help|help)
       usage
