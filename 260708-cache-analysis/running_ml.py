@@ -92,7 +92,12 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         poison_fraction=poison_fraction,
         attack_name=attack_name_for_poisoning_method(poisoning_method),
     )
-    with HardwareLogger(log_dir=args.log_dir, condition=condition, training_state=state) as logger:
+    with HardwareLogger(
+        log_dir=args.log_dir,
+        condition=condition,
+        training_state=state,
+        fps=args.hardware_fps,
+    ) as logger:
         perf_path = logger.path.with_name(f"{logger.path.stem}_perf.csv")
         metrics_logger = MetricsLogger(
             path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
@@ -104,6 +109,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
             training_state=state,
             path=perf_path,
             events=parse_perf_events(args.perf_events),
+            fps=args.perf_fps,
         ):
             train_model(
                 model=model,
@@ -151,6 +157,18 @@ def main() -> None:
             "Comma-separated perf event list. Defaults to the expanded cache-analysis event set: "
             f"{','.join(DEFAULT_PERF_EVENTS)}"
         ),
+    )
+    parser.add_argument(
+        "--perf-fps",
+        type=float,
+        default=10.0,
+        help="perf stat sampling frequency. The default 10 FPS uses 100 ms intervals.",
+    )
+    parser.add_argument(
+        "--hardware-fps",
+        type=float,
+        default=10.0,
+        help="psutil hardware sampling frequency. The default 10 FPS uses 100 ms intervals.",
     )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()

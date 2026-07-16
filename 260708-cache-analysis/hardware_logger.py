@@ -87,6 +87,8 @@ class HardwareLogger:
         pid: Optional[int] = None,
         fps: float = 10.0,
     ) -> None:
+        if fps <= 0:
+            raise ValueError("fps must be positive.")
         self.log_dir = log_dir
         self.condition = dict(condition)
         self.training_state = training_state or TrainingState()

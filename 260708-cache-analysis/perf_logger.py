@@ -261,8 +261,9 @@ class PerfLogger:
                     break
                 parsed = parse_perf_stat_csv_line(line)
                 if parsed is None:
-                    if "No permission" in line or "Permission" in line:
-                        self._error = line.strip()
+                    message = line.strip()
+                    if message and not message.startswith("#") and not self._error:
+                        self._error = message
                     continue
 
                 elapsed = float(parsed["elapsed_sec"])
