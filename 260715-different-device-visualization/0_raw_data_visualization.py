@@ -23,7 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "collected_logs" / "logs"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "visualization"
 
-DEVICES = ("192.168.0.112", "192.168.0.141")
+DEVICES = ("192.168.0.112", "192.168.0.141", "cloudlab_test")
 METHODS = ("clean", "unlearnable_examples", "availability_shortcuts")
 SEQUENCE_METHODS = ("clean", "availability_shortcuts")
 METHOD_LABELS = {
