@@ -112,6 +112,11 @@ check_environment() {
     test -d '$REMOTE_PROJECT_DIR' || { echo 'missing project: $REMOTE_PROJECT_DIR' >&2; exit 2; }
     test -d '$REMOTE_DATA_DIR/small_trashnet' || { echo 'missing dataset: $REMOTE_DATA_DIR/small_trashnet' >&2; exit 3; }
     cd '$REMOTE_PROJECT_DIR'
+    '$REMOTE_PYTHON' -c \"import sklearn; print('scikit-learn', sklearn.__version__)\" || {
+      echo 'missing scikit-learn in $REMOTE_PYTHON' >&2
+      echo \"install with: $REMOTE_PYTHON -m pip install scikit-learn\" >&2
+      exit 4
+    }
     CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' dataset_preparation.py \
       --dataset '$DATASET_NAME' \
       --data-dir '$REMOTE_DATA_DIR' \
@@ -138,6 +143,7 @@ check_environment() {
       exit 4
     }
     CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' -c \"import torch; from dataset_preparation import get_num_classes, load_metadata_records; assert not torch.cuda.is_available(); clean_train=load_metadata_records(data_dir='$REMOTE_DATA_DIR',dataset_name='$DATASET_NAME',client_id='$CLIENT_ID',poisoning_method='clean',split='train'); shortcut_train=load_metadata_records(data_dir='$REMOTE_DATA_DIR',dataset_name='$DATASET_NAME',client_id='$CLIENT_ID',poisoning_method='availability_shortcuts',split='train'); clean_test=load_metadata_records(data_dir='$REMOTE_DATA_DIR',dataset_name='$DATASET_NAME',client_id='all',poisoning_method='clean',split='test'); poisoned_test=load_metadata_records(data_dir='$REMOTE_DATA_DIR',dataset_name='$DATASET_NAME',client_id='all',poisoning_method='availability_shortcuts',split='test'); assert clean_train and shortcut_train and clean_test; assert not poisoned_test; print('device=cpu'); print('torch_threads=',torch.get_num_threads()); print('num_classes=',get_num_classes('$REMOTE_DATA_DIR','$DATASET_NAME')); print('clean_train_client=',len(clean_train)); print('shortcut_train_client=',len(shortcut_train)); print('global_clean_test=',len(clean_test)); print('poisoned_test=',len(poisoned_test))\"
+    CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' -c \"from dataset_preparation import AVAILABILITY_SHORTCUT_GENERATOR, load_metadata_records; rows=load_metadata_records(data_dir='$REMOTE_DATA_DIR',dataset_name='$DATASET_NAME',client_id='$CLIENT_ID',poisoning_method='availability_shortcuts',split='train'); assert rows and all(row.get('shortcut_generator') == AVAILABILITY_SHORTCUT_GENERATOR for row in rows); print('shortcut_generator=', AVAILABILITY_SHORTCUT_GENERATOR)\"
   "
   enable_and_check_perf
 }

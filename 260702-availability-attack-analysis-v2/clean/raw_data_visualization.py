@@ -116,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         help="Keep idle rows inside the selected epoch.",
     )
     parser.add_argument(
+        "--phase_filter",
+        default="training",
+        choices=["training", "evaluation", "all"],
+        help=(
+            "Rows to plot. training keeps forward/backward/optimizer_step; "
+            "evaluation keeps evaluation rows; all keeps every non-idle phase."
+        ),
+    )
+    parser.add_argument(
         "--physical_cpu_cores",
         action="store_true",
         help="Plot physical CPU core columns instead of per-timestamp ranked cores.",
@@ -230,6 +239,7 @@ def load_run_trace(
     epoch: int,
     include_idle: bool,
     rank_cpu_cores: bool,
+    phase_filter: str,
 ) -> pd.DataFrame:
     df = pd.read_csv(run.path)
     required = ["timestamp_unix", "epoch", "phase", *PLOT_COLUMNS]
@@ -250,8 +260,14 @@ def load_run_trace(
         df = df[df["epoch"] == epoch].copy()
     if not include_idle:
         df = df[df["phase"] != "idle"].copy()
+    if phase_filter == "training":
+        df = df[df["phase"].isin(["forward", "backward", "optimizer_step"])].copy()
+    elif phase_filter == "evaluation":
+        df = df[df["phase"] == "evaluation"].copy()
     if df.empty:
-        raise ValueError(f"No rows remain after filtering {run.path} for epoch={epoch}.")
+        raise ValueError(
+            f"No rows remain after filtering {run.path} for epoch={epoch}, phase_filter={phase_filter}."
+        )
 
     df = df.sort_values("timestamp_unix").reset_index(drop=True)
     df["relative_time"] = df["timestamp_unix"] - float(df["timestamp_unix"].iloc[0])
@@ -266,6 +282,7 @@ def load_all_traces(
     epoch: int,
     include_idle: bool,
     rank_cpu_cores: bool,
+    phase_filter: str,
 ) -> Dict[str, pd.DataFrame]:
     traces: Dict[str, pd.DataFrame] = {}
     for condition, run in selected_runs.items():
@@ -275,6 +292,7 @@ def load_all_traces(
             epoch=epoch,
             include_idle=include_idle,
             rank_cpu_cores=rank_cpu_cores,
+            phase_filter=phase_filter,
         )
     return traces
 
@@ -292,6 +310,7 @@ def plot_combined(
     trial_id: str,
     epoch: int,
     rank_cpu_cores: bool,
+    phase_filter: str,
 ) -> Path:
     n_rows = len(PLOT_COLUMNS)
     fig, axes = plt.subplots(n_rows, 1, figsize=(12, 2.45 * n_rows), sharex=True)
@@ -316,10 +335,13 @@ def plot_combined(
     axes[0].legend(loc="upper right", ncol=2, fontsize=8)
     epoch_label = "full_run" if epoch < 0 else f"epoch_{epoch}"
     cpu_label = "ranked_cpu" if rank_cpu_cores else "physical_cpu"
-    fig.suptitle(f"{device} local_ml {trial_id} {epoch_label} ({cpu_label})", y=0.995)
+    fig.suptitle(f"{device} local_ml {trial_id} {epoch_label} {phase_filter} ({cpu_label})", y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.985])
 
-    output_path = output_dir / f"raw_timeseries_{safe_name(device)}_{safe_name(trial_id)}_{epoch_label}_{cpu_label}.png"
+    output_path = (
+        output_dir
+        / f"raw_timeseries_{safe_name(device)}_{safe_name(trial_id)}_{epoch_label}_{safe_name(phase_filter)}_{cpu_label}.png"
+    )
     fig.savefig(output_path, dpi=180)
     fig.savefig(output_path.with_suffix(".pdf"))
     plt.close(fig)
@@ -333,6 +355,7 @@ def plot_individual(
     trial_id: str,
     epoch: int,
     rank_cpu_cores: bool,
+    phase_filter: str,
 ) -> None:
     epoch_label = "full_run" if epoch < 0 else f"epoch_{epoch}"
     cpu_label = "ranked_cpu" if rank_cpu_cores else "physical_cpu"
@@ -347,7 +370,7 @@ def plot_individual(
                 linewidth=1.45,
                 alpha=0.92,
             )
-        ax.set_title(f"{device} {trial_id} {epoch_label} / {DISPLAY_NAMES[column]}")
+        ax.set_title(f"{device} {trial_id} {epoch_label} {phase_filter} / {DISPLAY_NAMES[column]}")
         ax.set_xlabel("relative time (s)")
         ax.set_ylabel(y_label_for_column(column))
         ax.grid(True, alpha=0.25)
@@ -355,7 +378,10 @@ def plot_individual(
         fig.tight_layout()
         output_path = (
             output_dir
-            / f"raw_{safe_name(DISPLAY_NAMES[column])}_{safe_name(device)}_{safe_name(trial_id)}_{epoch_label}_{cpu_label}.png"
+            / (
+                f"raw_{safe_name(DISPLAY_NAMES[column])}_{safe_name(device)}_{safe_name(trial_id)}_"
+                f"{epoch_label}_{safe_name(phase_filter)}_{cpu_label}.png"
+            )
         )
         fig.savefig(output_path, dpi=180)
         fig.savefig(output_path.with_suffix(".pdf"))
@@ -369,6 +395,7 @@ def write_selection_summary(
     device: str,
     trial_id: str,
     epoch: int,
+    phase_filter: str,
 ) -> Path:
     rows = []
     for condition, run in selected_runs.items():
@@ -378,6 +405,7 @@ def write_selection_summary(
                 "device": device,
                 "trial_id": trial_id,
                 "epoch": "full_run" if epoch < 0 else epoch,
+                "phase_filter": phase_filter,
                 "condition": condition,
                 "attack_name": run.attack_name,
                 "source_file": str(run.path),
@@ -385,7 +413,10 @@ def write_selection_summary(
                 "duration_seconds": float(df["relative_time"].max()),
             }
         )
-    output_path = output_dir / f"raw_timeseries_selection_{safe_name(device)}_{safe_name(trial_id)}.csv"
+    output_path = (
+        output_dir
+        / f"raw_timeseries_selection_{safe_name(device)}_{safe_name(trial_id)}_{safe_name(phase_filter)}.csv"
+    )
     pd.DataFrame(rows).to_csv(output_path, index=False)
     return output_path
 
@@ -404,6 +435,7 @@ def main() -> None:
         epoch=args.epoch,
         include_idle=args.include_idle,
         rank_cpu_cores=not args.physical_cpu_cores,
+        phase_filter=args.phase_filter,
     )
 
     figure_path = plot_combined(
@@ -413,6 +445,7 @@ def main() -> None:
         trial_id=args.trial_id,
         epoch=args.epoch,
         rank_cpu_cores=not args.physical_cpu_cores,
+        phase_filter=args.phase_filter,
     )
     if args.save_individual:
         plot_individual(
@@ -422,6 +455,7 @@ def main() -> None:
             trial_id=args.trial_id,
             epoch=args.epoch,
             rank_cpu_cores=not args.physical_cpu_cores,
+            phase_filter=args.phase_filter,
         )
     summary_path = write_selection_summary(
         selected_runs=selected_runs,
@@ -430,6 +464,7 @@ def main() -> None:
         device=args.device,
         trial_id=args.trial_id,
         epoch=args.epoch,
+        phase_filter=args.phase_filter,
     )
     print(f"saved figure: {figure_path}")
     print(f"saved selection summary: {summary_path}")

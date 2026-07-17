@@ -8,7 +8,7 @@ import flwr as fl
 from flwr.common import Metrics, Parameters, Scalar
 from flwr.server.client_proxy import ClientProxy
 
-from dataset_preparation import get_num_classes, prepare_dataset
+from dataset_preparation import get_dataloader, get_num_classes, prepare_dataset
 from experiment_config import (
     DEFAULT_SERVER_ADDRESS,
     POISONING_ATTACK_METHODS,
@@ -20,10 +20,12 @@ from experiment_config import (
     parse_client_ids,
     select_poisoned_clients,
     set_all_seeds,
+    yyyymmddhhmmss_log_path,
 )
 from hardware_logger import HardwareLogger, TrainingState
+from metrics_logger import MetricsLogger
 from models import get_model
-from training_utils import get_parameters
+from training_utils import evaluate_model, get_parameters, set_parameters
 
 
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
@@ -55,7 +57,12 @@ class AnnotatedFedAvg(fl.server.strategy.FedAvg):
         return aggregated
 
 
-def make_strategy(args: argparse.Namespace, poisoned_ids: List[str], state: TrainingState) -> fl.server.strategy.Strategy:
+def make_strategy(
+    args: argparse.Namespace,
+    poisoned_ids: List[str],
+    state: TrainingState,
+    metrics_logger: MetricsLogger,
+) -> fl.server.strategy.Strategy:
     num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     augment = augment_from_args(args)
     resize = augment.get("resize", [64, 64])
@@ -65,6 +72,18 @@ def make_strategy(args: argparse.Namespace, poisoned_ids: List[str], state: Trai
         input_size=(int(resize[0]), int(resize[1])),
     )
     initial_parameters = fl.common.ndarrays_to_parameters(get_parameters(model))
+    evaluation_augment = dict(augment)
+    evaluation_augment["horizontal_flip"] = False
+    clean_test_loader = get_dataloader(
+        data_dir=args.data_dir,
+        dataset_name=args.dataset,
+        client_id="all",
+        poisoning_method=POISONING_METHOD_CLEAN,
+        split="test",
+        augment=evaluation_augment,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
 
     def fit_config(server_round: int) -> Dict[str, Scalar]:
         return {
@@ -78,24 +97,42 @@ def make_strategy(args: argparse.Namespace, poisoned_ids: List[str], state: Trai
             "poisoning_method": args.poisoning_method,
         }
 
-    def evaluate_config(server_round: int) -> Dict[str, Scalar]:
-        return {
-            "round": server_round,
-            "poisoned_client_ids": ",".join(poisoned_ids),
-            "poisoning_method": args.poisoning_method,
+    def evaluate_global_model(server_round: int, parameters: List, config: Dict[str, Scalar]):
+        if server_round == 0:
+            return None
+        set_parameters(model, parameters)
+        result = evaluate_model(
+            model=model,
+            data_loader=clean_test_loader,
+            state=state,
+            round_id=server_round,
+            metrics_logger=metrics_logger,
+            metric_event="global_clean_test_round",
+            metric_split="clean_test",
+            condition_overrides={
+                "dataset_split": "test",
+                "client_partition_id": "all",
+            },
+        )
+        print(
+            f"global_clean_test round={server_round} loss={result['loss']:.6f} "
+            f"accuracy={result['accuracy']:.4f} examples={int(result['num_examples'])}"
+        )
+        return float(result["loss"]), {
+            "accuracy": float(result["accuracy"]),
+            "num_examples": int(result["num_examples"]),
         }
 
     min_clients = args.min_clients or args.num_clients
     return AnnotatedFedAvg(
         fraction_fit=1.0,
-        fraction_evaluate=1.0,
+        fraction_evaluate=0.0,
         min_fit_clients=min_clients,
-        min_evaluate_clients=min_clients,
+        min_evaluate_clients=0,
         min_available_clients=min_clients,
         initial_parameters=initial_parameters,
         on_fit_config_fn=fit_config,
-        on_evaluate_config_fn=evaluate_config,
-        evaluate_metrics_aggregation_fn=weighted_average,
+        evaluate_fn=evaluate_global_model,
         fit_metrics_aggregation_fn=weighted_average,
         state=state,
     )
@@ -154,7 +191,6 @@ def main() -> None:
     )
 
     state = TrainingState(round=0, phase="idle")
-    strategy = make_strategy(args, poisoned_ids, state)
     server_condition = POISONING_METHOD_CLEAN if not poisoned_ids else "mixed"
     condition = condition_columns(
         args=args,
@@ -177,13 +213,23 @@ def main() -> None:
             condition=condition,
             training_state=state,
             cpu_freq_sample_ms=args.cpu_freq_sample_ms,
-        ):
+        ) as logger:
+            metrics_logger = MetricsLogger(
+                path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
+                condition=condition,
+            )
+            strategy = make_strategy(args, poisoned_ids, state, metrics_logger)
             fl.server.start_server(
                 server_address=args.server_address,
                 config=fl.server.ServerConfig(num_rounds=args.num_rounds),
                 strategy=strategy,
             )
     else:
+        metrics_logger = MetricsLogger(
+            path=yyyymmddhhmmss_log_path(args.log_dir, suffix="_metrics.csv"),
+            condition=condition,
+        )
+        strategy = make_strategy(args, poisoned_ids, state, metrics_logger)
         fl.server.start_server(
             server_address=args.server_address,
             config=fl.server.ServerConfig(num_rounds=args.num_rounds),

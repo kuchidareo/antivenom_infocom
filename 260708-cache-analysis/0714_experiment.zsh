@@ -8,7 +8,9 @@ SSH_PORT="${SSH_PORT:-22}"
 CONDITIONS="${CONDITIONS:-clean,unlearnable_examples,availability_shortcuts,random_label_flipping}"
 TRIALS="${TRIALS:-5}"
 REFERENCE_TRIALS="${REFERENCE_TRIALS:-0}"
-LOCAL_EPOCHS="${LOCAL_EPOCHS:-15}"
+# This experiment is defined as 15 local epochs. Keep it fixed so an exported
+# value from an earlier quick run cannot silently change the collected data.
+LOCAL_EPOCHS=15
 BATCH_SIZE="${BATCH_SIZE:-16}"
 BASE_SEED="${BASE_SEED:-260714}"
 MODEL_DEPTH="${MODEL_DEPTH:-5}"
@@ -19,6 +21,9 @@ REMOTE_DATA_DIR_NAME="${REMOTE_DATA_DIR_NAME:-iid-data}"
 REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/cache_0714}"
 LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR:h}/iid-data}"
 AUGMENT_JSON="${AUGMENT_JSON:-{\"enabled\":true,\"resize\":[224,224],\"horizontal_flip\":true,\"normalize\":true}}"
+COMMON_PERF_EVENTS="${COMMON_PERF_EVENTS:-cycles,instructions,task-clock,context-switches,cpu-migrations,page-faults}"
+RPI_PERF_EVENTS="${RPI_PERF_EVENTS:-${COMMON_PERF_EVENTS},branches,branch-misses,l1d_cache_rd,l1d_cache_refill_rd,l1d_cache_wr,l1d_cache_refill_wr,l2d_cache_rd,l2d_cache_refill_rd,l2d_cache_wr,l2d_cache_refill_wr,bus_access_rd,bus_access_wr,mem_access,ase_spec,vfp_spec,inst_spec}"
+JETSON_PERF_EVENTS="${JETSON_PERF_EVENTS:-${COMMON_PERF_EVENTS},br_retired,br_mis_pred_retired,l1d_cache,l1d_cache_refill,l1d_cache_wb,l2d_cache,l2d_cache_refill,l2d_cache_wb,bus_access,mem_access,inst_spec}"
 
 ACTION="${1:-both}"
 
@@ -70,7 +75,20 @@ Default experiment settings:
   AUGMENT_JSON='{"enabled":true,"resize":[224,224],"horizontal_flip":true,"normalize":true}'
 
 Environment variables above can be overridden when launching the script.
+LOCAL_EPOCHS is intentionally fixed at 15 for this experiment.
 EOF
+}
+
+perf_events_for_device() {
+  local device_type="$1"
+  case "$device_type" in
+    jetson_cpu)
+      print -- "$JETSON_PERF_EVENTS"
+      ;;
+    *)
+      print -- "$RPI_PERF_EVENTS"
+      ;;
+  esac
 }
 
 ssh_base_cmd() {
@@ -201,9 +219,19 @@ run_device_grid() {
   local project_dir="${repo_dir}/${REMOTE_PROJECT_NAME}"
   local data_dir="${repo_dir}/${REMOTE_DATA_DIR_NAME}"
   local remote_python="${repo_dir}/${REMOTE_PYTHON_REL}"
+  local perf_events
+  perf_events="$(perf_events_for_device "$device_type")"
 
   print "==> device grid start ${user}@${host} (${device_type}, ${client_id})"
   ssh_run "$user" "$host" "printf '%s\n' '$SSH_PASSWORD' | sudo -S sysctl kernel.perf_event_paranoid=-1"
+  print "==> perf preflight ${host}: ${perf_events}"
+  ssh_run "$user" "$host" "
+    perf stat -e '$perf_events' -- true >/dev/null 2>&1 || {
+      echo 'perf preflight failed for: $perf_events' >&2
+      perf stat -e '$perf_events' -- true
+      exit 4
+    }
+  "
 
   local dataset_spec model_spec
   for dataset_spec in "${DATASET_SPECS[@]}"; do
@@ -236,6 +264,7 @@ run_device_grid() {
           --local-epochs '$LOCAL_EPOCHS' \\
           --batch-size '$BATCH_SIZE' \\
           --seed '$BASE_SEED' \\
+          --perf-events '$perf_events' \\
           --augment '$AUGMENT_JSON' \\
           --model '$model_name' \\
           --model-depth '$MODEL_DEPTH' \\

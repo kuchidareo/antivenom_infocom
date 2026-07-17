@@ -23,6 +23,7 @@ class MetricsLogger:
         loss: Optional[float] = None,
         accuracy: Optional[float] = None,
         num_examples: Optional[float] = None,
+        condition_overrides: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = datetime.now()
         row = {
@@ -35,6 +36,7 @@ class MetricsLogger:
             "num_examples": "" if num_examples is None else num_examples,
         }
         row.update(self.condition)
+        row.update(condition_overrides or {})
         row.update(state)
         for column in METRIC_COLUMNS:
             row.setdefault(column, "")

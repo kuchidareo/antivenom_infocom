@@ -35,6 +35,8 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
         self.args = args
         self.state = state
         self.augment = augment_from_args(args)
+        self.evaluation_augment = dict(self.augment)
+        self.evaluation_augment["horizontal_flip"] = False
         self.num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
         resize = self.augment.get("resize", [64, 64])
         self.model = get_model(
@@ -78,17 +80,14 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
 
     def evaluate(self, parameters: List, config: Dict[str, str]):
         current_round = int(config.get("round", 0))
-        poisoned_ids = parse_client_ids(str(config.get("poisoned_client_ids", self.args.poisoned_client_ids)))
-        configured_method = str(config.get("poisoning_method", self.args.poisoning_method))
-        poisoning_method = configured_method if self.args.client_id in poisoned_ids else POISONING_METHOD_CLEAN
         set_parameters(self.model, parameters)
         eval_loader = get_dataloader(
             data_dir=self.args.data_dir,
             dataset_name=self.args.dataset,
-            client_id=self.args.client_id,
-            poisoning_method=poisoning_method,
-            split=self.args.dataset_split,
-            augment=self.augment,
+            client_id="all",
+            poisoning_method=POISONING_METHOD_CLEAN,
+            split="test",
+            augment=self.evaluation_augment,
             batch_size=self.args.batch_size,
             shuffle=False,
         )
@@ -98,6 +97,12 @@ class TrashNetFlowerClient(fl.client.NumPyClient):
             state=self.state,
             round_id=current_round,
             metrics_logger=self.metrics_logger,
+            metric_event="clean_test_round",
+            metric_split="clean_test",
+            condition_overrides={
+                "dataset_split": "test",
+                "client_partition_id": "all",
+            },
         )
         return float(metrics["loss"]), len(eval_loader.dataset), {"accuracy": float(metrics["accuracy"])}
 

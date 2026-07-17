@@ -131,6 +131,7 @@ class HardwareLogger:
     def _sample(self) -> Dict[str, Any]:
         now = datetime.now()
         cpu = psutil.cpu_percent(interval=None, percpu=True)
+        cpu_freq = psutil.cpu_freq(percpu=True) or []
         mem = psutil.virtual_memory()
         try:
             proc_mem = self._process.memory_info()
@@ -151,6 +152,10 @@ class HardwareLogger:
             "system_cpu_core_1": cpu[1] if len(cpu) > 1 else "",
             "system_cpu_core_2": cpu[2] if len(cpu) > 2 else "",
             "system_cpu_core_3": cpu[3] if len(cpu) > 3 else "",
+            "system_cpu_freq_core_0": cpu_freq[0].current if len(cpu_freq) > 0 else "",
+            "system_cpu_freq_core_1": cpu_freq[1].current if len(cpu_freq) > 1 else "",
+            "system_cpu_freq_core_2": cpu_freq[2].current if len(cpu_freq) > 2 else "",
+            "system_cpu_freq_core_3": cpu_freq[3].current if len(cpu_freq) > 3 else "",
             "system_memory_percent": mem.percent,
             "system_memory_used": mem.used,
             "system_memory_available": mem.available,

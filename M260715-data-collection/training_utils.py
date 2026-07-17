@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,6 +19,7 @@ def train_model(
     state: TrainingState,
     round_id: Any = 0,
     metrics_logger: Any = None,
+    epoch_end_callback: Optional[Callable[[int], None]] = None,
 ) -> Dict[str, float]:
     device = get_device()
     model.to(device)
@@ -30,6 +31,7 @@ def train_model(
     total_seen = 0
 
     for epoch in range(epochs):
+        model.train()
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_seen = 0
@@ -72,6 +74,8 @@ def train_model(
                 accuracy=epoch_correct / max(epoch_seen, 1),
                 num_examples=float(epoch_seen),
             )
+        if epoch_end_callback is not None:
+            epoch_end_callback(epoch)
 
     state.update(round=round_id, phase="idle")
     if metrics_logger is not None:
@@ -98,6 +102,9 @@ def evaluate_model(
     state: TrainingState,
     round_id: Any = 0,
     metrics_logger: Any = None,
+    metric_event: str = "eval_summary",
+    metric_split: str = "eval",
+    condition_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     device = get_device()
     model.to(device)
@@ -120,11 +127,12 @@ def evaluate_model(
     if metrics_logger is not None:
         metrics_logger.write(
             state=state.snapshot(),
-            metric_event="eval_summary",
-            metric_split="eval",
+            metric_event=metric_event,
+            metric_split=metric_split,
             loss=total_loss / max(total_seen, 1),
             accuracy=total_correct / max(total_seen, 1),
             num_examples=float(total_seen),
+            condition_overrides=condition_overrides,
         )
     return {
         "loss": total_loss / max(total_seen, 1),

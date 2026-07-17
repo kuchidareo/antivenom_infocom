@@ -48,13 +48,15 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         batch_size=args.batch_size,
         shuffle=True,
     )
-    eval_loader = get_dataloader(
+    evaluation_augment = dict(augment)
+    evaluation_augment["horizontal_flip"] = False
+    clean_test_loader = get_dataloader(
         data_dir=args.data_dir,
         dataset_name=args.dataset,
-        client_id=args.client_id,
-        poisoning_method=poisoning_method,
-        split=args.dataset_split,
-        augment=augment,
+        client_id="all",
+        poisoning_method=POISONING_METHOD_CLEAN,
+        split="test",
+        augment=evaluation_augment,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -97,6 +99,25 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
             condition=condition,
         )
         with perf_context:
+            def evaluate_clean_test(epoch: int) -> None:
+                result = evaluate_model(
+                    model=model,
+                    data_loader=clean_test_loader,
+                    state=state,
+                    round_id=0,
+                    metrics_logger=metrics_logger,
+                    metric_event="clean_test_epoch",
+                    metric_split="clean_test",
+                    condition_overrides={
+                        "dataset_split": "test",
+                        "client_partition_id": "all",
+                    },
+                )
+                print(
+                    f"clean_test epoch={epoch} loss={result['loss']:.6f} "
+                    f"accuracy={result['accuracy']:.4f} examples={int(result['num_examples'])}"
+                )
+
             train_model(
                 model=model,
                 train_loader=train_loader,
@@ -105,13 +126,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
                 state=state,
                 round_id=0,
                 metrics_logger=metrics_logger,
-            )
-            evaluate_model(
-                model=model,
-                data_loader=eval_loader,
-                state=state,
-                round_id=0,
-                metrics_logger=metrics_logger,
+                epoch_end_callback=evaluate_clean_test,
             )
     return str(logger.path)
 

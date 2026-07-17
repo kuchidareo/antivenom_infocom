@@ -151,9 +151,12 @@ def parse_input_sequences(value: str):
         if not sequence_text:
             continue
         methods = tuple(item.strip() for item in sequence_text.split(":"))
-        if len(methods) != 2 or any(method not in POISONING_METHODS for method in methods):
+        if len(methods) not in {1, 2} or any(
+            method not in POISONING_METHODS for method in methods
+        ):
             raise argparse.ArgumentTypeError(
-                "Each input sequence must contain two valid methods separated by ':'. "
+                "Each input sequence must contain one valid method, or two valid methods "
+                "separated by ':'. "
                 f"Received {sequence_text!r}."
             )
         sequences.append(methods)
@@ -165,14 +168,14 @@ def parse_input_sequences(value: str):
 def run_one_input_sequence(
     args: argparse.Namespace,
     first_method: str,
-    second_method: str,
+    second_method: str | None,
     stage_epochs: int,
 ) -> str:
-    """Train one model continuously across two input regimes.
+    """Train one model across one or two input regimes.
 
     The model parameters and Adam state are retained at the stage boundary.
-    Hardware and perf loggers also remain open, producing one continuous
-    20-epoch trace when stage_epochs is 10.
+    Hardware and perf loggers remain open across both stages when a transition
+    is requested.
     """
     set_all_seeds(args.seed)
     augment = augment_from_args(args)
@@ -196,10 +199,12 @@ def run_one_input_sequence(
     args.resolved_model_estimated_pam_mb = model_metadata.get("model_estimated_pam_mb", "")
     args.resolved_model_parameter_count = model_metadata.get("model_parameter_count", "")
 
-    sequence = f"{first_method}_to_{second_method}"
+    methods = (first_method,) if second_method is None else (first_method, second_method)
+    total_epochs = stage_epochs * len(methods)
+    sequence = "_to_".join(methods)
     print(
         f"Starting sequence={sequence} trial={args.trial_id} "
-        f"stage_epochs={stage_epochs} total_epochs={stage_epochs * 2}"
+        f"stage_epochs={stage_epochs} total_epochs={total_epochs}"
     )
     loaders = {
         method: get_dataloader(
@@ -212,7 +217,7 @@ def run_one_input_sequence(
             batch_size=args.batch_size,
             shuffle=True,
         )
-        for method in {first_method, second_method}
+        for method in set(methods)
     }
     evaluation_augment = dict(augment)
     evaluation_augment["horizontal_flip"] = False
@@ -234,12 +239,12 @@ def run_one_input_sequence(
             poisoning_method=method,
             split=args.dataset_split,
         )
-        for method in {first_method, second_method}
+        for method in set(methods)
     }
 
     original_local_epochs = args.local_epochs
     original_experiment_id = args.experiment_id
-    args.local_epochs = stage_epochs * 2
+    args.local_epochs = total_epochs
     args.evaluation_method = POISONING_METHOD_CLEAN
     args.evaluation_split = "clean_test"
     args.evaluation_num_examples = len(clean_evaluation_loader.dataset)
@@ -250,10 +255,7 @@ def run_one_input_sequence(
         args=args,
         run_type="local_ml_input_model_state",
         poisoning_method=sequence,
-        is_poisoned_client=(
-            first_method != POISONING_METHOD_CLEAN
-            or second_method != POISONING_METHOD_CLEAN
-        ),
+        is_poisoned_client=any(method != POISONING_METHOD_CLEAN for method in methods),
         poisoned_client_count=1,
         poisoned_client_ids=[args.client_id],
         poison_fraction=max(poison_fractions.values()),
@@ -302,7 +304,7 @@ def run_one_input_sequence(
             events=parse_perf_events(args.perf_events),
             fps=args.perf_fps,
         ):
-            for stage_index, method in enumerate((first_method, second_method)):
+            for stage_index, method in enumerate(methods):
                 model_state_condition = (
                     "stage_started_from_initial"
                     if stage_index == 0
@@ -439,9 +441,10 @@ def main() -> None:
         "--input-sequences",
         default="",
         help=(
-            "Run continuous two-stage input/model-state experiments. Separate stages with ':' "
-            "and sequences with ','. Example: clean:availability_shortcuts,"
-            "availability_shortcuts:clean. Empty keeps the legacy independent-run mode."
+            "Run one-stage or continuous two-stage input/model-state experiments. "
+            "Separate stages with ':' and sequences with ','. Examples: "
+            "availability_shortcuts or clean:availability_shortcuts. "
+            "Empty keeps the legacy independent-run mode."
         ),
     )
     parser.add_argument(
@@ -481,11 +484,11 @@ def main() -> None:
             args.trial_id = f"trial_{trial}"
             args.seed = base_seed + 1000 + trial
             args.run_role = "input_model_state_analysis"
-            for first_method, second_method in sequences:
+            for methods in sequences:
                 run_one_input_sequence(
                     args,
-                    first_method=first_method,
-                    second_method=second_method,
+                    first_method=methods[0],
+                    second_method=methods[1] if len(methods) == 2 else None,
                     stage_epochs=args.stage_epochs,
                 )
         return

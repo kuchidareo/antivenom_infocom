@@ -1,0 +1,1736 @@
+import argparse
+import csv
+import json
+import os
+import random
+import sys
+import shutil
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from PIL import Image
+
+try:
+    import experiment_config as _experiment_config
+except ModuleNotFoundError:
+    _experiment_config = None
+
+
+def _config_value(name: str, fallback: Any) -> Any:
+    if _experiment_config is None:
+        return fallback
+    return getattr(_experiment_config, name, fallback)
+
+
+DATASET_NAME = _config_value("DATASET_NAME", "kuchidareo/small_trashnet")
+DEFAULT_AUGMENT = _config_value(
+    "DEFAULT_AUGMENT",
+    {
+        "enabled": True,
+        "resize": [224, 224],
+        "horizontal_flip": True,
+        "normalize": True,
+    },
+)
+DEFAULT_AVAILABILITY_SHORTCUT_EPS = _config_value("DEFAULT_AVAILABILITY_SHORTCUT_EPS", 6.0)
+DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = _config_value(
+    "DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE", 4
+)
+DEFAULT_BATCH_SIZE = _config_value("DEFAULT_BATCH_SIZE", 16)
+DEFAULT_DATA_DIR = _config_value("DEFAULT_DATA_DIR", "iid-data")
+DEFAULT_NUM_CLIENTS = _config_value("DEFAULT_NUM_CLIENTS", 10)
+DEFAULT_TEST_FRACTION = _config_value("DEFAULT_TEST_FRACTION", 0.2)
+DEFAULT_TEST_SEED = _config_value("DEFAULT_TEST_SEED", 260626)
+DEFAULT_RANDOM_LABEL_FLIP_FRACTION = _config_value(
+    "DEFAULT_RANDOM_LABEL_FLIP_FRACTION", 1.0 / 6.0
+)
+DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL = _config_value(
+    "DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL", 3
+)
+DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL = _config_value(
+    "DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL", 5
+)
+DEFAULT_PARTITION_METHOD = _config_value("DEFAULT_PARTITION_METHOD", "iid")
+DEFAULT_NONIID_ALPHA = _config_value("DEFAULT_NONIID_ALPHA", 0.3)
+
+POISONING_METHOD_AVAILABILITY_SHORTCUTS = _config_value(
+    "POISONING_METHOD_AVAILABILITY_SHORTCUTS", "availability_shortcuts"
+)
+POISONING_METHOD_CLEAN = _config_value("POISONING_METHOD_CLEAN", "clean")
+POISONING_METHOD_RANDOM_LABEL_FLIPPING = _config_value(
+    "POISONING_METHOD_RANDOM_LABEL_FLIPPING", "random_label_flipping"
+)
+POISONING_METHOD_TARGET_LABEL_FLIPPING = _config_value(
+    "POISONING_METHOD_TARGET_LABEL_FLIPPING", "target_label_flipping"
+)
+POISONING_METHOD_UNLEARNABLE_EXAMPLES = _config_value(
+    "POISONING_METHOD_UNLEARNABLE_EXAMPLES", "unlearnable_examples"
+)
+
+
+def set_all_seeds(seed: int) -> None:
+    configured = getattr(_experiment_config, "set_all_seeds", None)
+    if configured is not None:
+        configured(seed)
+        return
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
+
+
+def augment_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+    configured = getattr(_experiment_config, "augment_from_args", None)
+    if configured is not None:
+        return configured(args)
+    value = getattr(args, "augment", DEFAULT_AUGMENT)
+    if isinstance(value, str):
+        return json.loads(value)
+    return dict(value)
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    configured = getattr(_experiment_config, "add_common_args", None)
+    if configured is not None:
+        configured(parser)
+        return
+    parser.add_argument("--dataset", default=DATASET_NAME)
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument("--num-clients", type=int, default=DEFAULT_NUM_CLIENTS)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--augment", default=json.dumps(DEFAULT_AUGMENT))
+
+
+METADATA_NAME = "partition_metadata.csv"
+PREPARED_MARKER = "PREPARED"
+REFERENCE_DATASET_NAME = "kuchidareo/small_trashnet"
+MATCH_REFERENCE_SIZE_DATASETS = {
+    "kuchidareo/chinese_trafficsign_dataset",
+    "uoft-cs/cifar10",
+}
+PREPARE_SCENARIO_ALL = "all"
+PREPARE_SCENARIOS = [
+    POISONING_METHOD_CLEAN,
+    POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+    POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+    POISONING_METHOD_TARGET_LABEL_FLIPPING,
+    POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+]
+AVAILABILITY_SHORTCUT_GENERATOR = "sklearn_make_classification_class_sep_10_jpeg_q100_v2"
+AVAILABILITY_SHORTCUT_CLASS_SEP = 10.0
+AVAILABILITY_SHORTCUT_REFERENCE_IMAGE_SIZE = 32
+AVAILABILITY_SHORTCUT_JPEG_QUALITY = 100
+AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING = 0
+
+METADATA_FIELDNAMES = [
+    "image_path",
+    "label",
+    "class_name",
+    "original_label",
+    "original_class_name",
+    "label_changed",
+    "label_flip_fraction",
+    "target_label",
+    "replacement_label",
+    "shortcut_eps",
+    "shortcut_patch_size",
+    "shortcut_generator",
+    "shortcut_class_sep",
+    "shortcut_jpeg_quality",
+    "shortcut_jpeg_subsampling",
+    "client_id",
+    "partition_id",
+    "partition_method",
+    "noniid_alpha",
+    "dataset_split",
+    "is_poisoned",
+    "poisoning_method",
+    "source_index",
+    "relative_path",
+]
+
+
+def _require_torch():
+    import torch
+    import torchvision.transforms as transforms
+    from torch.utils.data import DataLoader, Dataset
+
+    return torch, transforms, DataLoader, Dataset
+
+
+def _safe_class_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(name))
+
+
+def dataset_slug(dataset_name: Optional[str] = None) -> str:
+    name = dataset_name or os.environ.get("DATASET_NAME", DATASET_NAME)
+    slug = name.rstrip("/").split("/")[-1]
+    return _safe_class_name(slug)
+
+
+def _dataset_root(data_dir: str, dataset_name: Optional[str] = None) -> Path:
+    return Path(data_dir) / dataset_slug(dataset_name)
+
+
+def _canonical_partition_method(partition_method: str) -> str:
+    method = partition_method.lower()
+    if method == "iid":
+        return "iid"
+    if method in {"dirichlet_noniid", "non_iid_dirichlet", "noniid_dirichlet"}:
+        return "dirichlet_noniid"
+    raise ValueError(
+        f"Unknown partition_method={partition_method!r}. "
+        "Use 'iid' or 'dirichlet_noniid'."
+    )
+
+
+def _metadata_partition_method(rows: Sequence[Dict[str, Any]]) -> str:
+    methods = {
+        _canonical_partition_method(row["partition_method"])
+        for row in rows
+        if row.get("partition_method")
+    }
+    if len(methods) > 1:
+        raise ValueError(f"Metadata contains mixed partition methods: {sorted(methods)}")
+    # Metadata produced before partition_method was recorded was IID.
+    return next(iter(methods), "iid")
+
+
+def _fill_partition_metadata(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    partition_method: str,
+    noniid_alpha: float,
+) -> bool:
+    changed = False
+    alpha_value: Any = noniid_alpha if partition_method != "iid" else ""
+    for row in rows:
+        if not row.get("partition_method"):
+            row["partition_method"] = partition_method
+            changed = True
+        if "noniid_alpha" not in row or (
+            partition_method != "iid" and not row.get("noniid_alpha")
+        ):
+            row["noniid_alpha"] = alpha_value
+            changed = True
+    return changed
+
+
+def _resolve_metadata_image_path(
+    image_path: str,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+) -> str:
+    """Resolve old metadata paths after moving data_dir.
+
+    Older metadata stores paths such as data/small_trashnet/clean/...
+    When data_dir is now ../iid-data, the correct path is
+    ../iid-data/small_trashnet/clean/...
+    """
+    root = _dataset_root(data_dir, dataset_name)
+    raw = Path(image_path)
+    slug = dataset_slug(dataset_name)
+    candidates: List[Path] = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        parts = raw.parts
+        if slug in parts:
+            slug_idx = parts.index(slug)
+            candidates.append(root.joinpath(*parts[slug_idx + 1 :]))
+        candidates.extend([root / raw, Path(data_dir) / raw, raw])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0] if candidates else raw)
+
+
+def prepared_data_exists(
+    data_dir: str,
+    num_clients: int = DEFAULT_NUM_CLIENTS,
+    dataset_name: Optional[str] = None,
+    partition_method: Optional[str] = None,
+) -> bool:
+    root = _dataset_root(data_dir, dataset_name)
+    if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
+        return False
+    rows = _read_metadata_rows(root)
+    if partition_method is not None and _metadata_partition_method(rows) != _canonical_partition_method(
+        partition_method
+    ):
+        return False
+    if not any(
+        row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "test"
+        for row in rows
+    ):
+        return False
+    shortcut_rows = [
+        row
+        for row in rows
+        if row.get("poisoning_method") == POISONING_METHOD_AVAILABILITY_SHORTCUTS
+    ]
+    if not shortcut_rows or any(
+        row.get("shortcut_generator") != AVAILABILITY_SHORTCUT_GENERATOR
+        for row in shortcut_rows
+    ):
+        return False
+    required_modes = [
+        ("clean",),
+        (f"poisoned/{POISONING_METHOD_UNLEARNABLE_EXAMPLES}",),
+        (f"poisoned/{POISONING_METHOD_RANDOM_LABEL_FLIPPING}",),
+        (f"poisoned/{POISONING_METHOD_TARGET_LABEL_FLIPPING}",),
+        (f"poisoned/{POISONING_METHOD_AVAILABILITY_SHORTCUTS}",),
+    ]
+    for mode_options in required_modes:
+        for idx in range(num_clients):
+            if not any((root / mode / f"client_{idx}").exists() for mode in mode_options):
+                return False
+    return True
+
+
+def _extract_image_label(example: Dict[str, Any]) -> Tuple[Image.Image, int]:
+    image = None
+    for key in ("image", "img", "pixel_values"):
+        if key in example:
+            image = example[key]
+            break
+    if image is None:
+        for value in example.values():
+            if isinstance(value, Image.Image):
+                image = value
+                break
+    label = None
+    for key in ("label", "labels", "class", "target"):
+        if key in example:
+            label = example[key]
+            break
+    if image is None or label is None:
+        raise ValueError(f"Could not infer image/label fields from dataset example keys: {list(example.keys())}")
+    if not isinstance(image, Image.Image):
+        if isinstance(image, (str, os.PathLike)):
+            image = Image.open(image)
+        else:
+            try:
+                import numpy as np
+
+                image = Image.fromarray(np.asarray(image))
+            except Exception as exc:
+                raise ValueError(f"Could not convert image value of type {type(image)!r} to PIL.Image") from exc
+    return image.convert("RGB"), int(label)
+
+
+def _class_names(ds: Any) -> List[str]:
+    features = getattr(ds, "features", {})
+    label_feature = None
+    if hasattr(features, "get"):
+        for key in ("label", "labels", "class", "target"):
+            label_feature = features.get(key)
+            if label_feature is not None:
+                break
+    names = getattr(label_feature, "names", None)
+    if names:
+        return list(names)
+    labels = sorted({_extract_image_label(row)[1] for row in ds})
+    return [str(label) for label in labels]
+
+
+def _iter_splits(dataset_dict: Any) -> Iterable[Tuple[str, Any]]:
+    if hasattr(dataset_dict, "keys"):
+        for split in dataset_dict.keys():
+            yield split, dataset_dict[split]
+    else:
+        yield "train", dataset_dict
+
+
+def _should_match_reference_size(dataset_name: str) -> bool:
+    return dataset_name in MATCH_REFERENCE_SIZE_DATASETS
+
+
+def _reference_clean_split_counts(
+    data_dir: str,
+    reference_dataset_name: str = REFERENCE_DATASET_NAME,
+) -> Dict[str, int]:
+    metadata_path = _dataset_root(data_dir, reference_dataset_name) / METADATA_NAME
+    if metadata_path.exists():
+        counts: Dict[str, int] = {}
+        with metadata_path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("poisoning_method") == POISONING_METHOD_CLEAN:
+                    split = row.get("dataset_split", "train")
+                    counts[split] = counts.get(split, 0) + 1
+        if counts:
+            return counts
+
+    from datasets import load_dataset
+
+    reference = load_dataset(reference_dataset_name)
+    raw_counts = {split: len(ds) for split, ds in _iter_splits(reference)}
+    if "test" not in raw_counts and "train" in raw_counts:
+        test_count = int(round(raw_counts["train"] * DEFAULT_TEST_FRACTION))
+        return {
+            "train": raw_counts["train"] - test_count,
+            "test": test_count,
+        }
+    return raw_counts
+
+
+def _balanced_subset_indices(ds: Any, target_count: int, seed: int) -> List[int]:
+    from collections import defaultdict
+
+    if target_count >= len(ds):
+        return list(range(len(ds)))
+    if target_count <= 0:
+        return []
+
+    by_label: Dict[int, List[int]] = defaultdict(list)
+    for idx, example in enumerate(ds):
+        _, label = _extract_image_label(example)
+        by_label[label].append(idx)
+
+    rng = random.Random(seed)
+    total = sum(len(indices) for indices in by_label.values())
+    allocations: Dict[int, int] = {}
+    fractions: List[Tuple[float, int]] = []
+    allocated = 0
+    for label, indices in by_label.items():
+        exact = target_count * len(indices) / total
+        count = min(len(indices), int(exact))
+        allocations[label] = count
+        allocated += count
+        fractions.append((exact - int(exact), label))
+
+    for _, label in sorted(fractions, reverse=True):
+        if allocated >= target_count:
+            break
+        if allocations[label] < len(by_label[label]):
+            allocations[label] += 1
+            allocated += 1
+
+    selected: List[int] = []
+    for label in sorted(by_label):
+        indices = list(by_label[label])
+        rng.shuffle(indices)
+        selected.extend(indices[: allocations[label]])
+    rng.shuffle(selected)
+    return selected[:target_count]
+
+
+def _maybe_match_reference_split_size(
+    ds: Any,
+    *,
+    dataset_name: str,
+    split: str,
+    data_dir: str,
+    seed: int,
+    has_explicit_test_split: bool,
+) -> Tuple[Any, List[int]]:
+    source_indices = list(range(len(ds)))
+    if not _should_match_reference_size(dataset_name):
+        return ds, source_indices
+
+    reference_counts = _reference_clean_split_counts(data_dir)
+    if split == "train" and not has_explicit_test_split:
+        target_count = sum(reference_counts.values())
+    else:
+        target_count = reference_counts.get(split, 0)
+    target_count = min(target_count, len(ds))
+    selected_indices = _balanced_subset_indices(ds, target_count, seed)
+    return ds.select(selected_indices), selected_indices
+
+
+def _assign_iid_partitions(ds: Any, num_clients: int, seed: int) -> Dict[int, str]:
+    import random
+    from collections import defaultdict
+
+    by_label: Dict[int, List[int]] = defaultdict(list)
+    for idx, example in enumerate(ds):
+        _, label = _extract_image_label(example)
+        by_label[label].append(idx)
+
+    assignment: Dict[int, str] = {}
+    rng = random.Random(seed)
+    for label in sorted(by_label):
+        indices = list(by_label[label])
+        rng.shuffle(indices)
+        for offset, item_idx in enumerate(indices):
+            assignment[item_idx] = f"client_{offset % num_clients}"
+    return assignment
+
+
+def _assign_dirichlet_noniid_partitions(
+    ds: Any,
+    num_clients: int,
+    seed: int,
+    alpha: float,
+) -> Dict[int, str]:
+    """Assign label-skew partitions while guaranteeing non-empty clients."""
+    import numpy as np
+    from collections import defaultdict
+
+    if alpha <= 0:
+        raise ValueError(f"noniid_alpha must be > 0, got {alpha}")
+    if num_clients <= 0:
+        raise ValueError(f"num_clients must be > 0, got {num_clients}")
+
+    by_label: Dict[int, List[int]] = defaultdict(list)
+    for idx, example in enumerate(ds):
+        _, label = _extract_image_label(example)
+        by_label[label].append(idx)
+
+    rng = np.random.default_rng(seed)
+    client_indices: Dict[int, List[int]] = {idx: [] for idx in range(num_clients)}
+    for label in sorted(by_label):
+        indices = np.asarray(by_label[label], dtype=np.int64)
+        rng.shuffle(indices)
+        proportions = rng.dirichlet(np.full(num_clients, alpha, dtype=np.float64))
+        cuts = (np.cumsum(proportions)[:-1] * len(indices)).astype(int)
+        for client_idx, shard in enumerate(np.split(indices, cuts)):
+            client_indices[client_idx].extend(int(item) for item in shard)
+
+    for empty_client in [idx for idx, values in client_indices.items() if not values]:
+        donor = max(client_indices, key=lambda idx: len(client_indices[idx]))
+        if len(client_indices[donor]) <= 1:
+            raise ValueError("Could not rebalance non-IID partitions without empty clients.")
+        client_indices[empty_client].append(client_indices[donor].pop())
+
+    return {
+        item_idx: f"client_{client_idx}"
+        for client_idx, indices in client_indices.items()
+        for item_idx in indices
+    }
+
+
+def _assign_partitions(
+    ds: Any,
+    *,
+    num_clients: int,
+    seed: int,
+    partition_method: str,
+    noniid_alpha: float,
+) -> Dict[int, str]:
+    method = _canonical_partition_method(partition_method)
+    if method == "iid":
+        return _assign_iid_partitions(ds, num_clients, seed)
+    if method == "dirichlet_noniid":
+        return _assign_dirichlet_noniid_partitions(ds, num_clients, seed, noniid_alpha)
+    raise AssertionError(f"Unhandled canonical partition method: {method}")
+
+
+def _save_jpeg(
+    image: Image.Image,
+    path: Path,
+    *,
+    quality: int = 95,
+    subsampling: Optional[int] = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    options: Dict[str, Any] = {"format": "JPEG", "quality": quality}
+    if subsampling is not None:
+        options["subsampling"] = subsampling
+    image.convert("RGB").save(path, **options)
+
+
+def _read_metadata_rows(root: Path) -> List[Dict[str, Any]]:
+    path = root / METADATA_NAME
+    if not path.exists():
+        return []
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _write_metadata_rows(root: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    with (root / METADATA_NAME).open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=METADATA_FIELDNAMES, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _normalize_metadata_paths(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    data_dir: str,
+    dataset_name: str,
+) -> bool:
+    root = _dataset_root(data_dir, dataset_name)
+    resolved_root = root.resolve()
+    changed = False
+    for row in rows:
+        resolved_path = Path(
+            _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
+        ).resolve()
+        try:
+            relative_path = resolved_path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Metadata image is outside dataset root {resolved_root}: {resolved_path}"
+            ) from exc
+        normalized_path = str(root / relative_path)
+        if row.get("image_path") != normalized_path:
+            row["image_path"] = normalized_path
+            changed = True
+    return changed
+
+
+def prune_unreferenced_images(*, data_dir: str, dataset_name: str) -> int:
+    root = _dataset_root(data_dir, dataset_name)
+    rows = _read_metadata_rows(root)
+    if not rows:
+        raise FileNotFoundError(f"Prepared metadata not found in {root}")
+    referenced = {
+        Path(_resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)).resolve()
+        for row in rows
+    }
+    removed = 0
+    for image_path in root.rglob("*.jpeg"):
+        if image_path.resolve() not in referenced:
+            image_path.unlink()
+            removed += 1
+    for directory in sorted(
+        (path for path in root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def _add_clean_test_split(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    test_fraction: float,
+    test_seed: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Create a deterministic clean-only test split from prepared train rows.
+
+    The corresponding source IDs are removed from every poisoned condition, so
+    no poisoned image can enter evaluation and no test source can enter
+    training through another condition.
+    """
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be between 0 and 1.")
+    copied = [dict(row) for row in rows]
+    if any(
+        row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "test"
+        for row in copied
+    ):
+        return copied, 0
+
+    clean_train = [
+        row for row in copied
+        if row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "train"
+    ]
+    if not clean_train:
+        raise ValueError("Cannot create a clean test split: no clean train rows exist.")
+
+    by_label: Dict[str, List[str]] = {}
+    for row in clean_train:
+        source_index = str(row.get("source_index", ""))
+        if not source_index:
+            raise ValueError("Cannot split metadata row without source_index.")
+        by_label.setdefault(str(row["label"]), []).append(source_index)
+
+    candidates_by_label = {
+        label: sorted(set(source_indices), key=int)
+        for label, source_indices in by_label.items()
+    }
+    eligible = {
+        label: source_indices
+        for label, source_indices in candidates_by_label.items()
+        if len(source_indices) >= 2
+    }
+    if not eligible:
+        raise ValueError("No class has enough samples to create a clean test split.")
+
+    target_test_count = int(round(len(clean_train) * test_fraction))
+    max_test_count = sum(len(source_indices) - 1 for source_indices in eligible.values())
+    target_test_count = max(1, min(target_test_count, max_test_count))
+
+    eligible_total = sum(len(source_indices) for source_indices in eligible.values())
+    allocations: Dict[str, int] = {}
+    remainders: List[Tuple[float, str]] = []
+    allocated = 0
+    for label, source_indices in eligible.items():
+        exact = target_test_count * len(source_indices) / eligible_total
+        count = min(int(exact), len(source_indices) - 1)
+        allocations[label] = count
+        allocated += count
+        remainders.append((exact - int(exact), label))
+
+    while allocated < target_test_count:
+        made_progress = False
+        for _, label in sorted(remainders, reverse=True):
+            if allocations[label] >= len(eligible[label]) - 1:
+                continue
+            allocations[label] += 1
+            allocated += 1
+            made_progress = True
+            if allocated == target_test_count:
+                break
+        if not made_progress:
+            raise ValueError("Could not allocate the requested clean test split.")
+
+    rng = random.Random(test_seed)
+    test_source_indices = set()
+    for label, candidates in eligible.items():
+        rng.shuffle(candidates)
+        test_source_indices.update(candidates[: allocations[label]])
+
+    result: List[Dict[str, Any]] = []
+    for row in copied:
+        source_index = str(row.get("source_index", ""))
+        is_selected_train_source = (
+            row.get("dataset_split") == "train"
+            and source_index in test_source_indices
+        )
+        if not is_selected_train_source:
+            result.append(row)
+            continue
+        if row.get("poisoning_method") == POISONING_METHOD_CLEAN:
+            row["dataset_split"] = "test"
+            result.append(row)
+        # Poisoned rows for selected test source IDs are intentionally omitted.
+
+    return result, len(test_source_indices)
+
+
+def _mode_complete(root: Path, mode: str, num_clients: int) -> bool:
+    return all((root / mode / f"client_{idx}").exists() for idx in range(num_clients))
+
+
+def _metadata_has_method(rows: Sequence[Dict[str, Any]], poisoning_method: str) -> bool:
+    return any(row.get("poisoning_method") == poisoning_method for row in rows)
+
+
+def _parse_prepare_scenarios(value: Optional[Any]) -> List[str]:
+    if value is None or value == "" or value == PREPARE_SCENARIO_ALL:
+        return list(PREPARE_SCENARIOS)
+    if isinstance(value, str):
+        scenarios = [item.strip() for item in value.split(",") if item.strip()]
+    else:
+        scenarios = [str(item).strip() for item in value if str(item).strip()]
+    if not scenarios:
+        return list(PREPARE_SCENARIOS)
+    if PREPARE_SCENARIO_ALL in scenarios:
+        if len(scenarios) > 1:
+            raise ValueError(f"{PREPARE_SCENARIO_ALL!r} cannot be combined with specific scenarios.")
+        return list(PREPARE_SCENARIOS)
+    unknown = [scenario for scenario in scenarios if scenario not in PREPARE_SCENARIOS]
+    if unknown:
+        raise ValueError(
+            f"Unknown prepare scenario(s): {unknown}. "
+            f"Use {PREPARE_SCENARIO_ALL!r} or one or more of: {', '.join(PREPARE_SCENARIOS)}"
+        )
+    return scenarios
+
+
+def _scenario_mode(scenario: str) -> str:
+    if scenario == POISONING_METHOD_CLEAN:
+        return "clean"
+    return f"poisoned/{scenario}"
+
+
+def _scenario_complete(root: Path, scenario: str, rows: Sequence[Dict[str, Any]], num_clients: int) -> bool:
+    if not (_mode_complete(root, _scenario_mode(scenario), num_clients) and _metadata_has_method(rows, scenario)):
+        return False
+    if scenario == POISONING_METHOD_AVAILABILITY_SHORTCUTS:
+        shortcut_rows = [
+            row
+            for row in rows
+            if row.get("poisoning_method") == POISONING_METHOD_AVAILABILITY_SHORTCUTS
+        ]
+        return bool(shortcut_rows) and all(
+            row.get("shortcut_generator") == AVAILABILITY_SHORTCUT_GENERATOR
+            for row in shortcut_rows
+        )
+    return True
+
+
+def _clean_records_from_metadata(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    data_dir: str,
+    dataset_name: Optional[str],
+) -> List[Dict[str, Any]]:
+    records = [dict(row) for row in rows if row.get("poisoning_method") == POISONING_METHOD_CLEAN]
+    for record in records:
+        resolved = _resolve_metadata_image_path(record["image_path"], data_dir, dataset_name)
+        record["image_path"] = resolved
+        record["clean_path"] = resolved
+    return records
+
+
+def _class_names_from_records(records: Sequence[Dict[str, Any]]) -> List[str]:
+    label_to_name = {
+        int(record["label"]): str(record.get("class_name", record["label"]))
+        for record in records
+    }
+    return [label_to_name[label] for label in sorted(label_to_name)]
+
+
+def _pil_from_tensor(tensor: Any) -> Image.Image:
+    import torchvision.transforms.functional as TF
+
+    return TF.to_pil_image(tensor.detach().cpu().clamp(0, 1))
+
+
+def _build_unlearnable_example_images(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    output_root: Path,
+    num_classes: int,
+    resize: Sequence[int],
+    seed: int,
+    epsilon: float,
+    num_steps: int,
+    step_size: float,
+    batch_size: int,
+    unlearnable_repo: str,
+) -> None:
+    torch, transforms, DataLoader, Dataset = _require_torch()
+
+    repo_path = Path(unlearnable_repo).resolve()
+    if repo_path.exists():
+        sys.path.insert(0, str(repo_path))
+    try:
+        from toolbox import PerturbationTool
+    except Exception:
+        PerturbationTool = None
+
+    set_all_seeds(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    transform = transforms.Compose([transforms.Resize(tuple(resize)), transforms.ToTensor()])
+
+    class CleanRecordDataset(Dataset):
+        def __init__(self, records: Sequence[Dict[str, Any]]) -> None:
+            self.records = list(records)
+
+        def __len__(self) -> int:
+            return len(self.records)
+
+        def __getitem__(self, idx: int) -> Tuple[Any, int, int]:
+            record = self.records[idx]
+            image = Image.open(record["clean_path"]).convert("RGB")
+            return transform(image), int(record["label"]), idx
+
+    loader = DataLoader(CleanRecordDataset(clean_records), batch_size=batch_size, shuffle=False, num_workers=0)
+    model = torch.nn.Sequential(
+        torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        torch.nn.BatchNorm2d(16),
+        torch.nn.ReLU(inplace=True),
+        torch.nn.MaxPool2d(2),
+        torch.nn.Conv2d(16, 32, kernel_size=3, padding=1),
+        torch.nn.BatchNorm2d(32),
+        torch.nn.ReLU(inplace=True),
+        torch.nn.MaxPool2d(2),
+        torch.nn.Conv2d(32, 64, kernel_size=3, padding=1),
+        torch.nn.BatchNorm2d(64),
+        torch.nn.ReLU(inplace=True),
+        torch.nn.AdaptiveAvgPool2d((1, 1)),
+        torch.nn.Flatten(),
+        torch.nn.Dropout(p=0.1),
+        torch.nn.Linear(64, num_classes),
+    ).to(device)
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+    # One light surrogate pass keeps the unlearnable-example perturbation deterministic
+    # without turning data preparation into a full training run.
+    model.train()
+    for images, labels, _ in loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(images), labels)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    if PerturbationTool is not None:
+        tool = PerturbationTool(
+            seed=seed,
+            epsilon=epsilon / 255.0,
+            num_steps=num_steps,
+            step_size=step_size / 255.0,
+        )
+    else:
+        tool = None
+
+    for images, labels, indices in loader:
+        images, labels = images.to(device), labels.to(device)
+        if tool is not None:
+            poisoned, _ = tool.min_min_attack(images, labels, model, optimizer, criterion)
+        else:
+            poisoned = _fallback_min_min(images, labels, model, criterion, epsilon / 255.0, step_size / 255.0, num_steps)
+        for tensor, record_idx in zip(poisoned, indices):
+            record = clean_records[int(record_idx)]
+            out_path = output_root / record["client_id"] / record["relative_path"]
+            _save_jpeg(_pil_from_tensor(tensor), out_path)
+
+
+def _fallback_min_min(images: Any, labels: Any, model: Any, criterion: Any, epsilon: float, step_size: float, steps: int) -> Any:
+    import torch
+
+    eta = torch.zeros_like(images)
+    perturbed = images.detach().clone()
+    for _ in range(steps):
+        perturbed.requires_grad_(True)
+        model.zero_grad()
+        loss = criterion(model(perturbed), labels)
+        loss.backward()
+        eta = torch.clamp(eta - step_size * perturbed.grad.detach().sign(), -epsilon, epsilon)
+        perturbed = torch.clamp(images + eta, 0, 1).detach()
+    return perturbed
+
+
+def _copy_clean_image(record: Dict[str, Any], output_root: Path) -> Path:
+    out_path = output_root / record["client_id"] / record["relative_path"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(record["clean_path"], out_path)
+    return out_path
+
+
+def _class_name_for_label(class_names: Sequence[str], label: int) -> str:
+    return class_names[label] if 0 <= label < len(class_names) else str(label)
+
+
+def _make_label_flip_rows(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    method: str,
+    output_root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    random_flip_fraction: float,
+    target_label: int,
+    replacement_label: int,
+) -> List[Dict[str, Any]]:
+    labels = sorted({int(record["label"]) for record in clean_records})
+    if len(labels) < 2:
+        raise ValueError("Label flipping requires at least two classes.")
+
+    rng = random.Random(seed)
+    selected_random_indices = set()
+    if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING:
+        if not 0.0 <= random_flip_fraction <= 1.0:
+            raise ValueError(f"random_flip_fraction must be in [0, 1], got {random_flip_fraction}")
+        flip_count = int(len(clean_records) * random_flip_fraction)
+        selected_random_indices = set(rng.sample(range(len(clean_records)), flip_count))
+
+    rows: List[Dict[str, Any]] = []
+    for idx, record in enumerate(clean_records):
+        original_label = int(record["label"])
+        new_label = original_label
+        label_changed = False
+
+        if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING and idx in selected_random_indices:
+            choices = [label for label in labels if label != original_label]
+            new_label = rng.choice(choices)
+            label_changed = True
+        elif method == POISONING_METHOD_TARGET_LABEL_FLIPPING and original_label == target_label:
+            if replacement_label == target_label:
+                raise ValueError("target_label and replacement_label must differ for target label flipping.")
+            new_label = replacement_label
+            label_changed = True
+
+        image_path = _copy_clean_image(record, output_root)
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(image_path),
+                "label": new_label,
+                "class_name": _class_name_for_label(class_names, new_label),
+                "is_poisoned": label_changed,
+                "poisoning_method": method,
+                "original_label": original_label,
+                "original_class_name": record["class_name"],
+                "label_changed": label_changed,
+                "label_flip_fraction": random_flip_fraction if method == POISONING_METHOD_RANDOM_LABEL_FLIPPING else "",
+                "target_label": target_label if method == POISONING_METHOD_TARGET_LABEL_FLIPPING else "",
+                "replacement_label": replacement_label if method == POISONING_METHOD_TARGET_LABEL_FLIPPING else "",
+            }
+        )
+        rows.append(poisoned)
+    return rows
+
+
+def _l2norm_limit_from_linf(linf: float, feature_dim: int) -> float:
+    # Same projection scale used by Availability-Attacks-Create-Shortcuts.
+    return float((linf**2 * feature_dim) ** 0.5)
+
+
+def _normalize_l2norm(data: Any, norm_limit: float) -> Any:
+    import numpy as np
+
+    flat = data.reshape(data.shape[0], -1)
+    norms = np.linalg.norm(flat, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    return (flat / norms * norm_limit).reshape(data.shape)
+
+
+def _make_availability_shortcut_rows(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    output_root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    resize: Sequence[int],
+    eps: float,
+    patch_size: int,
+) -> List[Dict[str, Any]]:
+    import numpy as np
+    try:
+        from sklearn.datasets import make_classification
+    except ImportError as exc:
+        raise RuntimeError(
+            "availability_shortcuts requires scikit-learn. "
+            "Install it with: pip install scikit-learn"
+        ) from exc
+
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be > 0, got {patch_size}")
+    height = int(resize[0])
+    width = int(resize[1]) if len(resize) > 1 else height
+    if not clean_records:
+        return []
+
+    labels = sorted({int(record["label"]) for record in clean_records})
+    label_to_index = {label: idx for idx, label in enumerate(labels)}
+    num_classes = len(labels)
+    # The official attack defines patch_size on a 32x32 image. Preserve its
+    # feature grid when training images are resized to 224x224; using 8px
+    # patches directly at 224px would change 48 synthetic features into 2352.
+    reference_size = AVAILABILITY_SHORTCUT_REFERENCE_IMAGE_SIZE
+    grid_h = (reference_size + patch_size - 1) // patch_size
+    grid_w = (reference_size + patch_size - 1) // patch_size
+    n_random_features = grid_h * grid_w * 3
+
+    # The official implementation generates sample-specific synthetic features
+    # with sklearn.make_classification and then assigns same-label features to
+    # each training image. TrashNet is imbalanced, so generate a balanced pool
+    # large enough to cover the largest real class and retry if rounding leaves
+    # any class short.
+    class_counts = {
+        label: sum(int(record["label"]) == label for record in clean_records)
+        for label in labels
+    }
+    generated_count = max(len(clean_records), num_classes * max(class_counts.values()))
+    generated_data = None
+    generated_labels = None
+    for attempt in range(6):
+        candidate_data, candidate_labels = make_classification(
+            n_samples=generated_count,
+            n_features=n_random_features,
+            n_classes=num_classes,
+            n_informative=n_random_features,
+            n_redundant=0,
+            n_repeated=0,
+            class_sep=AVAILABILITY_SHORTCUT_CLASS_SEP,
+            flip_y=0.0,
+            n_clusters_per_class=1,
+            random_state=seed + attempt,
+        )
+        candidate_counts = np.bincount(candidate_labels, minlength=num_classes)
+        if all(
+            int(candidate_counts[label_to_index[label]]) >= required
+            for label, required in class_counts.items()
+        ):
+            generated_data = candidate_data.astype(np.float32, copy=False)
+            generated_labels = candidate_labels
+            break
+        generated_count *= 2
+    if generated_data is None or generated_labels is None:
+        raise RuntimeError(
+            "Could not generate enough class-matched availability shortcut samples "
+            f"for class counts {class_counts}."
+        )
+
+    generated_data = generated_data.reshape(generated_count, grid_h, grid_w, 3)
+    output_patch_h = (height + grid_h - 1) // grid_h
+    output_patch_w = (width + grid_w - 1) // grid_w
+    linf = float(eps) / 255.0
+    l2_limit = _l2norm_limit_from_linf(linf, height * width * 3)
+
+    class_shortcut_features = {
+        label: generated_data[generated_labels == label_to_index[label]][: class_counts[label]]
+        for label in labels
+    }
+    class_offsets = {label: 0 for label in labels}
+
+    rows: List[Dict[str, Any]] = []
+    for record in clean_records:
+        label = int(record["label"])
+        shortcut_features = class_shortcut_features[label][class_offsets[label]]
+        class_offsets[label] += 1
+        shortcut = np.repeat(shortcut_features, output_patch_w, axis=1)
+        shortcut = np.repeat(shortcut, output_patch_h, axis=0)[:height, :width, :]
+        shortcut = _normalize_l2norm(shortcut[None, ...], l2_limit)[0]
+
+        image = Image.open(record["clean_path"]).convert("RGB").resize((width, height))
+        image_array = np.asarray(image, dtype=np.float32) / 255.0
+        poisoned_array = np.clip(image_array + shortcut, 0.0, 1.0)
+        poisoned_image = Image.fromarray((poisoned_array * 255.0).round().astype(np.uint8), mode="RGB")
+
+        out_path = output_root / record["client_id"] / record["relative_path"]
+        _save_jpeg(
+            poisoned_image,
+            out_path,
+            quality=AVAILABILITY_SHORTCUT_JPEG_QUALITY,
+            subsampling=AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
+        )
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(out_path),
+                "label": label,
+                "class_name": _class_name_for_label(class_names, label),
+                "is_poisoned": True,
+                "poisoning_method": POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                "original_label": label,
+                "original_class_name": record["class_name"],
+                "label_changed": False,
+                "shortcut_eps": eps,
+                "shortcut_patch_size": patch_size,
+                "shortcut_generator": AVAILABILITY_SHORTCUT_GENERATOR,
+                "shortcut_class_sep": AVAILABILITY_SHORTCUT_CLASS_SEP,
+                "shortcut_jpeg_quality": AVAILABILITY_SHORTCUT_JPEG_QUALITY,
+                "shortcut_jpeg_subsampling": AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
+            }
+        )
+        rows.append(poisoned)
+    return rows
+
+
+def _append_unlearnable_example_rows(
+    metadata_rows: List[Dict[str, Any]],
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    root: Path,
+    num_classes: int,
+    resize: Sequence[int],
+    seed: int,
+    poison_epsilon: float,
+    poison_steps: int,
+    poison_step_size: float,
+    batch_size: int,
+    unlearnable_repo: str,
+) -> None:
+    _build_unlearnable_example_images(
+        clean_records,
+        output_root=root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+        num_classes=num_classes,
+        resize=resize,
+        seed=seed,
+        epsilon=poison_epsilon,
+        num_steps=poison_steps,
+        step_size=poison_step_size,
+        batch_size=batch_size,
+        unlearnable_repo=unlearnable_repo,
+    )
+
+    for record in clean_records:
+        poisoned_path = (
+            root
+            / "poisoned"
+            / POISONING_METHOD_UNLEARNABLE_EXAMPLES
+            / record["client_id"]
+            / record["relative_path"]
+        )
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(poisoned_path),
+                "is_poisoned": True,
+                "poisoning_method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+            }
+        )
+        metadata_rows.append(poisoned)
+
+
+def _append_requested_poisoning_rows(
+    metadata_rows: List[Dict[str, Any]],
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    requested_scenarios: Sequence[str],
+    root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    resize: Sequence[int],
+    poison_epsilon: float,
+    poison_steps: int,
+    poison_step_size: float,
+    batch_size: int,
+    unlearnable_repo: str,
+    random_label_flip_fraction: float,
+    target_label: int,
+    replacement_label: int,
+    shortcut_eps: float,
+    shortcut_patch_size: int,
+) -> None:
+    if POISONING_METHOD_UNLEARNABLE_EXAMPLES in requested_scenarios:
+        _append_unlearnable_example_rows(
+            metadata_rows,
+            clean_records,
+            root=root,
+            num_classes=len({int(row["label"]) for row in clean_records}),
+            resize=resize,
+            seed=seed,
+            poison_epsilon=poison_epsilon,
+            poison_steps=poison_steps,
+            poison_step_size=poison_step_size,
+            batch_size=batch_size,
+            unlearnable_repo=unlearnable_repo,
+        )
+
+    if POISONING_METHOD_RANDOM_LABEL_FLIPPING in requested_scenarios:
+        metadata_rows.extend(
+            _make_label_flip_rows(
+                clean_records,
+                method=POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+                output_root=root / "poisoned" / POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+                class_names=class_names,
+                seed=seed + 17,
+                random_flip_fraction=random_label_flip_fraction,
+                target_label=target_label,
+                replacement_label=replacement_label,
+            )
+        )
+
+    if POISONING_METHOD_TARGET_LABEL_FLIPPING in requested_scenarios:
+        metadata_rows.extend(
+            _make_label_flip_rows(
+                clean_records,
+                method=POISONING_METHOD_TARGET_LABEL_FLIPPING,
+                output_root=root / "poisoned" / POISONING_METHOD_TARGET_LABEL_FLIPPING,
+                class_names=class_names,
+                seed=seed + 31,
+                random_flip_fraction=random_label_flip_fraction,
+                target_label=target_label,
+                replacement_label=replacement_label,
+            )
+        )
+
+    if POISONING_METHOD_AVAILABILITY_SHORTCUTS in requested_scenarios:
+        metadata_rows.extend(
+            _make_availability_shortcut_rows(
+                clean_records,
+                output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                class_names=class_names,
+                seed=seed + 47,
+                resize=resize,
+                eps=shortcut_eps,
+                patch_size=shortcut_patch_size,
+            )
+        )
+
+
+def prepare_dataset(
+    *,
+    data_dir: str = DEFAULT_DATA_DIR,
+    dataset_name: str = DATASET_NAME,
+    num_clients: int = DEFAULT_NUM_CLIENTS,
+    seed: int = 0,
+    force: bool = False,
+    resize: Sequence[int] = (64, 64),
+    poison_epsilon: float = 8.0,
+    poison_steps: int = 5,
+    poison_step_size: float = 0.8,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    unlearnable_repo: str = "../Unlearnable-Examples",
+    random_label_flip_fraction: float = DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
+    target_label: int = DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
+    replacement_label: int = DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
+    shortcut_eps: float = DEFAULT_AVAILABILITY_SHORTCUT_EPS,
+    shortcut_patch_size: int = DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE,
+    prepare_scenarios: Optional[Any] = PREPARE_SCENARIO_ALL,
+    test_fraction: float = DEFAULT_TEST_FRACTION,
+    test_seed: int = DEFAULT_TEST_SEED,
+    partition_method: str = DEFAULT_PARTITION_METHOD,
+    noniid_alpha: float = DEFAULT_NONIID_ALPHA,
+) -> Path:
+    os.environ["DATASET_NAME"] = dataset_name
+    partition_method = _canonical_partition_method(partition_method)
+    root = _dataset_root(data_dir, dataset_name)
+    requested_scenarios = _parse_prepare_scenarios(prepare_scenarios)
+    existing_rows = _read_metadata_rows(root)
+    if existing_rows and _metadata_partition_method(existing_rows) != partition_method:
+        if not force or POISONING_METHOD_CLEAN not in requested_scenarios:
+            raise ValueError(
+                f"Prepared data in {root} uses partition_method="
+                f"{_metadata_partition_method(existing_rows)!r}, but {partition_method!r} "
+                "was requested. Use the correct data directory or regenerate clean data "
+                "with --force."
+            )
+    metadata_changed = bool(existing_rows) and _fill_partition_metadata(
+        existing_rows,
+        partition_method=partition_method,
+        noniid_alpha=noniid_alpha,
+    )
+    if existing_rows and _normalize_metadata_paths(
+        existing_rows,
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+    ):
+        metadata_changed = True
+    if metadata_changed:
+        _write_metadata_rows(root, existing_rows)
+    if existing_rows and not any(
+        row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "test"
+        for row in existing_rows
+    ):
+        existing_rows, created_test_samples = _add_clean_test_split(
+            existing_rows,
+            test_fraction=test_fraction,
+            test_seed=test_seed,
+        )
+        _write_metadata_rows(root, existing_rows)
+        (root / PREPARED_MARKER).write_text(
+            json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "num_clients": num_clients,
+                    "seed": seed,
+                    "test_fraction": test_fraction,
+                    "test_seed": test_seed,
+                    "partition_method": partition_method,
+                    "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                }
+            )
+        )
+        print(
+            f"Created clean-only test split with {created_test_samples} samples "
+            f"in {root / METADATA_NAME}"
+        )
+    if (
+        prepared_data_exists(data_dir, num_clients, dataset_name, partition_method)
+        and not force
+        and set(requested_scenarios) == set(PREPARE_SCENARIOS)
+    ):
+        return root
+
+    existing_rows = _read_metadata_rows(root)
+    clean_records_from_existing = _clean_records_from_metadata(
+        existing_rows,
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+    )
+    if clean_records_from_existing and _mode_complete(root, "clean", num_clients) and (
+        not force or POISONING_METHOD_CLEAN not in requested_scenarios
+    ):
+        missing_or_requested = [
+            scenario
+            for scenario in requested_scenarios
+            if scenario != POISONING_METHOD_CLEAN
+            and (force or not _scenario_complete(root, scenario, existing_rows, num_clients))
+        ]
+        if not missing_or_requested:
+            return root
+        metadata_rows = [row for row in existing_rows if row.get("poisoning_method") not in set(missing_or_requested)]
+        class_names = _class_names_from_records(clean_records_from_existing)
+        training_clean_records = [
+            record for record in clean_records_from_existing
+            if record.get("dataset_split") == "train"
+        ]
+        _append_requested_poisoning_rows(
+            metadata_rows,
+            training_clean_records,
+            requested_scenarios=missing_or_requested,
+            root=root,
+            class_names=class_names,
+            seed=seed,
+            resize=resize,
+            poison_epsilon=poison_epsilon,
+            poison_steps=poison_steps,
+            poison_step_size=poison_step_size,
+            batch_size=batch_size,
+            unlearnable_repo=unlearnable_repo,
+            random_label_flip_fraction=random_label_flip_fraction,
+            target_label=target_label,
+            replacement_label=replacement_label,
+            shortcut_eps=shortcut_eps,
+            shortcut_patch_size=shortcut_patch_size,
+        )
+        _write_metadata_rows(root, metadata_rows)
+        (root / PREPARED_MARKER).write_text(
+            json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "num_clients": num_clients,
+                    "seed": seed,
+                    "test_fraction": test_fraction,
+                    "test_seed": test_seed,
+                    "partition_method": partition_method,
+                    "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                }
+            )
+        )
+        return root
+
+    if POISONING_METHOD_CLEAN not in requested_scenarios:
+        raise FileNotFoundError(
+            "Clean prepared data is required before generating poisoning-only scenarios. "
+            f"Run with --prepare-scenarios {POISONING_METHOD_CLEAN} or --prepare-scenarios {PREPARE_SCENARIO_ALL} first."
+        )
+
+    from datasets import load_dataset
+
+    root.mkdir(parents=True, exist_ok=True)
+    dataset_dict = load_dataset(dataset_name)
+    split_names = {split for split, _ in _iter_splits(dataset_dict)}
+    has_explicit_test_split = "test" in split_names
+    metadata_rows: List[Dict[str, Any]] = []
+    clean_records: List[Dict[str, Any]] = []
+    class_names: List[str] = []
+
+    for split, raw_ds in _iter_splits(dataset_dict):
+        ds, source_indices = _maybe_match_reference_split_size(
+            raw_ds,
+            dataset_name=dataset_name,
+            split=split,
+            data_dir=data_dir,
+            seed=seed,
+            has_explicit_test_split=has_explicit_test_split,
+        )
+        if len(ds) == 0:
+            continue
+        names = _class_names(ds)
+        if not class_names:
+            class_names = names
+        assignments = _assign_partitions(
+            ds,
+            num_clients=num_clients,
+            seed=seed,
+            partition_method=partition_method,
+            noniid_alpha=noniid_alpha,
+        )
+        for idx, example in enumerate(ds):
+            source_index = source_indices[idx]
+            image, label = _extract_image_label(example)
+            class_name = names[label] if label < len(names) else str(label)
+            client_id = assignments[idx]
+            relative_path = Path(_safe_class_name(class_name)) / f"{split}_{source_index:06d}.jpeg"
+            clean_path = root / "clean" / client_id / relative_path
+            _save_jpeg(image, clean_path)
+            record = {
+                "source_index": source_index,
+                "image_path": str(clean_path),
+                "clean_path": str(clean_path),
+                "relative_path": str(relative_path),
+                "label": label,
+                "class_name": class_name,
+                "original_label": label,
+                "original_class_name": class_name,
+                "label_changed": False,
+                "label_flip_fraction": "",
+                "target_label": "",
+                "replacement_label": "",
+                "shortcut_eps": "",
+                "shortcut_patch_size": "",
+                "shortcut_generator": "",
+                "shortcut_class_sep": "",
+                "shortcut_jpeg_quality": "",
+                "shortcut_jpeg_subsampling": "",
+                "client_id": client_id,
+                "partition_id": client_id,
+                "partition_method": partition_method,
+                "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                "dataset_split": split,
+                "is_poisoned": False,
+                "poisoning_method": POISONING_METHOD_CLEAN,
+            }
+            clean_records.append(record)
+            metadata_rows.append(record)
+
+    metadata_rows, _ = _add_clean_test_split(
+        metadata_rows,
+        test_fraction=test_fraction,
+        test_seed=test_seed,
+    )
+    clean_records = _clean_records_from_metadata(
+        metadata_rows,
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+    )
+    training_clean_records = [
+        record for record in clean_records
+        if record.get("dataset_split") == "train"
+    ]
+
+    _append_requested_poisoning_rows(
+        metadata_rows,
+        training_clean_records,
+        requested_scenarios=[scenario for scenario in requested_scenarios if scenario != POISONING_METHOD_CLEAN],
+        root=root,
+        class_names=class_names,
+        seed=seed,
+        resize=resize,
+        poison_epsilon=poison_epsilon,
+        poison_steps=poison_steps,
+        poison_step_size=poison_step_size,
+        batch_size=batch_size,
+        unlearnable_repo=unlearnable_repo,
+        random_label_flip_fraction=random_label_flip_fraction,
+        target_label=target_label,
+        replacement_label=replacement_label,
+        shortcut_eps=shortcut_eps,
+        shortcut_patch_size=shortcut_patch_size,
+    )
+
+    _write_metadata_rows(root, metadata_rows)
+    (root / PREPARED_MARKER).write_text(
+        json.dumps(
+            {
+                "dataset": dataset_name,
+                "num_clients": num_clients,
+                "seed": seed,
+                "test_fraction": test_fraction,
+                "test_seed": test_seed,
+                "partition_method": partition_method,
+                "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+            }
+        )
+    )
+    return root
+
+
+def build_transform(augment: Optional[Dict[str, Any]] = None) -> Any:
+    _, transforms, _, _ = _require_torch()
+    augment = dict(DEFAULT_AUGMENT if augment is None else augment)
+    enabled = bool(augment.get("enabled", True))
+    ops: List[Any] = []
+    resize = augment.get("resize", [64, 64])
+    if resize:
+        ops.append(transforms.Resize(tuple(resize)))
+    if enabled and augment.get("horizontal_flip", False):
+        ops.append(transforms.RandomHorizontalFlip())
+    ops.append(transforms.ToTensor())
+    if augment.get("normalize", False):
+        ops.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+    return transforms.Compose(ops)
+
+
+class LocalImageDataset:
+    def __init__(
+        self,
+        *,
+        data_dir: str,
+        dataset_name: Optional[str] = None,
+        client_id: str,
+        poisoning_method: str,
+        split: str = "train",
+        transform: Any = None,
+    ) -> None:
+        torch, _, _, Dataset = _require_torch()
+
+        class _Dataset(Dataset):
+            def __init__(self, outer: "LocalImageDataset") -> None:
+                self.outer = outer
+
+            def __len__(self) -> int:
+                return len(self.outer.records)
+
+            def __getitem__(self, idx: int) -> Tuple[Any, int]:
+                record = self.outer.records[idx]
+                image = Image.open(record["image_path"]).convert("RGB")
+                if self.outer.transform is not None:
+                    image = self.outer.transform(image)
+                return image, int(record["label"])
+
+        self.data_dir = data_dir
+        self.dataset_name = dataset_name
+        self.client_id = client_id
+        self.poisoning_method = poisoning_method
+        self.split = split
+        self.transform = transform
+        self.records = load_metadata_records(
+            data_dir=data_dir,
+            dataset_name=dataset_name,
+            client_id=client_id,
+            poisoning_method=poisoning_method,
+            split=split,
+        )
+        self._dataset = _Dataset(self)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, idx: int) -> Tuple[Any, int]:
+        return self._dataset[idx]
+
+
+def load_metadata_records(
+    *,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+    client_id: str,
+    poisoning_method: str,
+    split: str = "train",
+) -> List[Dict[str, Any]]:
+    path = _dataset_root(data_dir, dataset_name) / METADATA_NAME
+    if not path.exists():
+        raise FileNotFoundError(f"Prepared metadata not found: {path}. Run dataset_preparation.py first.")
+    with path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    selected: List[Dict[str, Any]] = []
+    for row in rows:
+        if (
+            (client_id in {"all", "*"} or row["client_id"] == client_id)
+            and row["poisoning_method"] == poisoning_method
+            and row["dataset_split"] == split
+        ):
+            row = dict(row)
+            row["image_path"] = _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
+            selected.append(row)
+    return selected
+
+
+def get_poison_fraction(
+    *,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+    client_id: str,
+    poisoning_method: str,
+    split: str = "train",
+) -> float:
+    records = load_metadata_records(
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+        client_id=client_id,
+        poisoning_method=poisoning_method,
+        split=split,
+    )
+    if not records:
+        return 0.0
+    poisoned = 0
+    for record in records:
+        is_poisoned = str(record.get("is_poisoned", "")).lower() == "true"
+        label_changed = str(record.get("label_changed", "")).lower() == "true"
+        if is_poisoned or label_changed:
+            poisoned += 1
+    return poisoned / len(records)
+
+
+def get_num_classes(data_dir: str, dataset_name: Optional[str] = None) -> int:
+    path = _dataset_root(data_dir, dataset_name) / METADATA_NAME
+    if not path.exists():
+        raise FileNotFoundError(f"Prepared metadata not found: {path}")
+    with path.open(newline="") as f:
+        return len({int(row["label"]) for row in csv.DictReader(f)})
+
+
+def get_dataloader(
+    *,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+    client_id: str,
+    poisoning_method: str,
+    split: str,
+    augment: Dict[str, Any],
+    batch_size: int,
+    shuffle: bool,
+) -> Any:
+    _, _, DataLoader, _ = _require_torch()
+    dataset = LocalImageDataset(
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+        client_id=client_id,
+        poisoning_method=poisoning_method,
+        split=split,
+        transform=build_transform(augment),
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    add_common_args(parser)
+    if "--test-fraction" not in parser._option_string_actions:
+        parser.add_argument("--test-fraction", type=float, default=DEFAULT_TEST_FRACTION)
+    if "--test-seed" not in parser._option_string_actions:
+        parser.add_argument("--test-seed", type=int, default=DEFAULT_TEST_SEED)
+    if "--partition-method" not in parser._option_string_actions:
+        parser.add_argument(
+            "--partition-method",
+            choices=["iid", "dirichlet_noniid"],
+            default=DEFAULT_PARTITION_METHOD,
+        )
+    if "--noniid-alpha" not in parser._option_string_actions:
+        parser.add_argument("--noniid-alpha", type=float, default=DEFAULT_NONIID_ALPHA)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--prepare-scenarios",
+        default=PREPARE_SCENARIO_ALL,
+        help=(
+            "Comma-separated dataset scenarios to generate. "
+            f"Use {PREPARE_SCENARIO_ALL!r} or exact names: {', '.join(PREPARE_SCENARIOS)}. "
+            f"Example: --prepare-scenarios {POISONING_METHOD_AVAILABILITY_SHORTCUTS}"
+        ),
+    )
+    parser.add_argument("--poison-epsilon", type=float, default=8.0)
+    parser.add_argument("--poison-steps", type=int, default=5)
+    parser.add_argument("--poison-step-size", type=float, default=0.8)
+    parser.add_argument("--unlearnable-repo", default="../Unlearnable-Examples")
+    parser.add_argument("--random-label-flip-fraction", type=float, default=DEFAULT_RANDOM_LABEL_FLIP_FRACTION)
+    parser.add_argument("--target-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL)
+    parser.add_argument("--replacement-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL)
+    parser.add_argument("--shortcut-eps", type=float, default=DEFAULT_AVAILABILITY_SHORTCUT_EPS)
+    parser.add_argument("--shortcut-patch-size", type=int, default=DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE)
+    parser.add_argument(
+        "--prune-unreferenced",
+        action="store_true",
+        help="Delete JPEG files under this dataset root that are not referenced by metadata.",
+    )
+    args = parser.parse_args()
+    augment = augment_from_args(args)
+    resize = augment.get("resize", [64, 64])
+    root = prepare_dataset(
+        data_dir=args.data_dir,
+        dataset_name=args.dataset,
+        num_clients=args.num_clients,
+        seed=args.seed,
+        force=args.force,
+        resize=resize,
+        poison_epsilon=args.poison_epsilon,
+        poison_steps=args.poison_steps,
+        poison_step_size=args.poison_step_size,
+        batch_size=args.batch_size,
+        unlearnable_repo=args.unlearnable_repo,
+        random_label_flip_fraction=args.random_label_flip_fraction,
+        target_label=args.target_label,
+        replacement_label=args.replacement_label,
+        shortcut_eps=args.shortcut_eps,
+        shortcut_patch_size=args.shortcut_patch_size,
+        test_fraction=args.test_fraction,
+        test_seed=args.test_seed,
+        prepare_scenarios=args.prepare_scenarios,
+        partition_method=args.partition_method,
+        noniid_alpha=args.noniid_alpha,
+    )
+    print(root)
+    if args.prune_unreferenced:
+        removed = prune_unreferenced_images(
+            data_dir=args.data_dir,
+            dataset_name=args.dataset,
+        )
+        print(f"Pruned {removed} unreferenced JPEG files from {root}")
+
+
+if __name__ == "__main__":
+    main()
