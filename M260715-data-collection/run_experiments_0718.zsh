@@ -8,15 +8,14 @@ SSH_PASSWORD="${SSH_PASSWORD:-}"
 
 SMALL_TRASHNET_DATASET="kuchidareo/small_trashnet"
 CIFAR10_DATASET="uoft-cs/cifar10"
-CHINESE_TRAFFIC_SIGN_DATASET="kuchidareo/chinese_trafficsign_dataset"
-DEFAULT_METHODS="clean"
-DEFAULT_FL_METHODS="clean,unlearnable_examples,availability_shortcuts,random_label_flipping"
+DEFAULT_METHODS="clean,unlearnable_examples,availability_shortcuts"
+DEFAULT_FL_METHODS="unlearnable_examples,availability_shortcuts,random_label_flipping,clean"
 FL_DATASET="${FL_DATASET:-$SMALL_TRASHNET_DATASET}"
-FL_POISONED_CLIENT_COUNTS="${FL_POISONED_CLIENT_COUNTS:-1,4,7,10}"
+FL_POISONED_CLIENT_COUNTS="${FL_POISONED_CLIENT_COUNTS:-10,7,4,1}"
 FL_TRIALS="${FL_TRIALS:-1}"
 
-REFERENCE_TRIALS="${REFERENCE_TRIALS:-1}"
-ANALYSIS_TRIALS="${ANALYSIS_TRIALS:-1}"
+REFERENCE_TRIALS="${REFERENCE_TRIALS:-5}"
+ANALYSIS_TRIALS="${ANALYSIS_TRIALS:-5}"
 BG_WORKLOAD_ENABLED="${BG_WORKLOAD_ENABLED:-1}"
 BG_WORKLOAD_GROUP="${BG_WORKLOAD_GROUP:-group1}"
 BG_WORKLOAD_PROFILE="${BG_WORKLOAD_PROFILE:-medium}"
@@ -29,13 +28,8 @@ BG_OPENCV_PIP_PACKAGE="${BG_OPENCV_PIP_PACKAGE:-opencv-python-headless}"
 BG_WORKLOAD_CHECKED=0
 PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-1}"
 PERF_ENABLED="${PERF_ENABLED:-1}"
-PERF_FPS=10
+PERF_FPS="${PERF_FPS:-10}"
 PERF_EVENTS="${PERF_EVENTS:-}"
-LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
-BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-16}"
-BATCH_SIZE_VARIANTS="${BATCH_SIZE_VARIANTS:-4,8,32}"
-BASELINE_MODEL="${BASELINE_MODEL:-simple_cnn}"
-MODEL_VARIANTS="${MODEL_VARIANTS:-resnet18,mobilenet_v3_large,swin_t}"
 
 config_value() {
   local name="$1"
@@ -44,9 +38,8 @@ config_value() {
 }
 
 device_lines() {
-  # Reuse the existing IID partitions formerly assigned to .113 and .114.
-  print -- "client_1:192.168.0.141"
-  print -- "client_2:192.168.0.142"
+  cd "$SERVER_PROJECT_DIR"
+  "$SERVER_PYTHON" -c "import experiment_config as c; [print(f\"{d['client_id']}:{d['host']}\") for d in c.DEVICES]"
 }
 
 host_is_reachable() {
@@ -121,9 +114,6 @@ check_remote_environment() {
       '$REMOTE_PYTHON' --version
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/small_trashnet'
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/cifar10'
-      test -d '${REMOTE_PROJECT_DIR:h}/iid-data/chinese_trafficsign_dataset'
-      cd '$REMOTE_PROJECT_DIR'
-      '$REMOTE_PYTHON' -c 'from models import get_model; names = ("simple_cnn", "resnet18", "mobilenet_v3_large", "swin_t"); [get_model(name, num_classes=6) for name in names]; print("models", ",".join(names))'
       if [ '$PERF_ENABLED' = '1' ]; then
         command -v perf
       fi
@@ -386,17 +376,13 @@ run_local_ml_stage() {
   local methods="$3"
   local reference_trials="$4"
   local analysis_trials="$5"
-  local batch_size="$6"
-  local model_name="$7"
-  local use_bg="$8"
+  local use_bg="$6"
 
   local reference_option="--reference-trials '$reference_trials'"
   local trials_option="--trials '$analysis_trials'"
   local method_option="--poisoning-method '$methods'"
   local bg_option=""
   local perf_option
-  local -a stage_pids
-  local stage_failed=0
   perf_option="$(perf_args_for_python)"
 
   if [[ "$use_bg" == "1" ]]; then
@@ -408,9 +394,6 @@ run_local_ml_stage() {
   print "  dataset: ${dataset_name}"
   print "  methods: ${methods}"
   print "  reference_trials: ${reference_trials}, analysis_trials: ${analysis_trials}"
-  print "  model: ${model_name}"
-  print "  local_epochs: ${LOCAL_EPOCHS}, batch_size: ${batch_size}"
-  print "  compute_device: cpu (CUDA disabled)"
   print "  bg_noise: ${use_bg}"
 
   for device in "${(@f)$(reachable_device_lines)}"; do
@@ -419,157 +402,52 @@ run_local_ml_stage() {
     ssh_run "$host" "
       set -e
       cd '$REMOTE_PROJECT_DIR'
-      CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' running_ml.py \
+      '$REMOTE_PYTHON' running_ml.py \
         --dataset '$dataset_name' \
         --client-id '$client_id' \
         --device-id '$host' \
         --host '$host' \
-        --model '$model_name' \
-        --local-epochs '$LOCAL_EPOCHS' \
-        --batch-size '$batch_size' \
         $reference_option \
         $trials_option \
         $method_option \
         $perf_option \
         $bg_option
     " &
-    stage_pids+=("$!")
   done
-
-  for stage_pid in "${stage_pids[@]}"; do
-    if ! wait "$stage_pid"; then
-      stage_failed=1
-    fi
-  done
-
-  if (( stage_failed )); then
-    print -u2 "Failed stage: ${stage_name}"
-    return 1
-  fi
+  wait
   print "Finished stage: ${stage_name}"
 }
 
-run_bg_local_ml_stage() {
-  local group="$1"
-  shift
-  local BG_WORKLOAD_GROUP="$group"
-  local BG_WORKLOAD_CHECKED=0
-  run_with_bg_workloads run_local_ml_stage "$@" "1"
-}
+run_all_local_ml() {
+  local methods="${1:-$DEFAULT_METHODS}"
 
-prepare_remote_experiment() {
   pull_remote_repos
   check_remote_environment
   configure_remote_perf
-  validate_remote_perf_events
-}
 
-run_model_stages() {
-  local model_name
-  for model_name in ${(s:,:)MODEL_VARIANTS}; do
-    run_local_ml_stage \
-      "model_${model_name}" \
-      "$SMALL_TRASHNET_DATASET" \
-      "clean" \
-      "0" \
-      "$ANALYSIS_TRIALS" \
-      "$BASELINE_BATCH_SIZE" \
-      "$model_name" \
-      "0"
-  done
-}
-
-run_all_local_ml() {
-  prepare_remote_experiment
-
-  # Base clean reference: small_trashnet, no background load, batch size 16.
   run_local_ml_stage \
-    "base_clean" \
+    "small_trashnet_no_bg_reference_and_analysis" \
     "$SMALL_TRASHNET_DATASET" \
-    "clean" \
+    "$methods" \
     "$REFERENCE_TRIALS" \
-    "0" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL" \
-    "0"
-
-  # Background-noise robustness: vary only the background workload.
-  run_bg_local_ml_stage \
-    "group1" \
-    "bg_type_i" \
-    "$SMALL_TRASHNET_DATASET" \
-    "clean" \
-    "0" \
     "$ANALYSIS_TRIALS" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL"
-
-  run_bg_local_ml_stage \
-    "group2" \
-    "bg_type_ii" \
-    "$SMALL_TRASHNET_DATASET" \
-    "clean" \
-    "0" \
-    "$ANALYSIS_TRIALS" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL"
-
-  run_bg_local_ml_stage \
-    "both" \
-    "bg_type_i_plus_ii" \
-    "$SMALL_TRASHNET_DATASET" \
-    "clean" \
-    "0" \
-    "$ANALYSIS_TRIALS" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL"
-
-  # Dataset robustness: vary only the dataset.
-  run_local_ml_stage \
-    "dataset_chinese_traffic_sign" \
-    "$CHINESE_TRAFFIC_SIGN_DATASET" \
-    "clean" \
-    "0" \
-    "$ANALYSIS_TRIALS" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL" \
     "0"
 
   run_local_ml_stage \
-    "dataset_cifar10" \
+    "cifar10_no_bg_analysis_only" \
     "$CIFAR10_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
-    "$BASELINE_BATCH_SIZE" \
-    "$BASELINE_MODEL" \
     "0"
 
-  # Batch-size robustness: vary only batch size on small_trashnet without bg.
-  local batch_size
-  for batch_size in ${(s:,:)BATCH_SIZE_VARIANTS}; do
-    if [[ "$batch_size" != <-> ]] || (( batch_size < 1 )); then
-      print "Invalid batch size in BATCH_SIZE_VARIANTS: ${batch_size}" >&2
-      return 1
-    fi
-    run_local_ml_stage \
-      "batch_size_${batch_size}" \
-      "$SMALL_TRASHNET_DATASET" \
-      "clean" \
-      "0" \
-      "$ANALYSIS_TRIALS" \
-      "$batch_size" \
-      "$BASELINE_MODEL" \
-      "0"
-  done
-
-  # Model robustness: vary only the architecture.
-  run_model_stages
-}
-
-run_models_only() {
-  prepare_remote_experiment
-  run_model_stages
+  run_with_bg_workloads run_local_ml_stage \
+    "small_trashnet_bg_type_i_analysis_only" \
+    "$SMALL_TRASHNET_DATASET" \
+    "$methods" \
+    "0" \
+    "$ANALYSIS_TRIALS" \
+    "1"
 }
 
 run_fl_experiments() {
@@ -653,46 +531,40 @@ usage() {
   cat <<'EOF'
 Usage:
   ./run_experiments.zsh check
+  ./run_experiments.zsh fl-check
   ./run_experiments.zsh bg-check
-  ./run_experiments.zsh models
-  ./run_experiments.zsh run
-  ./run_experiments.zsh all
+  ./run_experiments.zsh all [conditions]
+  ./run_experiments.zsh fl [attack_conditions]
 
-Robustness experiment (clean local ML on 192.168.0.141 and 192.168.0.142):
-  1. Base clean: small_trashnet, no bg, batch size 16 (1 reference trial).
-  2. BG type I: small_trashnet, group1, batch size 16 (1 trial).
-  3. BG type II: small_trashnet, group2, batch size 16 (1 trial).
-  4. BG type I+II: small_trashnet, both groups, batch size 16 (1 trial).
-  5. Chinese traffic signs, no bg, batch size 16 (1 trial).
-  6. CIFAR-10, no bg, batch size 16 (1 trial).
-  7. small_trashnet, no bg, batch size 4 (1 trial).
-  8. small_trashnet, no bg, batch size 8 (1 trial).
-  9. small_trashnet, no bg, batch size 32 (1 trial).
- 10. ResNet18: small_trashnet, no bg, batch size 16 (1 trial).
- 11. MobileNetV3-Large: small_trashnet, no bg, batch size 16 (1 trial).
- 12. Swin-T: small_trashnet, no bg, batch size 16 (1 trial).
+Default experiment:
+  1. small_trashnet without bg:
+     5 clean global reference runs, then 5 clean + 5 unlearnable_examples + 5 availability_shortcuts analysis runs.
+  2. cifar10 without bg:
+     5 clean + 5 unlearnable_examples + 5 availability_shortcuts analysis runs.
+  3. small_trashnet with bg-noise type I:
+     5 clean + 5 unlearnable_examples + 5 availability_shortcuts analysis runs.
 
 Examples:
-  ./run_experiments.zsh check
-  ./run_experiments.zsh bg-check
-  ./run_experiments.zsh models     # resume/run only model conditions
-  ./run_experiments.zsh run
   ./run_experiments.zsh all
+  ./run_experiments.zsh all clean,unlearnable_examples,availability_shortcuts
+  ./run_experiments_0718.zsh fl unlearnable_examples,availability_shortcuts,random_label_flipping,clean
 
 Environment:
   SSH_PASSWORD=...                 optional if SSH keys are configured
-  REFERENCE_TRIALS=1
-  ANALYSIS_TRIALS=1
-  LOCAL_EPOCHS=10
-  BASELINE_BATCH_SIZE=16
-  BATCH_SIZE_VARIANTS=4,8,32
-  BASELINE_MODEL=simple_cnn
-  MODEL_VARIANTS=resnet18,mobilenet_v3_large,swin_t
+  REFERENCE_TRIALS=5
+  ANALYSIS_TRIALS=5
+  BG_WORKLOAD_GROUP=group1         type I/perception workload
   BG_WORKLOAD_PROFILE=medium
   BG_WORKLOAD_TEST_DURATION=10
   PERF_ENABLED=1                   collect perf CSV files; use 0 to disable
-  PERF_FPS=10                      fixed for this experiment
+  PERF_FPS=10
   PERF_EVENTS=                     empty uses perf_logger.py defaults
+  FL_DATASET=kuchidareo/small_trashnet
+  FL_POISONED_CLIENT_COUNTS=10,7,4,1
+  FL_TRIALS=1
+  FL_NUM_ROUNDS=15
+  FL_LOCAL_EPOCHS=1
+  FL_BATCH_SIZE=16
 EOF
 }
 
@@ -706,17 +578,31 @@ main() {
       check_remote_environment
       configure_remote_perf
       ;;
+    fl-check)
+      pull_remote_repos
+      check_remote_environment
+      check_fl_environment
+      configure_remote_perf
+      validate_remote_perf_events
+      print_reachable_fl_clients
+      print "FL environment check finished; no experiment was started."
+      ;;
     bg-check)
       pull_remote_repos
       check_remote_environment
       configure_remote_perf
       check_bg_workloads
       ;;
-    models)
-      run_models_only
+    all)
+      run_all_local_ml "${1:-$DEFAULT_METHODS}"
       ;;
-    run|all)
-      run_all_local_ml
+    fl)
+      pull_remote_repos
+      check_remote_environment
+      check_fl_environment
+      configure_remote_perf
+      validate_remote_perf_events
+      run_fl_experiments "${1:-$DEFAULT_FL_METHODS}"
       ;;
     -h|--help|help)
       usage

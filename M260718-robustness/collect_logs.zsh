@@ -5,7 +5,7 @@ set -euo pipefail
 SERVER_PROJECT_DIR="${0:A:h}"
 
 # Remote Raspberry Pi project path.
-REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/M260715-data-collection"
+REMOTE_PROJECT_DIR="/home/rasheed/kuchida/antivenom_infocom/M260718-robustness"
 
 # SSH credentials. Password is read from SSH_PASSWORD env var.
 SSH_USER="rasheed"

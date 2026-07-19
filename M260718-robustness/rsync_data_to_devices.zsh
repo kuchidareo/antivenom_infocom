@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 LOCAL_DATA_DIR="${LOCAL_DATA_DIR:-${SCRIPT_DIR:h}/iid-data}"
-REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/home/rasheed/kuchida/antivenom_infocom/M260715-data-collection}"
+REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-/home/rasheed/kuchida/antivenom_infocom/M260718-robustness}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-${REMOTE_PROJECT_DIR:h}/iid-data}"
 SSH_USER="${SSH_USER:-rasheed}"
 SSH_PASSWORD="${SSH_PASSWORD:-modenaottun}"
