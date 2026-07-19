@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+iid-data*/
+non-iid-data*/
+
+Unlearnable-Exampless/
+Availability-Attacks-Create-Shortcuts/

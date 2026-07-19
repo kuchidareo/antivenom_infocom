@@ -123,7 +123,7 @@ check_remote_environment() {
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/cifar10'
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/chinese_trafficsign_dataset'
       cd '$REMOTE_PROJECT_DIR'
-      '$REMOTE_PYTHON' -c 'from models import get_model; names = ("simple_cnn", "resnet18", "mobilenet_v3_large", "swin_t"); [get_model(name, num_classes=6) for name in names]; print("models", ",".join(names))'
+      '$REMOTE_PYTHON' -c 'from models import get_model; names = \"simple_cnn,resnet18,mobilenet_v3_large,swin_t\".split(\",\"); assert all(get_model(name, num_classes=6) is not None for name in names); print(\"models\", \",\".join(names))'
       if [ '$PERF_ENABLED' = '1' ]; then
         command -v perf
       fi
