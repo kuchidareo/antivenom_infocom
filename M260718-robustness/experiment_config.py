@@ -29,6 +29,8 @@ DEFAULT_FL_NUM_ROUNDS = 15
 DEFAULT_FL_TRIALS = 1
 DEFAULT_LEARNING_RATE = 0.001
 DEFAULT_NUM_CLIENTS = 10
+DEFAULT_PARTITION_METHOD = "iid"
+DEFAULT_NONIID_ALPHA = 0.3
 DEFAULT_BASE_SEED = 260626
 DEFAULT_SERVER_ADDRESS = "192.168.0.110:8080"
 DEFAULT_FL_SERVER_BIND_ADDRESS = "0.0.0.0:8080"
@@ -108,6 +110,7 @@ CSV_COLUMNS = [
     "dataset",
     "dataset_split",
     "partition_method",
+    "noniid_alpha",
     "num_clients",
     "client_partition_id",
     "model",
@@ -165,6 +168,7 @@ CONDITION_COLUMNS = [
     "dataset",
     "dataset_split",
     "partition_method",
+    "noniid_alpha",
     "num_clients",
     "client_partition_id",
     "model",
@@ -302,6 +306,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-rounds", type=int, default=DEFAULT_NUM_ROUNDS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--num-clients", type=int, default=DEFAULT_NUM_CLIENTS)
+    parser.add_argument(
+        "--partition-method",
+        choices=["iid", "dirichlet_noniid"],
+        default=DEFAULT_PARTITION_METHOD,
+    )
+    parser.add_argument("--noniid-alpha", type=float, default=DEFAULT_NONIID_ALPHA)
     parser.add_argument("--trial-id", default="trial_0")
     parser.add_argument("--seed", type=int, default=DEFAULT_BASE_SEED)
     parser.add_argument("--device-id", default="")
@@ -361,7 +371,12 @@ def condition_columns(
         "seed": getattr(args, "seed", DEFAULT_BASE_SEED),
         "dataset": getattr(args, "dataset", DATASET_NAME),
         "dataset_split": getattr(args, "dataset_split", "train"),
-        "partition_method": "iid",
+        "partition_method": getattr(args, "partition_method", DEFAULT_PARTITION_METHOD),
+        "noniid_alpha": (
+            getattr(args, "noniid_alpha", DEFAULT_NONIID_ALPHA)
+            if getattr(args, "partition_method", DEFAULT_PARTITION_METHOD) != "iid"
+            else ""
+        ),
         "num_clients": getattr(args, "num_clients", DEFAULT_NUM_CLIENTS),
         "client_partition_id": client_id,
         "model": getattr(args, "model", DEFAULT_MODEL),

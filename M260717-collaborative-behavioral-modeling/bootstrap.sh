@@ -15,12 +15,20 @@ readonly METADATA_DIR="${ROOT}/metadata"
 readonly DATASET_DIR="${ROOT}/datasets"
 readonly RESULT_DIR="${ROOT}/results"
 readonly VENV="${ROOT}/venv"
+readonly DEPENDENCY_DIR="${ROOT}/dependencies"
+readonly UNLEARNABLE_REPO="${DEPENDENCY_DIR}/Unlearnable-Examples"
+readonly UNLEARNABLE_REPO_URL="https://github.com/HanxunH/Unlearnable-Examples.git"
+readonly UNLEARNABLE_REPO_COMMIT="f347155ee23b002788c6594d1843076d796b2a88"
 
 # bootstrap.sh が置かれているディレクトリを自動的に取得する。
 readonly REPO_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
     pwd -P
 )"
+readonly ANTIVENOM_REPO_DIR="$(cd -- "${REPO_DIR}/.." && pwd -P)"
+readonly ROBUSTNESS_PROJECT_DIR="${ANTIVENOM_REPO_DIR}/M260718-robustness"
+readonly EXPERIMENT_SETUP="${REPO_DIR}/experiment_setup.sh"
+readonly LOCAL_EXPERIMENT_RUNNER="${REPO_DIR}/run_experiments_local.zsh"
 
 readonly REQUIREMENTS="${REPO_DIR}/requirements.txt"
 readonly TORCH_REQUIREMENTS="${REPO_DIR}/requirements-torch-cpu.txt"
@@ -44,7 +52,8 @@ mkdir -p \
     "${LOG_DIR}" \
     "${METADATA_DIR}" \
     "${DATASET_DIR}" \
-    "${RESULT_DIR}"
+    "${RESULT_DIR}" \
+    "${DEPENDENCY_DIR}"
 
 chmod 0755 \
     "${STATE_DIR}" \
@@ -135,6 +144,26 @@ if [[ ! -f "${TORCH_REQUIREMENTS}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${EXPERIMENT_SETUP}" ]]; then
+    echo "Experiment setup script not found: ${EXPERIMENT_SETUP}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${LOCAL_EXPERIMENT_RUNNER}" ]]; then
+    echo "Local experiment runner not found: ${LOCAL_EXPERIMENT_RUNNER}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${ANTIVENOM_REPO_DIR}/dataset_preparation.py" ]]; then
+    echo "Dataset preparation module not found: ${ANTIVENOM_REPO_DIR}/dataset_preparation.py" >&2
+    exit 1
+fi
+
+if [[ ! -f "${ROBUSTNESS_PROJECT_DIR}/running_ml.py" ]]; then
+    echo "Robustness training code not found: ${ROBUSTNESS_PROJECT_DIR}/running_ml.py" >&2
+    exit 1
+fi
+
 if ! command -v apt-get >/dev/null 2>&1; then
     echo "This bootstrap currently requires an apt-based OS image" >&2
     exit 1
@@ -157,6 +186,8 @@ readonly REQUIRED_PACKAGES=(
     python3-venv
     util-linux
     linux-tools-common
+    iperf3
+    zsh
 )
 
 missing_packages=()
@@ -175,6 +206,32 @@ if (( ${#missing_packages[@]} > 0 )); then
     apt-get install -y --no-install-recommends \
         "${missing_packages[@]}"
 fi
+
+
+# ---------------------------------------------------------------------------
+# External experiment dependencies
+#
+# Unlearnable-Examples is intentionally ignored by the main Git repository,
+# so CloudLab's /local/repository does not contain it. Pin the exact revision
+# used during local development for reproducible perturbation generation.
+# ---------------------------------------------------------------------------
+
+if [[ ! -d "${UNLEARNABLE_REPO}/.git" ]]; then
+    rm -rf "${UNLEARNABLE_REPO}"
+    git clone "${UNLEARNABLE_REPO_URL}" "${UNLEARNABLE_REPO}"
+fi
+
+git -C "${UNLEARNABLE_REPO}" fetch \
+    --depth 1 \
+    origin \
+    "${UNLEARNABLE_REPO_COMMIT}"
+
+git -C "${UNLEARNABLE_REPO}" checkout \
+    --detach \
+    "${UNLEARNABLE_REPO_COMMIT}"
+
+printf '%s\n' "${UNLEARNABLE_REPO_COMMIT}" \
+    > "${METADATA_DIR}/unlearnable_examples_commit.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +458,45 @@ print("cuda_available:", torch.cuda.is_available())
 print("torch_config:")
 print(torch.__config__.show())
 PY
+
+
+# ---------------------------------------------------------------------------
+# Dataset preparation
+#
+# Prepare clean and poisoned scenarios for all requested datasets using both
+# IID and Dirichlet non-IID partitions. Existing complete data is reused.
+# ---------------------------------------------------------------------------
+
+env \
+    PYTHON="${VENV}/bin/python" \
+    ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
+    IID_DATA_DIR="${DATASET_DIR}/iid-data" \
+    NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
+    UNLEARNABLE_REPO="${UNLEARNABLE_REPO}" \
+    PREPARE_SCENARIOS="${ANTIVENOM_PREPARE_SCENARIOS:-all}" \
+    bash "${EXPERIMENT_SETUP}" all
+
+
+# ---------------------------------------------------------------------------
+# Local robustness experiment
+#
+# Execute training on this node without SSH. The implementation comes from
+# M260718-robustness, while logs remain under /local/antivenom/logs.
+# ---------------------------------------------------------------------------
+
+env \
+    PYTHON="${VENV}/bin/python" \
+    ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
+    IID_DATA_DIR="${DATASET_DIR}/iid-data" \
+    NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
+    LOG_DIR="${LOG_DIR}/local_ml" \
+    CLIENT_ID="${ANTIVENOM_CLIENT_ID:-}" \
+    CLIENT_SELECTION_SEED="${ANTIVENOM_CLIENT_SELECTION_SEED:-260626}" \
+    HOST_LABEL="${ANTIVENOM_HOST_LABEL:-$(hostname -s)}" \
+    DEVICE_ID="${ANTIVENOM_DEVICE_ID:-$(hostname -s)}" \
+    PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
+    PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
+    zsh "${LOCAL_EXPERIMENT_RUNNER}" run
 
 
 # ---------------------------------------------------------------------------

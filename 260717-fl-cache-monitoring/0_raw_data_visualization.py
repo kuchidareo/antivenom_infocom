@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -156,13 +157,17 @@ def discover_runs(input_dir: Path) -> dict[str, list[Run]]:
         counts = {run.poisoned_count for run in cluster}
         methods = {run.local_method for run in cluster if run.local_method != "clean"}
         if len(cluster) != 10 or len(devices) != 10:
-            raise ValueError(
-                "Expected ten synchronized client runs; found "
-                f"{len(cluster)} records and {len(devices)} devices near "
-                f"timestamp {cluster[0].start_time}"
+            warnings.warn(
+                "Incomplete synchronized FL run: found "
+                f"{len(cluster)} records from {len(devices)} devices near "
+                f"timestamp {cluster[0].start_time}; using the available clients."
             )
         if len(counts) != 1:
-            raise ValueError(f"Inconsistent poisoned-client counts in run cluster: {counts}")
+            warnings.warn(
+                "Skipping an FL run with inconsistent poisoned-client counts near "
+                f"timestamp {cluster[0].start_time}: {counts}"
+            )
+            continue
 
         poisoned_count = next(iter(counts))
         if poisoned_count == 0:
@@ -170,11 +175,17 @@ def discover_runs(input_dir: Path) -> dict[str, list[Run]]:
         elif len(methods) == 1:
             global_method = next(iter(methods))
         else:
-            raise ValueError(
-                f"Could not identify one attack method near {cluster[0].start_time}: {methods}"
+            warnings.warn(
+                "Skipping an incomplete FL run whose attack method cannot be "
+                f"identified near timestamp {cluster[0].start_time}: {methods}"
             )
+            continue
         if global_method not in METHOD_ORDER:
-            raise ValueError(f"Unsupported poisoning method: {global_method}")
+            warnings.warn(
+                f"Skipping unsupported poisoning method {global_method!r} near "
+                f"timestamp {cluster[0].start_time}."
+            )
+            continue
         resolved.extend(replace(run, global_method=global_method) for run in cluster)
 
     by_device: dict[str, list[Run]] = {}
@@ -191,13 +202,37 @@ def discover_runs(input_dir: Path) -> dict[str, list[Run]]:
         },
     }
     for device, device_runs in by_device.items():
-        actual = {run.condition_key for run in device_runs}
-        if len(device_runs) != 13 or actual != expected_conditions:
-            raise ValueError(
-                f"{device} does not have the expected 13 unique conditions: "
-                f"found {len(device_runs)} runs and {len(actual)} conditions"
+        runs_by_condition: dict[tuple[int, int], list[Run]] = {}
+        for run in device_runs:
+            runs_by_condition.setdefault(run.condition_key, []).append(run)
+
+        selected_runs: list[Run] = []
+        for condition, candidates in runs_by_condition.items():
+            candidates.sort(key=lambda run: run.start_time)
+            selected = candidates[-1]
+            selected_runs.append(selected)
+            if len(candidates) > 1:
+                ignored = ", ".join(run.perf_path.name for run in candidates[:-1])
+                warnings.warn(
+                    f"{device} has {len(candidates)} runs for condition {condition}; "
+                    f"using latest {selected.perf_path.name} and ignoring {ignored}."
+                )
+
+        actual = set(runs_by_condition)
+        missing = expected_conditions - actual
+        if missing:
+            readable = ", ".join(
+                f"{next(name for name, order in METHOD_ORDER.items() if order == method)}:"
+                f"{count}"
+                for method, count in sorted(missing)
             )
-        device_runs.sort(key=lambda run: run.condition_key)
+            warnings.warn(
+                f"{device} is missing {len(missing)} expected conditions "
+                f"({readable}); plotting available conditions only."
+            )
+
+        selected_runs.sort(key=lambda run: run.condition_key)
+        by_device[device] = selected_runs
     return dict(sorted(by_device.items()))
 
 
@@ -330,12 +365,31 @@ def main() -> None:
     print(f"Found {sum(map(len, runs_by_device.values()))} runs for {len(runs_by_device)} clients")
     for device, runs in runs_by_device.items():
         print(f"Aggregating {device} ({len(runs)} conditions) ...", flush=True)
-        summaries = {run.perf_path: aggregate_run(run) for run in runs}
+        summaries: dict[Path, dict[str, pd.DataFrame]] = {}
+        valid_runs: list[Run] = []
+        for run in runs:
+            try:
+                summaries[run.perf_path] = aggregate_run(run)
+                valid_runs.append(run)
+            except (ValueError, KeyError, pd.errors.EmptyDataError) as exc:
+                warnings.warn(f"Skipping unusable run {run.perf_path}: {exc}")
+
+        available_counts = {
+            run.poisoned_count
+            for run in valid_runs
+            if run.global_method != "clean"
+        }
         for poisoned_count in POISONED_COUNTS:
+            if poisoned_count not in available_counts:
+                print(
+                    f"Skipping {device}, poisoned_count={poisoned_count}: "
+                    "no attack runs available."
+                )
+                continue
             for phase in PHASES:
                 path = save_phase_figure(
                     device,
-                    runs,
+                    valid_runs,
                     summaries,
                     phase,
                     poisoned_count,

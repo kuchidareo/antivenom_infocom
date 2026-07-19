@@ -313,7 +313,7 @@ def _extract_image_label(example: Dict[str, Any]) -> Tuple[Image.Image, int]:
                 image = value
                 break
     label = None
-    for key in ("label", "labels", "class", "target"):
+    for key in ("label", "labels", "fine_label", "class", "target"):
         if key in example:
             label = example[key]
             break
@@ -336,7 +336,7 @@ def _class_names(ds: Any) -> List[str]:
     features = getattr(ds, "features", {})
     label_feature = None
     if hasattr(features, "get"):
-        for key in ("label", "labels", "class", "target"):
+        for key in ("label", "labels", "fine_label", "class", "target"):
             label_feature = features.get(key)
             if label_feature is not None:
                 break
