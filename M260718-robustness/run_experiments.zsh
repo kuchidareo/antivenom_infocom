@@ -35,7 +35,7 @@ LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
 BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-16}"
 BATCH_SIZE_VARIANTS="${BATCH_SIZE_VARIANTS:-4,8,32}"
 BASELINE_MODEL="${BASELINE_MODEL:-simple_cnn}"
-MODEL_VARIANTS="${MODEL_VARIANTS:-resnet18,mobilenet_v3_large,swin_t}"
+MODEL_VARIANTS="${MODEL_VARIANTS:-resnet18,mobilenet_v3_small,swin_t}"
 AUGMENTATION_VARIANTS="${AUGMENTATION_VARIANTS:-moderate,strong}"
 
 config_value() {
@@ -74,6 +74,7 @@ SSH_USER="$(config_value DEFAULT_SSH_USER)"
 FL_NUM_ROUNDS="${FL_NUM_ROUNDS:-$(config_value DEFAULT_FL_NUM_ROUNDS)}"
 FL_LOCAL_EPOCHS="${FL_LOCAL_EPOCHS:-$(config_value DEFAULT_FL_LOCAL_EPOCHS)}"
 FL_BATCH_SIZE="${FL_BATCH_SIZE:-$(config_value DEFAULT_BATCH_SIZE)}"
+BADSAMPLER_KAPPA="${BADSAMPLER_KAPPA:-$(config_value DEFAULT_BADSAMPLER_KAPPA)}"
 
 ssh_target() {
   local host="$1"
@@ -124,8 +125,8 @@ check_remote_environment() {
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/cifar10'
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/chinese_trafficsign_dataset'
       cd '$REMOTE_PROJECT_DIR'
-      '$REMOTE_PYTHON' -c 'from models import get_model; names = \"simple_cnn,resnet18,mobilenet_v3_large,swin_t\".split(\",\"); assert all(get_model(name, num_classes=6) is not None for name in names); print(\"models\", \",\".join(names))'
-      '$REMOTE_PYTHON' -c 'import subprocess, sys; text = subprocess.check_output([sys.executable, \"running_ml.py\", \"--help\"], text=True); assert \"--augmentation-profile {baseline,moderate,strong}\" in text, \"remote running_ml.py does not support augmentation profiles\"'
+      '$REMOTE_PYTHON' -c 'from models import get_model; names = \"simple_cnn,resnet18,mobilenet_v3_small,swin_t\".split(\",\"); assert all(get_model(name, num_classes=6) is not None for name in names); print(\"models\", \",\".join(names))'
+      '$REMOTE_PYTHON' -c 'import subprocess, sys; text = subprocess.check_output([sys.executable, \"running_ml.py\", \"--help\"], text=True); assert \"--augmentation-profile {baseline,moderate,strong}\" in text, \"remote running_ml.py does not support augmentation profiles\"; assert \"badsampling\" in text and \"--badsampler-kappa\" in text, \"remote running_ml.py does not support BadSampler\"'
       if [ '$PERF_ENABLED' = '1' ]; then
         command -v perf
       fi
@@ -235,7 +236,7 @@ normalize_methods() {
 
   for token in ${(z)raw}; do
     case "$token" in
-      clean|unlearnable_examples|random_label_flipping|target_label_flipping|availability_shortcuts)
+      clean|unlearnable_examples|random_label_flipping|target_label_flipping|availability_shortcuts|badsampling)
         if (( ${selected[(Ie)$token]} == 0 )); then
           selected+=("$token")
         fi
@@ -432,6 +433,7 @@ run_local_ml_stage() {
         --augmentation-profile '$augmentation_profile' \
         --local-epochs '$LOCAL_EPOCHS' \
         --batch-size '$batch_size' \
+        --badsampler-kappa '$BADSAMPLER_KAPPA' \
         $reference_option \
         $trials_option \
         $method_option \
@@ -585,6 +587,19 @@ run_all_local_ml() {
     "$BASELINE_MODEL" \
     "0"
 
+  # Sampling-attack condition: keep images and labels clean, vary only sampling.
+  if [[ ",${methods}," != *,badsampling,* ]]; then
+    run_local_ml_stage \
+      "attack_badsampling" \
+      "$SMALL_TRASHNET_DATASET" \
+      "badsampling" \
+      "0" \
+      "$ANALYSIS_TRIALS" \
+      "$BASELINE_BATCH_SIZE" \
+      "$BASELINE_MODEL" \
+      "0"
+  fi
+
   # Batch-size robustness: vary only batch size on small_trashnet without bg.
   local batch_size
   for batch_size in ${(s:,:)BATCH_SIZE_VARIANTS}; do
@@ -710,22 +725,24 @@ Usage:
   ./run_experiments.zsh all [poisoning_method]
 
 Robustness experiment on 192.168.0.141 and 192.168.0.142:
-  The optional poisoning_method applies to conditions 1-12. Default: clean.
-  Conditions 13-14 always use saved augmentations of clean training images.
+  The optional poisoning_method applies to the general robustness conditions. Default: clean.
+  The dedicated BadSampler condition is skipped if badsampling is already selected.
+  Conditions 14-15 always use saved augmentations of clean training images.
   1. Base: small_trashnet, no bg, batch size 16 (1 trial).
   2. BG type I: small_trashnet, group1, batch size 16 (1 trial).
   3. BG type II: small_trashnet, group2, batch size 16 (1 trial).
   4. BG type I+II: small_trashnet, both groups, batch size 16 (1 trial).
   5. Chinese traffic signs, no bg, batch size 16 (1 trial).
   6. CIFAR-10, no bg, batch size 16 (1 trial).
-  7. small_trashnet, no bg, batch size 4 (1 trial).
-  8. small_trashnet, no bg, batch size 8 (1 trial).
-  9. small_trashnet, no bg, batch size 32 (1 trial).
- 10. ResNet18: small_trashnet, no bg, batch size 16 (1 trial).
- 11. MobileNetV3-Large: small_trashnet, no bg, batch size 16 (1 trial).
- 12. Swin-T: small_trashnet, no bg, batch size 16 (1 trial).
- 13. Moderate augmentation: small_trashnet, no bg, batch size 16 (1 trial).
- 14. Strong augmentation: small_trashnet, no bg, batch size 16 (1 trial).
+  7. BadSampler: small_trashnet, no bg, batch size 16, SimpleCNN (1 trial).
+  8. small_trashnet, no bg, batch size 4 (1 trial).
+  9. small_trashnet, no bg, batch size 8 (1 trial).
+ 10. small_trashnet, no bg, batch size 32 (1 trial).
+ 11. ResNet18: small_trashnet, no bg, batch size 16 (1 trial).
+ 12. MobileNetV3-Small: small_trashnet, no bg, batch size 16 (1 trial).
+ 13. Swin-T: small_trashnet, no bg, batch size 16 (1 trial).
+ 14. Moderate augmentation: small_trashnet, no bg, batch size 16 (1 trial).
+ 15. Strong augmentation: small_trashnet, no bg, batch size 16 (1 trial).
 
 Examples:
   ./run_experiments.zsh check
@@ -741,6 +758,7 @@ Supported poisoning methods:
   availability_shortcuts
   random_label_flipping
   target_label_flipping
+  badsampling
 
 Environment:
   SSH_PASSWORD=...                 optional if SSH keys are configured
@@ -750,8 +768,9 @@ Environment:
   BASELINE_BATCH_SIZE=16
   BATCH_SIZE_VARIANTS=4,8,32
   BASELINE_MODEL=simple_cnn
-  MODEL_VARIANTS=resnet18,mobilenet_v3_large,swin_t
+  MODEL_VARIANTS=resnet18,mobilenet_v3_small,swin_t
   AUGMENTATION_VARIANTS=moderate,strong
+  BADSAMPLER_KAPPA=2               top-loss pool multiplier for badsampling
   BG_WORKLOAD_PROFILE=medium
   BG_WORKLOAD_TEST_DURATION=10
   PERF_ENABLED=1                   collect perf CSV files; use 0 to disable

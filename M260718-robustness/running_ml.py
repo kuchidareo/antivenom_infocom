@@ -1,4 +1,5 @@
 import argparse
+import copy
 from contextlib import nullcontext
 
 from dataset_preparation import (
@@ -16,6 +17,7 @@ from experiment_config import (
     DEFAULT_LOCAL_ML_GLOBAL_CLEAN_REFERENCE_TRIALS,
     DEFAULT_LOCAL_ML_POISONING_METHODS,
     POISONING_METHODS,
+    POISONING_METHOD_BADSAMPLING,
     POISONING_METHOD_CLEAN,
     add_common_args,
     attack_name_for_poisoning_method,
@@ -64,6 +66,11 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         set_all_seeds(args.seed)
     num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     model = get_model(args.model, num_classes=num_classes)
+    surrogate_model = (
+        copy.deepcopy(model)
+        if poisoning_method == POISONING_METHOD_BADSAMPLING
+        else None
+    )
     train_loader = get_dataloader(
         data_dir=args.data_dir,
         dataset_name=args.dataset,
@@ -73,6 +80,13 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         augment=augment,
         batch_size=args.batch_size,
         shuffle=True,
+        surrogate_model=surrogate_model,
+        badsampler_kappa=args.badsampler_kappa,
+        badsampler_seed=args.seed,
+        badsampler_run_name=(
+            f"{args.model}_{args.trial_id}_seed_{args.seed}"
+        ),
+        badsampler_num_epochs=args.local_epochs,
     )
     evaluation_augment = evaluation_augment_from_training(augment)
     clean_test_loader = get_dataloader(

@@ -1,8 +1,10 @@
 import argparse
 import csv
 import json
+import math
 import os
 import random
+import re
 import sys
 import shutil
 from pathlib import Path
@@ -73,6 +75,7 @@ DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = _config_value(
     "DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE", 4
 )
 DEFAULT_BATCH_SIZE = _config_value("DEFAULT_BATCH_SIZE", 16)
+DEFAULT_BADSAMPLER_KAPPA = _config_value("DEFAULT_BADSAMPLER_KAPPA", 2.0)
 DEFAULT_DATA_DIR = _config_value("DEFAULT_DATA_DIR", "iid-data")
 DEFAULT_NUM_CLIENTS = _config_value("DEFAULT_NUM_CLIENTS", 10)
 DEFAULT_TEST_FRACTION = _config_value("DEFAULT_TEST_FRACTION", 0.2)
@@ -101,6 +104,9 @@ POISONING_METHOD_TARGET_LABEL_FLIPPING = _config_value(
 )
 POISONING_METHOD_UNLEARNABLE_EXAMPLES = _config_value(
     "POISONING_METHOD_UNLEARNABLE_EXAMPLES", "unlearnable_examples"
+)
+POISONING_METHOD_BADSAMPLING = _config_value(
+    "POISONING_METHOD_BADSAMPLING", "badsampling"
 )
 
 
@@ -179,6 +185,7 @@ PREPARE_SCENARIOS = [
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
     POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+    POISONING_METHOD_BADSAMPLING,
 ]
 AVAILABILITY_SHORTCUT_GENERATOR = "sklearn_make_classification_class_sep_10_jpeg_q100_v2"
 AVAILABILITY_SHORTCUT_CLASS_SEP = 10.0
@@ -187,6 +194,7 @@ AVAILABILITY_SHORTCUT_JPEG_QUALITY = 100
 AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING = 0
 AUGMENTATION_PROFILE_DIR = "augmented"
 AUGMENTATION_VARIANT_NAMES = ("moderate", "strong")
+BADSAMPLER_PLAN_NAME = "sampling_plan.json"
 
 METADATA_FIELDNAMES = [
     "image_path",
@@ -349,6 +357,7 @@ def prepared_data_exists(
         (f"poisoned/{POISONING_METHOD_RANDOM_LABEL_FLIPPING}",),
         (f"poisoned/{POISONING_METHOD_TARGET_LABEL_FLIPPING}",),
         (f"poisoned/{POISONING_METHOD_AVAILABILITY_SHORTCUTS}",),
+        (f"poisoned/{POISONING_METHOD_BADSAMPLING}",),
     ]
     for mode_options in required_modes:
         for idx in range(num_clients):
@@ -804,6 +813,11 @@ def _scenario_mode(scenario: str) -> str:
 
 
 def _scenario_complete(root: Path, scenario: str, rows: Sequence[Dict[str, Any]], num_clients: int) -> bool:
+    if scenario == POISONING_METHOD_BADSAMPLING:
+        return all(
+            (root / "poisoned" / scenario / f"client_{idx}" / BADSAMPLER_PLAN_NAME).exists()
+            for idx in range(num_clients)
+        )
     if not (_mode_complete(root, _scenario_mode(scenario), num_clients) and _metadata_has_method(rows, scenario)):
         return False
     if scenario == POISONING_METHOD_AVAILABILITY_SHORTCUTS:
@@ -1219,6 +1233,60 @@ def _append_unlearnable_example_rows(
         metadata_rows.append(poisoned)
 
 
+def _write_badsampler_plans(
+    *,
+    root: Path,
+    clean_records: Sequence[Dict[str, Any]],
+    kappa: float,
+) -> Path:
+    attack_root = root / "poisoned" / POISONING_METHOD_BADSAMPLING
+    by_client: Dict[str, List[Dict[str, Any]]] = {}
+    for record in clean_records:
+        by_client.setdefault(str(record["client_id"]), []).append(record)
+
+    for client_id, records in sorted(by_client.items()):
+        ordered = sorted(
+            records,
+            key=lambda record: (
+                int(record.get("source_index", 0)),
+                str(record.get("relative_path", "")),
+            ),
+        )
+        candidates = [
+            {
+                "position": position,
+                "source_index": int(record["source_index"]),
+                "relative_path": str(record["relative_path"]),
+                "label": int(record["label"]),
+            }
+            for position, record in enumerate(ordered)
+        ]
+        plan = {
+            "attack": POISONING_METHOD_BADSAMPLING,
+            "version": 1,
+            "client_id": client_id,
+            "dataset_split": "train",
+            "source_poisoning_method": POISONING_METHOD_CLEAN,
+            "images_or_labels_modified": False,
+            "ranking": "computed_from_surrogate_loss_at_runtime",
+            "selection": {
+                "strategy": "top_k_loss",
+                "kappa": float(kappa),
+                "pool_size": "min(num_candidates, kappa * batch_size)",
+                "replacement": True,
+                "num_samples": "num_candidates",
+            },
+            "num_candidates": len(candidates),
+            "candidates": candidates,
+        }
+        client_dir = attack_root / client_id
+        client_dir.mkdir(parents=True, exist_ok=True)
+        (client_dir / BADSAMPLER_PLAN_NAME).write_text(
+            json.dumps(plan, indent=2, sort_keys=True) + "\n"
+        )
+    return attack_root
+
+
 def _append_requested_poisoning_rows(
     metadata_rows: List[Dict[str, Any]],
     clean_records: Sequence[Dict[str, Any]],
@@ -1239,6 +1307,13 @@ def _append_requested_poisoning_rows(
     shortcut_eps: float,
     shortcut_patch_size: int,
 ) -> None:
+    if POISONING_METHOD_BADSAMPLING in requested_scenarios:
+        _write_badsampler_plans(
+            root=root,
+            clean_records=clean_records,
+            kappa=DEFAULT_BADSAMPLER_KAPPA,
+        )
+
     if POISONING_METHOD_UNLEARNABLE_EXAMPLES in requested_scenarios:
         _append_unlearnable_example_rows(
             metadata_rows,
@@ -1785,6 +1860,20 @@ class LocalImageDataset:
             poisoning_method=poisoning_method,
             split=split,
         )
+        if poisoning_method == POISONING_METHOD_BADSAMPLING:
+            if split != "train":
+                raise ValueError("BadSampler is only valid for the training split.")
+            self.records.sort(
+                key=lambda record: (
+                    int(record.get("source_index", 0)),
+                    str(record.get("relative_path", "")),
+                )
+            )
+            _validate_badsampler_plan(
+                root=_dataset_root(data_dir, dataset_name),
+                client_id=client_id,
+                records=self.records,
+            )
         if augmentation_profile != DEFAULT_AUGMENTATION_PROFILE and split == "train":
             if poisoning_method != POISONING_METHOD_CLEAN:
                 raise ValueError(
@@ -1822,17 +1911,204 @@ def load_metadata_records(
         raise FileNotFoundError(f"Prepared metadata not found: {path}. Run dataset_preparation.py first.")
     with path.open(newline="") as f:
         rows = list(csv.DictReader(f))
+    source_method = (
+        POISONING_METHOD_CLEAN
+        if poisoning_method == POISONING_METHOD_BADSAMPLING
+        else poisoning_method
+    )
     selected: List[Dict[str, Any]] = []
     for row in rows:
         if (
             (client_id in {"all", "*"} or row["client_id"] == client_id)
-            and row["poisoning_method"] == poisoning_method
+            and row["poisoning_method"] == source_method
             and row["dataset_split"] == split
         ):
             row = dict(row)
             row["image_path"] = _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
             selected.append(row)
     return selected
+
+
+def _validate_badsampler_plan(
+    *,
+    root: Path,
+    client_id: str,
+    records: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    plan_path = (
+        root
+        / "poisoned"
+        / POISONING_METHOD_BADSAMPLING
+        / client_id
+        / BADSAMPLER_PLAN_NAME
+    )
+    if not plan_path.exists():
+        raise FileNotFoundError(
+            f"Missing BadSampler plan: {plan_path}. Run dataset_preparation.py first."
+        )
+    plan = json.loads(plan_path.read_text())
+    expected = [
+        (int(record["source_index"]), str(record["relative_path"]), int(record["label"]))
+        for record in records
+    ]
+    actual = [
+        (int(item["source_index"]), str(item["relative_path"]), int(item["label"]))
+        for item in plan.get("candidates", [])
+    ]
+    if actual != expected:
+        raise ValueError(
+            f"BadSampler plan does not match current clean records: {plan_path}. "
+            "Regenerate the badsampling scenario."
+        )
+    return plan
+
+
+def calculate_badsampler_losses(
+    *,
+    model: Any,
+    dataset: Any,
+    batch_size: int,
+    device: Optional[Any] = None,
+) -> Any:
+    torch, _, DataLoader, _ = _require_torch()
+    if len(dataset) == 0:
+        raise ValueError("BadSampler cannot score an empty local dataset.")
+    target_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    original_training = bool(model.training)
+    try:
+        original_device = next(model.parameters()).device
+    except StopIteration:
+        original_device = torch.device("cpu")
+
+    python_rng_state = random.getstate()
+    torch_rng_state = torch.random.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        model.to(target_device)
+        model.eval()
+        loader = DataLoader(
+            dataset,
+            batch_size=max(1, batch_size),
+            shuffle=False,
+            num_workers=0,
+        )
+        losses = []
+        with torch.no_grad():
+            for images, labels in loader:
+                outputs = model(images.to(target_device))
+                batch_losses = torch.nn.functional.cross_entropy(
+                    outputs,
+                    labels.to(target_device),
+                    reduction="none",
+                )
+                losses.extend(batch_losses.detach().cpu().tolist())
+        return torch.tensor(losses, dtype=torch.float64)
+    finally:
+        model.to(original_device)
+        model.train(original_training)
+        random.setstate(python_rng_state)
+        torch.random.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
+def make_badsampler(
+    *,
+    losses: Any,
+    batch_size: int,
+    kappa: float,
+    seed: int,
+) -> Tuple[Any, List[int]]:
+    torch, _, _, _ = _require_torch()
+    from torch.utils.data import WeightedRandomSampler
+
+    if len(losses) == 0:
+        raise ValueError("BadSampler requires at least one loss value.")
+    if batch_size <= 0 or kappa <= 0:
+        raise ValueError("BadSampler batch_size and kappa must be positive.")
+    pool_size = min(len(losses), max(1, math.ceil(kappa * batch_size)))
+    hard_positions = torch.topk(losses, k=pool_size, largest=True).indices
+    weights = torch.zeros(len(losses), dtype=torch.float64)
+    weights[hard_positions] = 1.0
+    generator = torch.Generator().manual_seed(seed)
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(losses),
+        replacement=True,
+        generator=generator,
+    )
+    return sampler, [int(position) for position in hard_positions.tolist()]
+
+
+def _write_badsampler_runtime_ranking(
+    *,
+    root: Path,
+    client_id: str,
+    records: Sequence[Dict[str, Any]],
+    losses: Any,
+    hard_positions: Sequence[int],
+    batch_size: int,
+    kappa: float,
+    seed: int,
+    run_name: str,
+    num_epochs: int,
+) -> Path:
+    torch, _, _, _ = _require_torch()
+    hard_set = set(hard_positions)
+    ranked_positions = sorted(
+        range(len(records)), key=lambda position: float(losses[position]), reverse=True
+    )
+    ranking = []
+    for rank, position in enumerate(ranked_positions, start=1):
+        record = records[position]
+        ranking.append(
+            {
+                "rank": rank,
+                "position": position,
+                "source_index": int(record["source_index"]),
+                "relative_path": str(record["relative_path"]),
+                "label": int(record["label"]),
+                "loss": float(losses[position]),
+                "in_sampling_pool": position in hard_set,
+            }
+        )
+    safe_run_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_name).strip("_") or "run"
+    output_dir = root / "poisoned" / POISONING_METHOD_BADSAMPLING / client_id / "rankings"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{safe_run_name}.json"
+    weights = torch.zeros(len(records), dtype=torch.float64)
+    weights[list(hard_positions)] = 1.0
+    preview_generator = torch.Generator().manual_seed(seed)
+    sampled_positions_by_epoch = []
+    sampled_source_indices_by_epoch = []
+    for _ in range(max(0, num_epochs)):
+        sampled_positions = torch.multinomial(
+            weights,
+            num_samples=len(records),
+            replacement=True,
+            generator=preview_generator,
+        ).tolist()
+        sampled_positions_by_epoch.append(sampled_positions)
+        sampled_source_indices_by_epoch.append(
+            [int(records[position]["source_index"]) for position in sampled_positions]
+        )
+
+    payload = {
+        "attack": POISONING_METHOD_BADSAMPLING,
+        "client_id": client_id,
+        "seed": seed,
+        "batch_size": batch_size,
+        "kappa": kappa,
+        "pool_size": len(hard_positions),
+        "num_samples_per_epoch": len(records),
+        "replacement": True,
+        "num_epochs": num_epochs,
+        "sampled_positions_by_epoch": sampled_positions_by_epoch,
+        "sampled_source_indices_by_epoch": sampled_source_indices_by_epoch,
+        "ranking": ranking,
+    }
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return output_path
 
 
 def get_poison_fraction(
@@ -1852,6 +2128,8 @@ def get_poison_fraction(
     )
     if not records:
         return 0.0
+    if poisoning_method == POISONING_METHOD_BADSAMPLING:
+        return 1.0
     poisoned = 0
     for record in records:
         is_poisoned = str(record.get("is_poisoned", "")).lower() == "true"
@@ -1879,6 +2157,12 @@ def get_dataloader(
     augment: Dict[str, Any],
     batch_size: int,
     shuffle: bool,
+    surrogate_model: Any = None,
+    badsampler_kappa: float = DEFAULT_BADSAMPLER_KAPPA,
+    badsampler_seed: int = 0,
+    badsampler_run_name: str = "run",
+    badsampler_device: Optional[Any] = None,
+    badsampler_num_epochs: int = 1,
 ) -> Any:
     _, _, DataLoader, _ = _require_torch()
     augmentation_profile = str(
@@ -1896,7 +2180,44 @@ def get_dataloader(
         split=split,
         transform=build_transform(loader_augment),
     )
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+    if poisoning_method != POISONING_METHOD_BADSAMPLING:
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+    if surrogate_model is None:
+        raise ValueError("BadSampler requires surrogate_model to rank local samples.")
+    losses = calculate_badsampler_losses(
+        model=surrogate_model,
+        dataset=dataset,
+        batch_size=batch_size,
+        device=badsampler_device,
+    )
+    sampler, hard_positions = make_badsampler(
+        losses=losses,
+        batch_size=batch_size,
+        kappa=badsampler_kappa,
+        seed=badsampler_seed,
+    )
+    ranking_path = _write_badsampler_runtime_ranking(
+        root=_dataset_root(data_dir, dataset_name),
+        client_id=client_id,
+        records=dataset.records,
+        losses=losses,
+        hard_positions=hard_positions,
+        batch_size=batch_size,
+        kappa=badsampler_kappa,
+        seed=badsampler_seed,
+        run_name=badsampler_run_name,
+        num_epochs=badsampler_num_epochs,
+    )
+    print(
+        f"BadSampler client={client_id} candidates={len(dataset)} "
+        f"pool={len(hard_positions)} replacement=true ranking={ranking_path}"
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=0,
+    )
 
 
 def main() -> None:

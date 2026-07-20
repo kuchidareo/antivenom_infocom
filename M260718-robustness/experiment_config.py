@@ -47,18 +47,21 @@ POISONING_METHOD_UNLEARNABLE_EXAMPLES = "unlearnable_examples"
 POISONING_METHOD_RANDOM_LABEL_FLIPPING = "random_label_flipping"
 POISONING_METHOD_TARGET_LABEL_FLIPPING = "target_label_flipping"
 POISONING_METHOD_AVAILABILITY_SHORTCUTS = "availability_shortcuts"
+POISONING_METHOD_BADSAMPLING = "badsampling"
 POISONING_METHODS = [
     POISONING_METHOD_CLEAN,
     POISONING_METHOD_UNLEARNABLE_EXAMPLES,
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
     POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+    POISONING_METHOD_BADSAMPLING,
 ]
 POISONING_ATTACK_METHODS = [
     POISONING_METHOD_UNLEARNABLE_EXAMPLES,
     POISONING_METHOD_RANDOM_LABEL_FLIPPING,
     POISONING_METHOD_TARGET_LABEL_FLIPPING,
     POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+    POISONING_METHOD_BADSAMPLING,
 ]
 DEFAULT_LOCAL_ML_POISONING_METHODS = POISONING_METHODS
 DEFAULT_FL_POISONING_METHODS = POISONING_ATTACK_METHODS
@@ -67,6 +70,7 @@ DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL = 5
 DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL = 3
 DEFAULT_AVAILABILITY_SHORTCUT_EPS = 6.0
 DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = 8
+DEFAULT_BADSAMPLER_KAPPA = 2.0
 
 ATTACK_NAME_BY_POISONING_METHOD = {
     POISONING_METHOD_CLEAN: "",
@@ -74,6 +78,7 @@ ATTACK_NAME_BY_POISONING_METHOD = {
     POISONING_METHOD_RANDOM_LABEL_FLIPPING: "random_label_flipping_1_over_6",
     POISONING_METHOD_TARGET_LABEL_FLIPPING: "target_label_flipping_5_to_3",
     POISONING_METHOD_AVAILABILITY_SHORTCUTS: "availability_shortcuts_synthetic_classwise",
+    POISONING_METHOD_BADSAMPLING: "badsampling_top_kappa_replacement",
 }
 
 DEVICES = [
@@ -162,6 +167,8 @@ CSV_COLUMNS = [
     "poisoned_client_ids",
     "poison_fraction",
     "attack_name",
+    "badsampler_kappa",
+    "badsampler_replacement",
     "background_workload_enabled",
     "background_workload_group",
     "background_workload_profile",
@@ -221,6 +228,8 @@ CONDITION_COLUMNS = [
     "poisoned_client_ids",
     "poison_fraction",
     "attack_name",
+    "badsampler_kappa",
+    "badsampler_replacement",
     "background_workload_enabled",
     "background_workload_group",
     "background_workload_profile",
@@ -363,6 +372,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="JSON overrides applied after the selected augmentation profile.",
     )
     parser.add_argument("--dataset-split", default="train")
+    parser.add_argument(
+        "--badsampler-kappa",
+        type=float,
+        default=DEFAULT_BADSAMPLER_KAPPA,
+        help="BadSampler hard-pool multiplier: pool_size = kappa * batch_size.",
+    )
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--run-role", default="")
     parser.add_argument("--background-workload-enabled", action="store_true", default=DEFAULT_BACKGROUND_WORKLOAD_ENABLED)
@@ -448,6 +463,14 @@ def condition_columns(
         "poisoned_client_ids": ",".join(poisoned_ids),
         "poison_fraction": poison_fraction,
         "attack_name": attack_name,
+        "badsampler_kappa": (
+            getattr(args, "badsampler_kappa", DEFAULT_BADSAMPLER_KAPPA)
+            if poisoning_method == POISONING_METHOD_BADSAMPLING
+            else ""
+        ),
+        "badsampler_replacement": (
+            True if poisoning_method == POISONING_METHOD_BADSAMPLING else ""
+        ),
         "background_workload_enabled": bool(
             getattr(args, "background_workload_enabled", DEFAULT_BACKGROUND_WORKLOAD_ENABLED)
         ),

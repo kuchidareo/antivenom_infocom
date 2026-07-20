@@ -51,6 +51,12 @@ def _torchvision_model(model_name: str, num_classes: int) -> nn.Module:
             model.classifier[-1].in_features, num_classes
         )
         return model
+    if model_name == "mobilenet_v3_small":
+        model = models.mobilenet_v3_small(weights=None)
+        model.classifier[-1] = nn.Linear(
+            model.classifier[-1].in_features, num_classes
+        )
+        return model
     if model_name == "swin_t":
         model = models.swin_t(weights=None)
         model.head = nn.Linear(model.head.in_features, num_classes)
@@ -65,9 +71,15 @@ def get_model(model_name: str, num_classes: int, input_size: Tuple[int, int] = (
     aliases = {
         "resnet_18": "resnet18",
         "mobilenetv3_large": "mobilenet_v3_large",
+        "mobilenetv3_small": "mobilenet_v3_small",
         "swin_tiny": "swin_t",
     }
     normalized_name = aliases.get(normalized_name, normalized_name)
-    if normalized_name in {"resnet18", "mobilenet_v3_large", "swin_t"}:
+    if normalized_name in {
+        "resnet18",
+        "mobilenet_v3_large",
+        "mobilenet_v3_small",
+        "swin_t",
+    }:
         return _torchvision_model(normalized_name, num_classes)
     raise ValueError(f"Unknown model: {model_name}")
