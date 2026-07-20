@@ -379,6 +379,25 @@ run_model_stages() {
   done
 }
 
+run_batch_size_stages() {
+  local methods="$1"
+  local batch_size
+  for batch_size in ${(s:,:)BATCH_SIZE_VARIANTS}; do
+    if [[ "$batch_size" != <-> ]] || (( batch_size < 1 )); then
+      print -u2 "Invalid batch size in BATCH_SIZE_VARIANTS: ${batch_size}"
+      return 1
+    fi
+    run_local_stage \
+      "batch_size_${batch_size}" \
+      "$SMALL_TRASHNET_DATASET" \
+      "$methods" \
+      "0" \
+      "$ANALYSIS_TRIALS" \
+      "$batch_size" \
+      "$BASELINE_MODEL"
+  done
+}
+
 prepare_local_experiment() {
   check_local_environment
   configure_local_perf
@@ -389,9 +408,23 @@ run_all_stages() {
   methods="$(normalize_methods "$methods")"
   prepare_local_experiment
 
+  # Base IID condition: Small TrashNet, no background workload, batch 16.
   run_local_stage "iid_small_trashnet" "$SMALL_TRASHNET_DATASET" \
     "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
+
+  # Background robustness: vary only the workload on the base condition.
+  run_bg_stage "group1" \
+    "bg_type_i" "$SMALL_TRASHNET_DATASET" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL"
+  run_bg_stage "group2" \
+    "bg_type_ii" "$SMALL_TRASHNET_DATASET" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL"
+  run_bg_stage "both" \
+    "bg_type_i_plus_ii" "$SMALL_TRASHNET_DATASET" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL"
+
+  # Dataset robustness: vary only the IID dataset.
   run_local_stage "iid_chinese_traffic_sign" "$CHINESE_TRAFFIC_SIGN_DATASET" \
     "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
@@ -399,6 +432,11 @@ run_all_stages() {
     "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
 
+  # Batch-size and architecture robustness on IID Small TrashNet without bg.
+  run_batch_size_stages "$methods"
+  run_model_stages "$methods"
+
+  # Additional non-IID dataset conditions retained for this experiment.
   run_local_stage "noniid_small_trashnet" "$SMALL_TRASHNET_DATASET" \
     "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$NONIID_DATA_ROOT" "dirichlet_noniid"
@@ -420,8 +458,18 @@ print_plan_line() {
 print_experiment_plan() {
   print "Local experiment plan (device_id=${RUN_DEVICE_ID}, client_seed=${CLIENT_SELECTION_SEED}):"
   print_plan_line "iid_small_trashnet" "$SMALL_TRASHNET_DATASET" "iid"
+  print_plan_line "bg_type_i" "$SMALL_TRASHNET_DATASET" "iid, bg=group1"
+  print_plan_line "bg_type_ii" "$SMALL_TRASHNET_DATASET" "iid, bg=group2"
+  print_plan_line "bg_type_i_plus_ii" "$SMALL_TRASHNET_DATASET" "iid, bg=both"
   print_plan_line "iid_chinese_traffic_sign" "$CHINESE_TRAFFIC_SIGN_DATASET" "iid"
   print_plan_line "iid_cifar10" "$CIFAR10_DATASET" "iid"
+  local batch_size model_name
+  for batch_size in ${(s:,:)BATCH_SIZE_VARIANTS}; do
+    print_plan_line "batch_size_${batch_size}" "$SMALL_TRASHNET_DATASET" "iid, batch=${batch_size}"
+  done
+  for model_name in ${(s:,:)MODEL_VARIANTS}; do
+    print_plan_line "model_${model_name}" "$SMALL_TRASHNET_DATASET" "iid, model=${model_name}"
+  done
   print_plan_line "noniid_small_trashnet" "$SMALL_TRASHNET_DATASET" "dirichlet_noniid"
   print_plan_line "noniid_chinese_traffic_sign" "$CHINESE_TRAFFIC_SIGN_DATASET" "dirichlet_noniid"
   print_plan_line "noniid_cifar10" "$CIFAR10_DATASET" "dirichlet_noniid"
@@ -443,9 +491,22 @@ client_0 through client_9. To force one partition for every stage:
   CLIENT_ID=client_1 ./run_experiments_local.zsh run
   ./run_experiments_local.zsh run clean,availability_shortcuts
 
-Default run order:
-  IID:     small_trashnet, Chinese traffic signs, CIFAR-10
-  non-IID: small_trashnet, Chinese traffic signs, CIFAR-10
+Default run order (15 stages):
+   1. IID Small TrashNet baseline: no bg, batch 16, SimpleCNN
+   2. Background type I: group1
+   3. Background type II: group2
+   4. Background type I+II: both groups
+   5. IID Chinese traffic signs
+   6. IID CIFAR-10
+   7. IID Small TrashNet, batch 4
+   8. IID Small TrashNet, batch 8
+   9. IID Small TrashNet, batch 32
+  10. IID Small TrashNet, ResNet18
+  11. IID Small TrashNet, MobileNetV3-Large
+  12. IID Small TrashNet, Swin-T
+  13. non-IID Small TrashNet
+  14. non-IID Chinese traffic signs
+  15. non-IID CIFAR-10
 
 Common overrides:
   PYTHON=/path/to/venv/bin/python
@@ -457,9 +518,14 @@ Common overrides:
   CLIENT_SELECTION_SEED=260626
   PERF_PROFILE=auto              auto, common, x86, rpi, or jetson
   PERF_ENABLED=0
+  PERF_FPS=50
   LOCAL_EPOCHS=10
   REFERENCE_TRIALS=1
   ANALYSIS_TRIALS=1
+  BASELINE_BATCH_SIZE=16
+  BATCH_SIZE_VARIANTS=4,8,32
+  BASELINE_MODEL=simple_cnn
+  MODEL_VARIANTS=resnet18,mobilenet_v3_large,swin_t
 EOF
 }
 

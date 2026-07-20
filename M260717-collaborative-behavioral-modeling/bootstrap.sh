@@ -29,6 +29,8 @@ readonly ANTIVENOM_REPO_DIR="$(cd -- "${REPO_DIR}/.." && pwd -P)"
 readonly ROBUSTNESS_PROJECT_DIR="${ANTIVENOM_REPO_DIR}/M260718-robustness"
 readonly EXPERIMENT_SETUP="${REPO_DIR}/experiment_setup.sh"
 readonly LOCAL_EXPERIMENT_RUNNER="${REPO_DIR}/run_experiments_local.zsh"
+readonly TRAINING_JOB_RUNNER="${REPO_DIR}/run_training_job.sh"
+readonly STATIC_METADATA_COLLECTOR="${REPO_DIR}/collect_static_metadata.sh"
 
 readonly REQUIREMENTS="${REPO_DIR}/requirements.txt"
 readonly TORCH_REQUIREMENTS="${REPO_DIR}/requirements-torch-cpu.txt"
@@ -37,6 +39,11 @@ readonly READY_FILE="${ROOT}/READY"
 readonly READY_TMP="${ROOT}/READY.tmp"
 readonly FAILED_FILE="${ROOT}/FAILED"
 readonly FAILED_TMP="${ROOT}/FAILED.tmp"
+readonly TRAINING_STATE_DIR="${STATE_DIR}/training"
+readonly TRAINING_LOG_DIR="${LOG_DIR}/local_ml"
+readonly TRAINING_RUNNER_LOG="${TRAINING_LOG_DIR}/runner.log"
+readonly TRAINING_METHODS="${ANTIVENOM_TRAINING_METHODS:-clean,availability_shortcuts}"
+readonly RESTART_TRAINING="${ANTIVENOM_RESTART_TRAINING:-0}"
 
 # 1の場合、perfを利用できなければbootstrapを失敗させる。
 # 必要に応じてprofile.py側から0を設定できる。
@@ -49,7 +56,9 @@ readonly REQUIRE_PERF="${ANTIVENOM_REQUIRE_PERF:-1}"
 
 mkdir -p \
     "${STATE_DIR}" \
+    "${TRAINING_STATE_DIR}" \
     "${LOG_DIR}" \
+    "${TRAINING_LOG_DIR}" \
     "${METADATA_DIR}" \
     "${DATASET_DIR}" \
     "${RESULT_DIR}" \
@@ -154,6 +163,16 @@ if [[ ! -f "${LOCAL_EXPERIMENT_RUNNER}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${TRAINING_JOB_RUNNER}" ]]; then
+    echo "Training job runner not found: ${TRAINING_JOB_RUNNER}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${STATIC_METADATA_COLLECTOR}" ]]; then
+    echo "Static metadata collector not found: ${STATIC_METADATA_COLLECTOR}" >&2
+    exit 1
+fi
+
 if [[ ! -f "${ANTIVENOM_REPO_DIR}/dataset_preparation.py" ]]; then
     echo "Dataset preparation module not found: ${ANTIVENOM_REPO_DIR}/dataset_preparation.py" >&2
     exit 1
@@ -180,12 +199,18 @@ readonly REQUIRED_PACKAGES=(
     git
     jq
     numactl
+    dmidecode
+    ethtool
+    iproute2
+    lm-sensors
+    pciutils
     procps
     python3
     python3-pip
     python3-venv
     util-linux
     linux-tools-common
+    systemd
     iperf3
     zsh
 )
@@ -277,6 +302,17 @@ else
         exit 1
     fi
 fi
+
+
+# ---------------------------------------------------------------------------
+# Static system metadata
+# ---------------------------------------------------------------------------
+
+env \
+    ANTIVENOM_METADATA_DIR="${METADATA_DIR}" \
+    ANTIVENOM_CLUSTER="${ANTIVENOM_CLUSTER:-unknown}" \
+    ANTIVENOM_HARDWARE_TYPE="${ANTIVENOM_HARDWARE_TYPE:-unknown}" \
+    bash "${STATIC_METADATA_COLLECTOR}"
 
 
 # ---------------------------------------------------------------------------
@@ -478,25 +514,82 @@ env \
 
 
 # ---------------------------------------------------------------------------
-# Local robustness experiment
+# Detached local robustness experiment
 #
-# Execute training on this node without SSH. The implementation comes from
-# M260718-robustness, while logs remain under /local/antivenom/logs.
+# CloudLab Execute must finish after provisioning. Training is launched in a
+# separate session and reports its own lifecycle below state/training.
 # ---------------------------------------------------------------------------
 
-env \
-    PYTHON="${VENV}/bin/python" \
-    ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
-    IID_DATA_DIR="${DATASET_DIR}/iid-data" \
-    NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
-    LOG_DIR="${LOG_DIR}/local_ml" \
-    CLIENT_ID="${ANTIVENOM_CLIENT_ID:-}" \
-    CLIENT_SELECTION_SEED="${ANTIVENOM_CLIENT_SELECTION_SEED:-260626}" \
-    HOST_LABEL="${ANTIVENOM_HOST_LABEL:-$(hostname -s)}" \
-    DEVICE_ID="${ANTIVENOM_DEVICE_ID:-$(hostname -s)}" \
-    PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
-    PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
-    zsh "${LOCAL_EXPERIMENT_RUNNER}" run clean,availability_shortcuts
+training_pid=""
+training_status="not_started"
+
+training_process_is_active() {
+    local pid_file="${TRAINING_STATE_DIR}/pid"
+    local pid
+
+    [[ -r "${pid_file}" ]] || return 1
+    pid="$(cat "${pid_file}")"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+
+    training_pid="${pid}"
+    return 0
+}
+
+launch_training() {
+    if training_process_is_active; then
+        training_status="running"
+        echo "Training is already running with PID ${training_pid}; not launching a duplicate."
+        return
+    fi
+
+    if [[ "${RESTART_TRAINING}" != "1" ]]; then
+        if [[ -f "${TRAINING_STATE_DIR}/done" ]]; then
+            training_status="done"
+            echo "Training is already complete; not launching it again."
+            return
+        fi
+        if [[ -f "${TRAINING_STATE_DIR}/failed" ]]; then
+            training_status="failed"
+            echo "A previous training failure is recorded; not launching it again."
+            echo "Set ANTIVENOM_RESTART_TRAINING=1 to retry."
+            return
+        fi
+    fi
+
+    rm -f \
+        "${TRAINING_STATE_DIR}/running" \
+        "${TRAINING_STATE_DIR}/done" \
+        "${TRAINING_STATE_DIR}/failed" \
+        "${TRAINING_STATE_DIR}/pid"
+
+    echo "Launching detached training: methods=${TRAINING_METHODS}"
+    setsid nohup env \
+        ANTIVENOM_ROOT="${ROOT}" \
+        ANTIVENOM_TRAINING_STATE_DIR="${TRAINING_STATE_DIR}" \
+        LOCAL_EXPERIMENT_RUNNER="${LOCAL_EXPERIMENT_RUNNER}" \
+        TRAINING_METHODS="${TRAINING_METHODS}" \
+        PYTHON="${VENV}/bin/python" \
+        ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
+        IID_DATA_DIR="${DATASET_DIR}/iid-data" \
+        NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
+        LOG_DIR="${TRAINING_LOG_DIR}" \
+        CLIENT_ID="${ANTIVENOM_CLIENT_ID:-}" \
+        CLIENT_SELECTION_SEED="${ANTIVENOM_CLIENT_SELECTION_SEED:-260626}" \
+        HOST_LABEL="${ANTIVENOM_HOST_LABEL:-$(hostname -s)}" \
+        DEVICE_ID="${ANTIVENOM_DEVICE_ID:-$(hostname -s)}" \
+        PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
+        PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
+        bash "${TRAINING_JOB_RUNNER}" \
+        </dev/null >>"${TRAINING_RUNNER_LOG}" 2>&1 &
+
+    training_pid=$!
+    training_status="running"
+    echo "Detached training launched with PID ${training_pid}."
+    echo "Training log: ${TRAINING_RUNNER_LOG}"
+}
+
+launch_training
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +607,9 @@ set +x
         "${ANTIVENOM_HARDWARE_TYPE:-unknown}"
     printf 'repository=%s\n' "${REPO_DIR}"
     printf 'requirements_hash=%s\n' "${REQUIREMENTS_HASH}"
+    printf 'training_status=%s\n' "${training_status}"
+    printf 'training_pid=%s\n' "${training_pid}"
+    printf 'training_log=%s\n' "${TRAINING_RUNNER_LOG}"
 } > "${READY_TMP}"
 
 mv -f "${READY_TMP}" "${READY_FILE}"
@@ -523,3 +619,6 @@ rm -f "${FAILED_FILE}" "${FAILED_TMP}"
 
 echo "Bootstrap finished: $(date --iso-8601=seconds)"
 echo "Ready file: ${READY_FILE}"
+echo "Training status: ${training_status}"
+echo "Training state directory: ${TRAINING_STATE_DIR}"
+echo "Training log: ${TRAINING_RUNNER_LOG}"
