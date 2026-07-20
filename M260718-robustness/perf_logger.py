@@ -1,5 +1,6 @@
 import csv
 import os
+import platform
 import re
 import shutil
 import socket
@@ -20,6 +21,19 @@ COMMON_PERF_EVENTS = [
     "context-switches",
     "cpu-migrations",
     "page-faults",
+]
+
+# Keep the default x86 set focused enough to limit PMU multiplexing.  The L1
+# aliases are portable perf hardware-cache events, while the L2 pair is the
+# Intel PMU's direct demand-reference/miss pair available on the CloudLab
+# machines used by this experiment.  LLC events are intentionally excluded:
+# LLC normally means L3 on these systems and must not be interpreted as L2.
+X86_PERF_EVENTS = [
+    *COMMON_PERF_EVENTS,
+    "L1-dcache-loads",
+    "L1-dcache-load-misses",
+    "l2_rqsts.all_demand_references",
+    "l2_rqsts.all_demand_miss",
 ]
 
 RPI_PERF_EVENTS = [
@@ -58,12 +72,18 @@ JETSON_PERF_EVENTS = [
 ]
 
 JETSON_HOSTS = {"192.168.0.141", "192.168.0.142"}
+RPI_HOSTS = {f"192.168.0.{last_octet}" for last_octet in range(112, 122)}
 DEFAULT_PERF_EVENTS = RPI_PERF_EVENTS
 
 
 def default_perf_events_for_host(host: str) -> List[str]:
-    if host.strip() in JETSON_HOSTS:
+    normalized_host = host.strip()
+    if normalized_host in JETSON_HOSTS:
         return list(JETSON_PERF_EVENTS)
+    if normalized_host in RPI_HOSTS:
+        return list(RPI_PERF_EVENTS)
+    if platform.machine().lower() in {"x86_64", "amd64", "i386", "i686"}:
+        return list(X86_PERF_EVENTS)
     return list(RPI_PERF_EVENTS)
 
 
@@ -357,6 +377,7 @@ __all__ = [
     "JETSON_PERF_EVENTS",
     "PerfLogger",
     "RPI_PERF_EVENTS",
+    "X86_PERF_EVENTS",
     "check_perf_available",
     "default_perf_events_for_host",
     "parse_perf_stat_csv_line",

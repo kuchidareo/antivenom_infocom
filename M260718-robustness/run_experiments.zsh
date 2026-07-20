@@ -225,7 +225,7 @@ perf_args_for_python() {
   fi
 }
 
-normalize_fl_methods() {
+normalize_methods() {
   local raw="$1"
   local -a selected
   local token
@@ -239,14 +239,14 @@ normalize_fl_methods() {
         fi
         ;;
       *)
-        print "Unknown FL condition: ${token}" >&2
+        print "Unknown poisoning method: ${token}" >&2
         return 1
         ;;
     esac
   done
 
   if (( ${#selected[@]} == 0 )); then
-    print "No FL attack conditions remain after validation." >&2
+    print "No poisoning methods remain after validation." >&2
     return 1
   fi
   print -- "${(j:,:)selected}"
@@ -465,12 +465,13 @@ prepare_remote_experiment() {
 }
 
 run_model_stages() {
+  local methods="$1"
   local model_name
   for model_name in ${(s:,:)MODEL_VARIANTS}; do
     run_local_ml_stage \
       "model_${model_name}" \
       "$SMALL_TRASHNET_DATASET" \
-      "clean" \
+      "$methods" \
       "0" \
       "$ANALYSIS_TRIALS" \
       "$BASELINE_BATCH_SIZE" \
@@ -480,15 +481,26 @@ run_model_stages() {
 }
 
 run_all_local_ml() {
+  local methods="${1:-$DEFAULT_METHODS}"
+  local base_reference_trials=0
+  local base_analysis_trials="$ANALYSIS_TRIALS"
+  methods="$(normalize_methods "$methods")"
+
+  # Keep the original clean-reference behavior when no attack was requested.
+  if [[ "$methods" == "clean" ]]; then
+    base_reference_trials="$REFERENCE_TRIALS"
+    base_analysis_trials=0
+  fi
+
   prepare_remote_experiment
 
-  # Base clean reference: small_trashnet, no background load, batch size 16.
+  # Base condition. Attack runs use the already collected clean run as baseline.
   run_local_ml_stage \
-    "base_clean" \
+    "base_${methods}" \
     "$SMALL_TRASHNET_DATASET" \
-    "clean" \
-    "$REFERENCE_TRIALS" \
-    "0" \
+    "$methods" \
+    "$base_reference_trials" \
+    "$base_analysis_trials" \
     "$BASELINE_BATCH_SIZE" \
     "$BASELINE_MODEL" \
     "0"
@@ -498,7 +510,7 @@ run_all_local_ml() {
     "group1" \
     "bg_type_i" \
     "$SMALL_TRASHNET_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
     "$BASELINE_BATCH_SIZE" \
@@ -508,7 +520,7 @@ run_all_local_ml() {
     "group2" \
     "bg_type_ii" \
     "$SMALL_TRASHNET_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
     "$BASELINE_BATCH_SIZE" \
@@ -518,7 +530,7 @@ run_all_local_ml() {
     "both" \
     "bg_type_i_plus_ii" \
     "$SMALL_TRASHNET_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
     "$BASELINE_BATCH_SIZE" \
@@ -528,7 +540,7 @@ run_all_local_ml() {
   run_local_ml_stage \
     "dataset_chinese_traffic_sign" \
     "$CHINESE_TRAFFIC_SIGN_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
     "$BASELINE_BATCH_SIZE" \
@@ -538,7 +550,7 @@ run_all_local_ml() {
   run_local_ml_stage \
     "dataset_cifar10" \
     "$CIFAR10_DATASET" \
-    "clean" \
+    "$methods" \
     "0" \
     "$ANALYSIS_TRIALS" \
     "$BASELINE_BATCH_SIZE" \
@@ -555,7 +567,7 @@ run_all_local_ml() {
     run_local_ml_stage \
       "batch_size_${batch_size}" \
       "$SMALL_TRASHNET_DATASET" \
-      "clean" \
+      "$methods" \
       "0" \
       "$ANALYSIS_TRIALS" \
       "$batch_size" \
@@ -564,12 +576,14 @@ run_all_local_ml() {
   done
 
   # Model robustness: vary only the architecture.
-  run_model_stages
+  run_model_stages "$methods"
 }
 
 run_models_only() {
+  local methods="${1:-$DEFAULT_METHODS}"
+  methods="$(normalize_methods "$methods")"
   prepare_remote_experiment
-  run_model_stages
+  run_model_stages "$methods"
 }
 
 run_fl_experiments() {
@@ -577,7 +591,7 @@ run_fl_experiments() {
   local -a active_lines active_ids perf_args
   local device
 
-  methods="$(normalize_fl_methods "$methods")"
+  methods="$(normalize_methods "$methods")"
 
   active_lines=("${(@f)$(reachable_device_lines)}")
   if (( ${#active_lines[@]} == 0 )); then
@@ -654,12 +668,13 @@ usage() {
 Usage:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
-  ./run_experiments.zsh models
-  ./run_experiments.zsh run
-  ./run_experiments.zsh all
+  ./run_experiments.zsh models [poisoning_method]
+  ./run_experiments.zsh run [poisoning_method]
+  ./run_experiments.zsh all [poisoning_method]
 
-Robustness experiment (clean local ML on 192.168.0.141 and 192.168.0.142):
-  1. Base clean: small_trashnet, no bg, batch size 16 (1 reference trial).
+Robustness experiment on 192.168.0.141 and 192.168.0.142:
+  The optional poisoning_method applies to all 12 conditions. Default: clean.
+  1. Base: small_trashnet, no bg, batch size 16 (1 trial).
   2. BG type I: small_trashnet, group1, batch size 16 (1 trial).
   3. BG type II: small_trashnet, group2, batch size 16 (1 trial).
   4. BG type I+II: small_trashnet, both groups, batch size 16 (1 trial).
@@ -675,13 +690,20 @@ Robustness experiment (clean local ML on 192.168.0.141 and 192.168.0.142):
 Examples:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
-  ./run_experiments.zsh models     # resume/run only model conditions
-  ./run_experiments.zsh run
-  ./run_experiments.zsh all
+  ./run_experiments.zsh run availability_shortcuts
+  ./run_experiments.zsh models availability_shortcuts
+  ./run_experiments.zsh run clean
+
+Supported poisoning methods:
+  clean
+  unlearnable_examples
+  availability_shortcuts
+  random_label_flipping
+  target_label_flipping
 
 Environment:
   SSH_PASSWORD=...                 optional if SSH keys are configured
-  REFERENCE_TRIALS=1
+  REFERENCE_TRIALS=1               used by the default clean base condition
   ANALYSIS_TRIALS=1
   LOCAL_EPOCHS=10
   BASELINE_BATCH_SIZE=16
@@ -713,10 +735,10 @@ main() {
       check_bg_workloads
       ;;
     models)
-      run_models_only
+      run_models_only "${1:-$DEFAULT_METHODS}"
       ;;
     run|all)
-      run_all_local_ml
+      run_all_local_ml "${1:-$DEFAULT_METHODS}"
       ;;
     -h|--help|help)
       usage
