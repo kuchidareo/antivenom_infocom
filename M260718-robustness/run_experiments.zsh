@@ -36,6 +36,7 @@ BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-16}"
 BATCH_SIZE_VARIANTS="${BATCH_SIZE_VARIANTS:-4,8,32}"
 BASELINE_MODEL="${BASELINE_MODEL:-simple_cnn}"
 MODEL_VARIANTS="${MODEL_VARIANTS:-resnet18,mobilenet_v3_large,swin_t}"
+AUGMENTATION_VARIANTS="${AUGMENTATION_VARIANTS:-moderate,strong}"
 
 config_value() {
   local name="$1"
@@ -124,6 +125,7 @@ check_remote_environment() {
       test -d '${REMOTE_PROJECT_DIR:h}/iid-data/chinese_trafficsign_dataset'
       cd '$REMOTE_PROJECT_DIR'
       '$REMOTE_PYTHON' -c 'from models import get_model; names = \"simple_cnn,resnet18,mobilenet_v3_large,swin_t\".split(\",\"); assert all(get_model(name, num_classes=6) is not None for name in names); print(\"models\", \",\".join(names))'
+      '$REMOTE_PYTHON' -c 'import subprocess, sys; text = subprocess.check_output([sys.executable, \"running_ml.py\", \"--help\"], text=True); assert \"--augmentation-profile {baseline,moderate,strong}\" in text, \"remote running_ml.py does not support augmentation profiles\"'
       if [ '$PERF_ENABLED' = '1' ]; then
         command -v perf
       fi
@@ -389,6 +391,7 @@ run_local_ml_stage() {
   local batch_size="$6"
   local model_name="$7"
   local use_bg="$8"
+  local augmentation_profile="${9:-baseline}"
 
   local reference_option="--reference-trials '$reference_trials'"
   local trials_option="--trials '$analysis_trials'"
@@ -409,6 +412,7 @@ run_local_ml_stage() {
   print "  methods: ${methods}"
   print "  reference_trials: ${reference_trials}, analysis_trials: ${analysis_trials}"
   print "  model: ${model_name}"
+  print "  augmentation_profile: ${augmentation_profile}"
   print "  local_epochs: ${LOCAL_EPOCHS}, batch_size: ${batch_size}"
   print "  compute_device: cpu (CUDA disabled)"
   print "  bg_noise: ${use_bg}"
@@ -425,6 +429,7 @@ run_local_ml_stage() {
         --device-id '$host' \
         --host '$host' \
         --model '$model_name' \
+        --augmentation-profile '$augmentation_profile' \
         --local-epochs '$LOCAL_EPOCHS' \
         --batch-size '$batch_size' \
         $reference_option \
@@ -477,6 +482,29 @@ run_model_stages() {
       "$BASELINE_BATCH_SIZE" \
       "$model_name" \
       "0"
+  done
+}
+
+run_augmentation_stages() {
+  local augmentation_profile
+  for augmentation_profile in ${(s:,:)AUGMENTATION_VARIANTS}; do
+    case "$augmentation_profile" in
+      moderate|strong) ;;
+      *)
+        print "Invalid augmentation profile in AUGMENTATION_VARIANTS: ${augmentation_profile}" >&2
+        return 1
+        ;;
+    esac
+    run_local_ml_stage \
+      "augmentation_${augmentation_profile}" \
+      "$SMALL_TRASHNET_DATASET" \
+      "clean" \
+      "0" \
+      "$ANALYSIS_TRIALS" \
+      "$BASELINE_BATCH_SIZE" \
+      "$BASELINE_MODEL" \
+      "0" \
+      "$augmentation_profile"
   done
 }
 
@@ -577,6 +605,9 @@ run_all_local_ml() {
 
   # Model robustness: vary only the architecture.
   run_model_stages "$methods"
+
+  # Augmentation robustness: vary only training-time augmentation intensity.
+  run_augmentation_stages
 }
 
 run_models_only() {
@@ -584,6 +615,11 @@ run_models_only() {
   methods="$(normalize_methods "$methods")"
   prepare_remote_experiment
   run_model_stages "$methods"
+}
+
+run_augmentations_only() {
+  prepare_remote_experiment
+  run_augmentation_stages
 }
 
 run_fl_experiments() {
@@ -669,11 +705,13 @@ Usage:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
   ./run_experiments.zsh models [poisoning_method]
+  ./run_experiments.zsh augmentations
   ./run_experiments.zsh run [poisoning_method]
   ./run_experiments.zsh all [poisoning_method]
 
 Robustness experiment on 192.168.0.141 and 192.168.0.142:
-  The optional poisoning_method applies to all 12 conditions. Default: clean.
+  The optional poisoning_method applies to conditions 1-12. Default: clean.
+  Conditions 13-14 always use saved augmentations of clean training images.
   1. Base: small_trashnet, no bg, batch size 16 (1 trial).
   2. BG type I: small_trashnet, group1, batch size 16 (1 trial).
   3. BG type II: small_trashnet, group2, batch size 16 (1 trial).
@@ -686,12 +724,15 @@ Robustness experiment on 192.168.0.141 and 192.168.0.142:
  10. ResNet18: small_trashnet, no bg, batch size 16 (1 trial).
  11. MobileNetV3-Large: small_trashnet, no bg, batch size 16 (1 trial).
  12. Swin-T: small_trashnet, no bg, batch size 16 (1 trial).
+ 13. Moderate augmentation: small_trashnet, no bg, batch size 16 (1 trial).
+ 14. Strong augmentation: small_trashnet, no bg, batch size 16 (1 trial).
 
 Examples:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
   ./run_experiments.zsh run availability_shortcuts
   ./run_experiments.zsh models availability_shortcuts
+  ./run_experiments.zsh augmentations
   ./run_experiments.zsh run clean
 
 Supported poisoning methods:
@@ -710,6 +751,7 @@ Environment:
   BATCH_SIZE_VARIANTS=4,8,32
   BASELINE_MODEL=simple_cnn
   MODEL_VARIANTS=resnet18,mobilenet_v3_large,swin_t
+  AUGMENTATION_VARIANTS=moderate,strong
   BG_WORKLOAD_PROFILE=medium
   BG_WORKLOAD_TEST_DURATION=10
   PERF_ENABLED=1                   collect perf CSV files; use 0 to disable
@@ -736,6 +778,9 @@ main() {
       ;;
     models)
       run_models_only "${1:-$DEFAULT_METHODS}"
+      ;;
+    augmentations)
+      run_augmentations_only
       ;;
     run|all)
       run_all_local_ml "${1:-$DEFAULT_METHODS}"

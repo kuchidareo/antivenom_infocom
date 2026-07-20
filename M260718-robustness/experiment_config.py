@@ -95,6 +95,39 @@ DEFAULT_AUGMENT = {
     "horizontal_flip": True,
     "normalize": True,
 }
+DEFAULT_AUGMENTATION_PROFILE = "baseline"
+DEFAULT_AUGMENTATION_SEED = 260719
+AUGMENTATION_PROFILES = {
+    "baseline": DEFAULT_AUGMENT,
+    "moderate": {
+        "enabled": True,
+        "resize": [224, 224],
+        "random_resized_crop_scale": [0.8, 1.0],
+        "random_resized_crop_ratio": [0.85, 1.18],
+        "horizontal_flip": True,
+        "rotation_degrees": 15,
+        "color_jitter": [0.2, 0.2, 0.2, 0.05],
+        "normalize": True,
+    },
+    "strong": {
+        "enabled": True,
+        "resize": [224, 224],
+        "random_resized_crop_scale": [0.4, 1.0],
+        "random_resized_crop_ratio": [0.6, 1.67],
+        "horizontal_flip": True,
+        "vertical_flip": True,
+        "rotation_degrees": 45,
+        "perspective_distortion": 0.5,
+        "perspective_probability": 0.5,
+        "color_jitter": [0.6, 0.6, 0.6, 0.2],
+        "random_grayscale_probability": 0.2,
+        "gaussian_blur_kernel_size": 9,
+        "gaussian_blur_probability": 0.3,
+        "random_erasing_probability": 0.5,
+        "random_erasing_scale": [0.05, 0.35],
+        "normalize": True,
+    },
+}
 
 CSV_COLUMNS = [
     "timestamp",
@@ -118,6 +151,7 @@ CSV_COLUMNS = [
     "local_epochs",
     "num_rounds",
     "learning_rate",
+    "augmentation_profile",
     "augment_enabled",
     "augment_resize",
     "augment_horizontal_flip",
@@ -176,6 +210,7 @@ CONDITION_COLUMNS = [
     "local_epochs",
     "num_rounds",
     "learning_rate",
+    "augmentation_profile",
     "augment_enabled",
     "augment_resize",
     "augment_horizontal_flip",
@@ -317,7 +352,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device-id", default="")
     parser.add_argument("--client-id", default="client_0")
     parser.add_argument("--host", default="")
-    parser.add_argument("--augment", default=json.dumps(DEFAULT_AUGMENT))
+    parser.add_argument(
+        "--augmentation-profile",
+        choices=tuple(AUGMENTATION_PROFILES),
+        default=DEFAULT_AUGMENTATION_PROFILE,
+    )
+    parser.add_argument(
+        "--augment",
+        default="{}",
+        help="JSON overrides applied after the selected augmentation profile.",
+    )
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--run-role", default="")
@@ -336,8 +380,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def augment_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    augment = dict(DEFAULT_AUGMENT)
+    profile = getattr(args, "augmentation_profile", DEFAULT_AUGMENTATION_PROFILE)
+    if profile not in AUGMENTATION_PROFILES:
+        raise ValueError(
+            f"Unknown augmentation profile {profile!r}; "
+            f"choose one of {', '.join(AUGMENTATION_PROFILES)}"
+        )
+    augment = dict(AUGMENTATION_PROFILES[profile])
     augment.update(parse_json_dict(args.augment))
+    augment["_profile"] = profile
     return augment
 
 
@@ -384,6 +435,9 @@ def condition_columns(
         "local_epochs": getattr(args, "local_epochs", DEFAULT_LOCAL_EPOCHS),
         "num_rounds": getattr(args, "num_rounds", DEFAULT_NUM_ROUNDS),
         "learning_rate": getattr(args, "learning_rate", DEFAULT_LEARNING_RATE),
+        "augmentation_profile": getattr(
+            args, "augmentation_profile", DEFAULT_AUGMENTATION_PROFILE
+        ),
         "augment_enabled": bool(augment.get("enabled", True)),
         "augment_resize": "x".join(str(v) for v in augment.get("resize", [])),
         "augment_horizontal_flip": bool(augment.get("horizontal_flip", False)),

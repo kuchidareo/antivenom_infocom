@@ -1,7 +1,14 @@
 import argparse
 from contextlib import nullcontext
 
-from dataset_preparation import get_dataloader, get_num_classes, get_poison_fraction, prepare_dataset
+from dataset_preparation import (
+    evaluation_augment_from_training,
+    get_dataloader,
+    get_num_classes,
+    get_poison_fraction,
+    prepare_augmentation_variants,
+    prepare_dataset,
+)
 from experiment_config import (
     DEFAULT_LOCAL_ML_LOG_DIR,
     DEFAULT_LOCAL_ML_ANALYSIS_TRIALS,
@@ -43,6 +50,18 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         partition_method=args.partition_method,
         noniid_alpha=args.noniid_alpha,
     )
+    if args.augmentation_profile != "baseline":
+        if poisoning_method != POISONING_METHOD_CLEAN:
+            raise ValueError(
+                "Augmentation profiles are separate clean-data conditions and cannot "
+                f"be combined with poisoning_method={poisoning_method!r}."
+            )
+        prepare_augmentation_variants(
+            data_dir=args.data_dir,
+            dataset_name=args.dataset,
+            profiles=[args.augmentation_profile],
+        )
+        set_all_seeds(args.seed)
     num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     model = get_model(args.model, num_classes=num_classes)
     train_loader = get_dataloader(
@@ -55,8 +74,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         batch_size=args.batch_size,
         shuffle=True,
     )
-    evaluation_augment = dict(augment)
-    evaluation_augment["horizontal_flip"] = False
+    evaluation_augment = evaluation_augment_from_training(augment)
     clean_test_loader = get_dataloader(
         data_dir=args.data_dir,
         dataset_name=args.dataset,

@@ -32,6 +32,42 @@ DEFAULT_AUGMENT = _config_value(
         "normalize": True,
     },
 )
+DEFAULT_AUGMENTATION_PROFILE = _config_value("DEFAULT_AUGMENTATION_PROFILE", "baseline")
+DEFAULT_AUGMENTATION_SEED = _config_value("DEFAULT_AUGMENTATION_SEED", 260719)
+AUGMENTATION_PROFILES = _config_value(
+    "AUGMENTATION_PROFILES",
+    {
+        "baseline": DEFAULT_AUGMENT,
+        "moderate": {
+            "enabled": True,
+            "resize": [224, 224],
+            "random_resized_crop_scale": [0.8, 1.0],
+            "random_resized_crop_ratio": [0.85, 1.18],
+            "horizontal_flip": True,
+            "rotation_degrees": 15,
+            "color_jitter": [0.2, 0.2, 0.2, 0.05],
+            "normalize": True,
+        },
+        "strong": {
+            "enabled": True,
+            "resize": [224, 224],
+            "random_resized_crop_scale": [0.4, 1.0],
+            "random_resized_crop_ratio": [0.6, 1.67],
+            "horizontal_flip": True,
+            "vertical_flip": True,
+            "rotation_degrees": 45,
+            "perspective_distortion": 0.5,
+            "perspective_probability": 0.5,
+            "color_jitter": [0.6, 0.6, 0.6, 0.2],
+            "random_grayscale_probability": 0.2,
+            "gaussian_blur_kernel_size": 9,
+            "gaussian_blur_probability": 0.3,
+            "random_erasing_probability": 0.5,
+            "random_erasing_scale": [0.05, 0.35],
+            "normalize": True,
+        },
+    },
+)
 DEFAULT_AVAILABILITY_SHORTCUT_EPS = _config_value("DEFAULT_AVAILABILITY_SHORTCUT_EPS", 6.0)
 DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = _config_value(
     "DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE", 4
@@ -92,10 +128,19 @@ def augment_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     configured = getattr(_experiment_config, "augment_from_args", None)
     if configured is not None:
         return configured(args)
-    value = getattr(args, "augment", DEFAULT_AUGMENT)
+    profile = getattr(args, "augmentation_profile", DEFAULT_AUGMENTATION_PROFILE)
+    if profile not in AUGMENTATION_PROFILES:
+        raise ValueError(
+            f"Unknown augmentation profile {profile!r}; "
+            f"choose one of {', '.join(AUGMENTATION_PROFILES)}"
+        )
+    augment = dict(AUGMENTATION_PROFILES[profile])
+    value = getattr(args, "augment", "{}")
     if isinstance(value, str):
-        return json.loads(value)
-    return dict(value)
+        value = json.loads(value)
+    augment.update(dict(value))
+    augment["_profile"] = profile
+    return augment
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -108,7 +153,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-clients", type=int, default=DEFAULT_NUM_CLIENTS)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--augment", default=json.dumps(DEFAULT_AUGMENT))
+    parser.add_argument(
+        "--augmentation-profile",
+        choices=tuple(AUGMENTATION_PROFILES),
+        default=DEFAULT_AUGMENTATION_PROFILE,
+    )
+    parser.add_argument(
+        "--augment",
+        default="{}",
+        help="JSON overrides applied after the selected augmentation profile.",
+    )
 
 
 METADATA_NAME = "partition_metadata.csv"
@@ -131,6 +185,8 @@ AVAILABILITY_SHORTCUT_CLASS_SEP = 10.0
 AVAILABILITY_SHORTCUT_REFERENCE_IMAGE_SIZE = 32
 AVAILABILITY_SHORTCUT_JPEG_QUALITY = 100
 AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING = 0
+AUGMENTATION_PROFILE_DIR = "augmented"
+AUGMENTATION_VARIANT_NAMES = ("moderate", "strong")
 
 METADATA_FIELDNAMES = [
     "image_path",
@@ -1323,7 +1379,7 @@ def prepare_dataset(
         and not force
         and set(requested_scenarios) == set(PREPARE_SCENARIOS)
     ):
-        return root
+        return _finalize_prepared_dataset(root)
 
     existing_rows = _read_metadata_rows(root)
     clean_records_from_existing = _clean_records_from_metadata(
@@ -1341,7 +1397,7 @@ def prepare_dataset(
             and (force or not _scenario_complete(root, scenario, existing_rows, num_clients))
         ]
         if not missing_or_requested:
-            return root
+            return _finalize_prepared_dataset(root)
         metadata_rows = [row for row in existing_rows if row.get("poisoning_method") not in set(missing_or_requested)]
         class_names = _class_names_from_records(clean_records_from_existing)
         training_clean_records = [
@@ -1381,7 +1437,7 @@ def prepare_dataset(
                 }
             )
         )
-        return root
+        return _finalize_prepared_dataset(root)
 
     if POISONING_METHOD_CLEAN not in requested_scenarios:
         raise FileNotFoundError(
@@ -1507,7 +1563,122 @@ def prepare_dataset(
             }
         )
     )
+    return _finalize_prepared_dataset(root)
+
+
+def write_augmentation_profile_manifests(root: Path) -> Path:
+    profile_root = root / AUGMENTATION_PROFILE_DIR
+    profile_root.mkdir(parents=True, exist_ok=True)
+    for profile_name in AUGMENTATION_VARIANT_NAMES:
+        profile_dir = profile_root / profile_name
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "profile": profile_name,
+            "application": "materialized_once",
+            "source": "clean_train",
+            "test_augmentation": False,
+            "transform": AUGMENTATION_PROFILES[profile_name],
+        }
+        (profile_dir / "augmentation.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+    return profile_root
+
+
+def _augmented_clean_path(root: Path, profile_name: str, record: Dict[str, Any]) -> Path:
+    return (
+        root
+        / AUGMENTATION_PROFILE_DIR
+        / profile_name
+        / record["client_id"]
+        / record["relative_path"]
+    )
+
+
+def prepare_augmentation_variants(
+    *,
+    data_dir: str,
+    dataset_name: Optional[str] = None,
+    profiles: Sequence[str] = AUGMENTATION_VARIANT_NAMES,
+    seed: int = DEFAULT_AUGMENTATION_SEED,
+    force: bool = False,
+) -> Path:
+    root = _dataset_root(data_dir, dataset_name)
+    rows = _read_metadata_rows(root)
+    clean_training_rows = [
+        dict(row)
+        for row in rows
+        if row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "train"
+    ]
+    if not clean_training_rows:
+        raise FileNotFoundError(
+            f"No clean training records found in {root / METADATA_NAME}"
+        )
+
+    torch, _, _, _ = _require_torch()
+    for profile_name in profiles:
+        if profile_name not in AUGMENTATION_VARIANT_NAMES:
+            raise ValueError(
+                f"Cannot materialize augmentation profile {profile_name!r}; "
+                f"choose from {', '.join(AUGMENTATION_VARIANT_NAMES)}"
+            )
+        profile_dir = root / AUGMENTATION_PROFILE_DIR / profile_name
+        marker_path = profile_dir / PREPARED_MARKER
+        marker = {
+            "dataset": dataset_name or DATASET_NAME,
+            "profile": profile_name,
+            "seed": seed,
+            "source": "clean_train",
+            "num_images": len(clean_training_rows),
+            "transform": AUGMENTATION_PROFILES[profile_name],
+        }
+        marker_matches = False
+        if marker_path.exists() and not force:
+            try:
+                marker_matches = json.loads(marker_path.read_text()) == marker
+            except (json.JSONDecodeError, OSError):
+                marker_matches = False
+            if marker_matches and all(
+                _augmented_clean_path(root, profile_name, record).exists()
+                for record in clean_training_rows
+            ):
+                continue
+
+        materialize_augment = dict(AUGMENTATION_PROFILES[profile_name])
+        materialize_augment["normalize"] = False
+        transform = build_transform(materialize_augment)
+        for record in clean_training_rows:
+            output_path = _augmented_clean_path(root, profile_name, record)
+            if output_path.exists() and not force and not marker_path.exists():
+                continue
+            source_path = _resolve_metadata_image_path(
+                record["image_path"], data_dir, dataset_name
+            )
+            profile_offset = AUGMENTATION_VARIANT_NAMES.index(profile_name) * 1_000_000
+            sample_seed = seed + profile_offset + int(record["source_index"])
+            random.seed(sample_seed)
+            torch.manual_seed(sample_seed)
+            with Image.open(source_path) as source_image:
+                augmented_image = transform(source_image.convert("RGB"))
+            _save_jpeg(_pil_from_tensor(augmented_image), output_path)
+
+        marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    return root / AUGMENTATION_PROFILE_DIR
+
+
+def _finalize_prepared_dataset(root: Path) -> Path:
+    if root.name == dataset_slug(REFERENCE_DATASET_NAME):
+        write_augmentation_profile_manifests(root)
     return root
+
+
+def evaluation_augment_from_training(augment: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "resize": list(augment.get("resize", [224, 224])),
+        "normalize": bool(augment.get("normalize", False)),
+    }
 
 
 def build_transform(augment: Optional[Dict[str, Any]] = None) -> Any:
@@ -1516,11 +1687,57 @@ def build_transform(augment: Optional[Dict[str, Any]] = None) -> Any:
     enabled = bool(augment.get("enabled", True))
     ops: List[Any] = []
     resize = augment.get("resize", [64, 64])
-    if resize:
+    crop_scale = augment.get("random_resized_crop_scale")
+    if enabled and resize and crop_scale:
+        crop_ratio = augment.get("random_resized_crop_ratio", [0.75, 1.3333333333])
+        ops.append(
+            transforms.RandomResizedCrop(
+                tuple(resize),
+                scale=tuple(crop_scale),
+                ratio=tuple(crop_ratio),
+            )
+        )
+    elif resize:
         ops.append(transforms.Resize(tuple(resize)))
     if enabled and augment.get("horizontal_flip", False):
         ops.append(transforms.RandomHorizontalFlip())
+    if enabled and augment.get("vertical_flip", False):
+        ops.append(transforms.RandomVerticalFlip())
+    if enabled and augment.get("rotation_degrees"):
+        ops.append(transforms.RandomRotation(float(augment["rotation_degrees"])))
+    if enabled and augment.get("perspective_distortion"):
+        ops.append(
+            transforms.RandomPerspective(
+                distortion_scale=float(augment["perspective_distortion"]),
+                p=float(augment.get("perspective_probability", 0.5)),
+            )
+        )
+    if enabled and augment.get("color_jitter"):
+        jitter = augment["color_jitter"]
+        ops.append(transforms.ColorJitter(*jitter))
+    if enabled and augment.get("random_grayscale_probability"):
+        ops.append(
+            transforms.RandomGrayscale(
+                p=float(augment["random_grayscale_probability"])
+            )
+        )
+    if enabled and augment.get("gaussian_blur_probability"):
+        blur = transforms.GaussianBlur(
+            kernel_size=int(augment.get("gaussian_blur_kernel_size", 5))
+        )
+        ops.append(
+            transforms.RandomApply(
+                [blur], p=float(augment["gaussian_blur_probability"])
+            )
+        )
     ops.append(transforms.ToTensor())
+    if enabled and augment.get("random_erasing_probability"):
+        ops.append(
+            transforms.RandomErasing(
+                p=float(augment["random_erasing_probability"]),
+                scale=tuple(augment.get("random_erasing_scale", [0.02, 0.33])),
+            )
+        )
     if augment.get("normalize", False):
         ops.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
     return transforms.Compose(ops)
@@ -1534,6 +1751,7 @@ class LocalImageDataset:
         dataset_name: Optional[str] = None,
         client_id: str,
         poisoning_method: str,
+        augmentation_profile: str = DEFAULT_AUGMENTATION_PROFILE,
         split: str = "train",
         transform: Any = None,
     ) -> None:
@@ -1557,6 +1775,7 @@ class LocalImageDataset:
         self.dataset_name = dataset_name
         self.client_id = client_id
         self.poisoning_method = poisoning_method
+        self.augmentation_profile = augmentation_profile
         self.split = split
         self.transform = transform
         self.records = load_metadata_records(
@@ -1566,6 +1785,21 @@ class LocalImageDataset:
             poisoning_method=poisoning_method,
             split=split,
         )
+        if augmentation_profile != DEFAULT_AUGMENTATION_PROFILE and split == "train":
+            if poisoning_method != POISONING_METHOD_CLEAN:
+                raise ValueError(
+                    "Saved augmentation profiles are clean-data conditions and cannot "
+                    f"be combined with poisoning_method={poisoning_method!r}."
+                )
+            root = _dataset_root(data_dir, dataset_name)
+            for record in self.records:
+                augmented_path = _augmented_clean_path(root, augmentation_profile, record)
+                if not augmented_path.exists():
+                    raise FileNotFoundError(
+                        f"Missing saved augmented image: {augmented_path}. "
+                        "Run dataset_preparation.py first."
+                    )
+                record["image_path"] = str(augmented_path)
         self._dataset = _Dataset(self)
 
     def __len__(self) -> int:
@@ -1647,13 +1881,20 @@ def get_dataloader(
     shuffle: bool,
 ) -> Any:
     _, _, DataLoader, _ = _require_torch()
+    augmentation_profile = str(
+        augment.get("_profile", DEFAULT_AUGMENTATION_PROFILE)
+    )
+    loader_augment = augment
+    if augmentation_profile != DEFAULT_AUGMENTATION_PROFILE and split == "train":
+        loader_augment = evaluation_augment_from_training(augment)
     dataset = LocalImageDataset(
         data_dir=data_dir,
         dataset_name=dataset_name,
         client_id=client_id,
         poisoning_method=poisoning_method,
+        augmentation_profile=augmentation_profile,
         split=split,
-        transform=build_transform(augment),
+        transform=build_transform(loader_augment),
     )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
@@ -1723,7 +1964,18 @@ def main() -> None:
         partition_method=args.partition_method,
         noniid_alpha=args.noniid_alpha,
     )
+    has_augmentation_variants = (
+        dataset_slug(args.dataset) == dataset_slug(REFERENCE_DATASET_NAME)
+    )
+    if has_augmentation_variants:
+        prepare_augmentation_variants(
+            data_dir=args.data_dir,
+            dataset_name=args.dataset,
+            force=args.force,
+        )
     print(root)
+    if has_augmentation_variants:
+        print(f"Augmentation profiles: {root / AUGMENTATION_PROFILE_DIR}")
     if args.prune_unreferenced:
         removed = prune_unreferenced_images(
             data_dir=args.data_dir,
