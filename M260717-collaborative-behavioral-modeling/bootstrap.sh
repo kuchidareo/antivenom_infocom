@@ -496,7 +496,7 @@ env \
     DEVICE_ID="${ANTIVENOM_DEVICE_ID:-$(hostname -s)}" \
     PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
     PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
-    zsh "${LOCAL_EXPERIMENT_RUNNER}" run
+    zsh "${LOCAL_EXPERIMENT_RUNNER}" run clean,availability_shortcuts
 
 
 # ---------------------------------------------------------------------------

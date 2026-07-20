@@ -12,6 +12,7 @@ LOCAL_LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/local_ml}"
 SMALL_TRASHNET_DATASET="kuchidareo/small_trashnet"
 CIFAR10_DATASET="uoft-cs/cifar10"
 CHINESE_TRAFFIC_SIGN_DATASET="kuchidareo/chinese_trafficsign_dataset"
+DEFAULT_METHODS="clean"
 
 REFERENCE_TRIALS="${REFERENCE_TRIALS:-1}"
 ANALYSIS_TRIALS="${ANALYSIS_TRIALS:-1}"
@@ -24,7 +25,7 @@ NONIID_ALPHA="${NONIID_ALPHA:-0.3}"
 CLIENT_SELECTION_SEED="${CLIENT_SELECTION_SEED:-260626}"
 
 PERF_ENABLED="${PERF_ENABLED:-1}"
-PERF_FPS=10
+PERF_FPS="${PERF_FPS:-50}"
 PERF_EVENTS="${PERF_EVENTS:-}"
 PERF_PROFILE="${PERF_PROFILE:-auto}"
 
@@ -43,6 +44,33 @@ require_identity() {
     print -u2 "Invalid CLIENT_ID '${FIXED_CLIENT_ID}'; expected client_0 through client_9."
     return 1
   fi
+}
+
+normalize_methods() {
+  local raw="$1"
+  local -a selected
+  local token
+  raw="${raw//,/ }"
+
+  for token in ${(z)raw}; do
+    case "$token" in
+      clean|unlearnable_examples|random_label_flipping|target_label_flipping|availability_shortcuts)
+        if (( ${selected[(Ie)$token]} == 0 )); then
+          selected+=("$token")
+        fi
+        ;;
+      *)
+        print -u2 "Unknown poisoning method: ${token}"
+        return 1
+        ;;
+    esac
+  done
+
+  (( ${#selected[@]} > 0 )) || {
+    print -u2 "No poisoning methods were selected."
+    return 1
+  }
+  print -- "${(j:,:)selected}"
 }
 
 select_client_id() {
@@ -157,15 +185,16 @@ configure_local_perf() {
       elif [[ "$machine" == aarch64 || "$machine" == arm* ]]; then
         selected_profile="rpi"
       else
-        selected_profile="common"
+        selected_profile="x86"
       fi
     fi
     case "$selected_profile" in
       jetson) event_constant="JETSON_PERF_EVENTS" ;;
       rpi) event_constant="RPI_PERF_EVENTS" ;;
+      x86) event_constant="X86_PERF_EVENTS" ;;
       common) event_constant="COMMON_PERF_EVENTS" ;;
       *)
-        print -u2 "Invalid PERF_PROFILE '${PERF_PROFILE}'; expected auto, common, rpi, or jetson."
+        print -u2 "Invalid PERF_PROFILE '${PERF_PROFILE}'; expected auto, common, x86, rpi, or jetson."
         return 1
         ;;
     esac
@@ -258,13 +287,14 @@ start_bg_workloads() {
 run_local_stage() {
   local stage_name="$1"
   local dataset_name="$2"
-  local reference_trials="$3"
-  local analysis_trials="$4"
-  local batch_size="$5"
-  local model_name="$6"
-  local bg_group="${7:-}"
-  local data_root="${8:-$IID_DATA_ROOT}"
-  local partition_method="${9:-iid}"
+  local methods="$3"
+  local reference_trials="$4"
+  local analysis_trials="$5"
+  local batch_size="$6"
+  local model_name="$7"
+  local bg_group="${8:-}"
+  local data_root="${9:-$IID_DATA_ROOT}"
+  local partition_method="${10:-iid}"
   local selected_client_id
   local -a command perf_args bg_args
 
@@ -291,6 +321,7 @@ run_local_stage() {
   print "  dataset: ${dataset_name}"
   print "  data_root: ${data_root}"
   print "  partition_method: ${partition_method}"
+  print "  poisoning_methods: ${methods}"
   print "  model: ${model_name}"
   print "  local_epochs: ${LOCAL_EPOCHS}, batch_size: ${batch_size}"
   print "  reference_trials: ${reference_trials}, analysis_trials: ${analysis_trials}"
@@ -312,7 +343,7 @@ run_local_stage() {
     --noniid-alpha "$NONIID_ALPHA"
     --reference-trials "$reference_trials"
     --trials "$analysis_trials"
-    --poisoning-method clean
+    --poisoning-method "$methods"
     "${perf_args[@]}"
     "${bg_args[@]}"
   )
@@ -334,11 +365,13 @@ run_bg_stage() {
 }
 
 run_model_stages() {
+  local methods="$1"
   local model_name
   for model_name in ${(s:,:)MODEL_VARIANTS}; do
     run_local_stage \
       "model_${model_name}" \
       "$SMALL_TRASHNET_DATASET" \
+      "$methods" \
       "0" \
       "$ANALYSIS_TRIALS" \
       "$BASELINE_BATCH_SIZE" \
@@ -352,26 +385,28 @@ prepare_local_experiment() {
 }
 
 run_all_stages() {
+  local methods="${1:-$DEFAULT_METHODS}"
+  methods="$(normalize_methods "$methods")"
   prepare_local_experiment
 
   run_local_stage "iid_small_trashnet" "$SMALL_TRASHNET_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
   run_local_stage "iid_chinese_traffic_sign" "$CHINESE_TRAFFIC_SIGN_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
   run_local_stage "iid_cifar10" "$CIFAR10_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$IID_DATA_ROOT" "iid"
 
   run_local_stage "noniid_small_trashnet" "$SMALL_TRASHNET_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$NONIID_DATA_ROOT" "dirichlet_noniid"
   run_local_stage "noniid_chinese_traffic_sign" "$CHINESE_TRAFFIC_SIGN_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$NONIID_DATA_ROOT" "dirichlet_noniid"
   run_local_stage "noniid_cifar10" "$CIFAR10_DATASET" \
-    "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
+    "$methods" "0" "$ANALYSIS_TRIALS" "$BASELINE_BATCH_SIZE" "$BASELINE_MODEL" \
     "" "$NONIID_DATA_ROOT" "dirichlet_noniid"
 }
 
@@ -398,14 +433,15 @@ Usage:
   ./run_experiments_local.zsh check
   ./run_experiments_local.zsh plan
   ./run_experiments_local.zsh bg-check
-  ./run_experiments_local.zsh models
-  ./run_experiments_local.zsh run
+  ./run_experiments_local.zsh models [poisoning_methods]
+  ./run_experiments_local.zsh run [poisoning_methods]
 
 This script runs training directly on the current machine. It does not use SSH.
 
 The network address is not used. Each stage reproducibly selects a random
 client_0 through client_9. To force one partition for every stage:
   CLIENT_ID=client_1 ./run_experiments_local.zsh run
+  ./run_experiments_local.zsh run clean,availability_shortcuts
 
 Default run order:
   IID:     small_trashnet, Chinese traffic signs, CIFAR-10
@@ -419,7 +455,7 @@ Common overrides:
   HOST_LABEL=my-host
   DEVICE_ID=my-device
   CLIENT_SELECTION_SEED=260626
-  PERF_PROFILE=auto              auto, common, rpi, or jetson
+  PERF_PROFILE=auto              auto, common, x86, rpi, or jetson
   PERF_ENABLED=0
   LOCAL_EPOCHS=10
   REFERENCE_TRIALS=1
@@ -450,10 +486,10 @@ main() {
       ;;
     models)
       prepare_local_experiment
-      run_model_stages
+      run_model_stages "$(normalize_methods "${2:-$DEFAULT_METHODS}")"
       ;;
     run|all)
-      run_all_stages
+      run_all_stages "${2:-$DEFAULT_METHODS}"
       ;;
     -h|--help|help)
       usage
