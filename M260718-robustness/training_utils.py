@@ -1,9 +1,32 @@
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from hardware_logger import TrainingState
+
+
+@contextmanager
+def training_phase(
+    *,
+    state: TrainingState,
+    phase_perf_logger: Any,
+    round_id: Any,
+    epoch: Any,
+    batch_idx: Any,
+    phase: str,
+) -> Iterator[None]:
+    """Align the shared phase annotation with optional gated perf counters."""
+    state.update(round=round_id, epoch=epoch, batch_idx=batch_idx, phase=phase)
+    if phase_perf_logger is None:
+        yield
+        return
+    try:
+        with phase_perf_logger.measure_phase():
+            yield
+    finally:
+        state.update(phase="idle")
 
 
 def get_device() -> torch.device:
@@ -20,6 +43,7 @@ def train_model(
     round_id: Any = 0,
     metrics_logger: Any = None,
     epoch_end_callback: Optional[Callable[[int], None]] = None,
+    phase_perf_logger: Any = None,
 ) -> Dict[str, float]:
     device = get_device()
     model.to(device)
@@ -37,16 +61,37 @@ def train_model(
         epoch_seen = 0
         for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
-            state.update(round=round_id, epoch=epoch, batch_idx=batch_idx, phase="forward")
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with training_phase(
+                state=state,
+                phase_perf_logger=phase_perf_logger,
+                round_id=round_id,
+                epoch=epoch,
+                batch_idx=batch_idx,
+                phase="forward",
+            ):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
-            state.update(round=round_id, epoch=epoch, batch_idx=batch_idx, phase="backward")
-            optimizer.zero_grad()
-            loss.backward()
+            with training_phase(
+                state=state,
+                phase_perf_logger=phase_perf_logger,
+                round_id=round_id,
+                epoch=epoch,
+                batch_idx=batch_idx,
+                phase="backward",
+            ):
+                optimizer.zero_grad()
+                loss.backward()
 
-            state.update(round=round_id, epoch=epoch, batch_idx=batch_idx, phase="optimizer_step")
-            optimizer.step()
+            with training_phase(
+                state=state,
+                phase_perf_logger=phase_perf_logger,
+                round_id=round_id,
+                epoch=epoch,
+                batch_idx=batch_idx,
+                phase="optimizer_step",
+            ):
+                optimizer.step()
 
             batch_size = labels.size(0)
             batch_correct = int((outputs.argmax(dim=1) == labels).sum().item())
@@ -57,8 +102,10 @@ def train_model(
             epoch_correct += batch_correct
             epoch_seen += batch_size
             if metrics_logger is not None:
+                metric_state = state.snapshot()
+                metric_state["phase"] = "optimizer_step"
                 metrics_logger.write(
-                    state=state.snapshot(),
+                    state=metric_state,
                     metric_event="train_batch",
                     metric_split="train",
                     loss=float(loss.item()),
@@ -105,6 +152,7 @@ def evaluate_model(
     metric_event: str = "eval_summary",
     metric_split: str = "eval",
     condition_overrides: Optional[Dict[str, Any]] = None,
+    phase_perf_logger: Any = None,
 ) -> Dict[str, float]:
     device = get_device()
     model.to(device)
@@ -113,20 +161,28 @@ def evaluate_model(
     total_loss = 0.0
     total_correct = 0
     total_seen = 0
-    state.update(round=round_id, phase="evaluation")
     for batch_idx, (images, labels) in enumerate(data_loader):
-        state.update(round=round_id, batch_idx=batch_idx, phase="evaluation")
         images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        with training_phase(
+            state=state,
+            phase_perf_logger=phase_perf_logger,
+            round_id=round_id,
+            epoch=state.snapshot()["epoch"],
+            batch_idx=batch_idx,
+            phase="evaluation",
+        ):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
         batch_size = labels.size(0)
         total_loss += float(loss.item()) * batch_size
         total_correct += int((outputs.argmax(dim=1) == labels).sum().item())
         total_seen += batch_size
     state.update(round=round_id, phase="idle")
     if metrics_logger is not None:
+        metric_state = state.snapshot()
+        metric_state["phase"] = "evaluation"
         metrics_logger.write(
-            state=state.snapshot(),
+            state=metric_state,
             metric_event=metric_event,
             metric_split=metric_split,
             loss=total_loss / max(total_seen, 1),

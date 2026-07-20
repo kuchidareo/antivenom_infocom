@@ -21,7 +21,12 @@ from experiment_config import (
 from hardware_logger import HardwareLogger, TrainingState
 from metrics_logger import MetricsLogger
 from models import get_model
-from perf_logger import DEFAULT_PERF_EVENTS, PerfLogger, default_perf_events_for_host
+from perf_logger import (
+    DEFAULT_PERF_EVENTS,
+    PhasePerfLogger,
+    PerfLogger,
+    default_perf_events_for_host,
+)
 from training_utils import evaluate_model, train_model
 
 
@@ -87,15 +92,23 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         cpu_freq_sample_ms=args.cpu_freq_sample_ms,
     ) as logger:
         perf_context = nullcontext()
+        phase_perf_logger = None
         if args.enable_perf:
-            perf_context = PerfLogger(
-                log_dir=args.log_dir,
-                condition=condition,
-                training_state=state,
-                path=logger.path.with_name(f"{logger.path.stem}_perf.csv"),
-                events=parse_perf_events(args.perf_events, host=args.host),
-                fps=args.perf_fps,
-            )
+            perf_arguments = {
+                "log_dir": args.log_dir,
+                "condition": condition,
+                "training_state": state,
+                "path": logger.path.with_name(f"{logger.path.stem}_perf.csv"),
+                "events": parse_perf_events(args.perf_events, host=args.host),
+            }
+            if args.perf_mode == "phase":
+                phase_perf_logger = PhasePerfLogger(
+                    **perf_arguments,
+                    excluded_tids=logger.monitoring_thread_ids(),
+                )
+                perf_context = phase_perf_logger
+            else:
+                perf_context = PerfLogger(**perf_arguments, fps=args.perf_fps)
         metrics_logger = MetricsLogger(
             path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
             condition=condition,
@@ -114,9 +127,11 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
                         "dataset_split": "test",
                         "client_partition_id": "all",
                     },
+                    phase_perf_logger=phase_perf_logger,
                 )
                 print(
-                    f"clean_test epoch={epoch} loss={result['loss']:.6f} "
+                    f"train_condition={poisoning_method} eval_dataset=clean_test "
+                    f"epoch={epoch} loss={result['loss']:.6f} "
                     f"accuracy={result['accuracy']:.4f} examples={int(result['num_examples'])}"
                 )
 
@@ -129,6 +144,7 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
                 round_id=0,
                 metrics_logger=metrics_logger,
                 epoch_end_callback=evaluate_clean_test,
+                phase_perf_logger=phase_perf_logger,
             )
     return str(logger.path)
 
@@ -167,6 +183,15 @@ def main() -> None:
         ),
     )
     parser.add_argument("--perf-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--perf-mode",
+        choices=("interval", "phase"),
+        default="interval",
+        help=(
+            "interval samples perf continuously at --perf-fps; phase gates counters "
+            "around each forward, backward, optimizer_step, and evaluation operation."
+        ),
+    )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 

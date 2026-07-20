@@ -579,6 +579,7 @@ launch_training() {
         HOST_LABEL="${ANTIVENOM_HOST_LABEL:-$(hostname -s)}" \
         DEVICE_ID="${ANTIVENOM_DEVICE_ID:-$(hostname -s)}" \
         PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
+        PERF_MODE="${ANTIVENOM_PERF_MODE:-phase}" \
         PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
         bash "${TRAINING_JOB_RUNNER}" \
         </dev/null >>"${TRAINING_RUNNER_LOG}" 2>&1 &

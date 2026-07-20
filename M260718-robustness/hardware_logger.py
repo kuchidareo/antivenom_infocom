@@ -136,6 +136,14 @@ class HardwareLogger:
         if self._cpu_freq_thread is not None:
             self._cpu_freq_thread.join(timeout=5)
 
+    def monitoring_thread_ids(self) -> set[int]:
+        """Return native logger thread IDs so process-wide perf can exclude them."""
+        return {
+            int(thread.native_id)
+            for thread in (self._thread, self._cpu_freq_thread)
+            if thread is not None and thread.native_id is not None
+        }
+
     def _run(self) -> None:
         with self.path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")

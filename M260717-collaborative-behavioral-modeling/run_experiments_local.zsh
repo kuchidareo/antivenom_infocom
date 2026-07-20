@@ -25,6 +25,7 @@ NONIID_ALPHA="${NONIID_ALPHA:-0.3}"
 CLIENT_SELECTION_SEED="${CLIENT_SELECTION_SEED:-260626}"
 
 PERF_ENABLED="${PERF_ENABLED:-1}"
+PERF_MODE="${PERF_MODE:-phase}"
 PERF_FPS="${PERF_FPS:-50}"
 PERF_EVENTS="${PERF_EVENTS:-}"
 PERF_PROFILE="${PERF_PROFILE:-auto}"
@@ -167,6 +168,11 @@ configure_local_perf() {
     return
   fi
 
+  if [[ "$PERF_MODE" != "phase" && "$PERF_MODE" != "interval" ]]; then
+    print -u2 "Invalid PERF_MODE '${PERF_MODE}'; expected phase or interval."
+    return 1
+  fi
+
   print "Configuring kernel.perf_event_paranoid=-1 locally..."
   if (( EUID == 0 )); then
     sysctl kernel.perf_event_paranoid=-1
@@ -204,10 +210,26 @@ configure_local_perf() {
     )"
     print "Detected perf profile: ${selected_profile}"
   fi
-  PERF_EVENTS="$events"
+  local -a supported_events skipped_events
+  local event
+  for event in ${(s:,:)events}; do
+    if perf stat -e "$event" -- true >/dev/null 2>&1; then
+      supported_events+=("$event")
+    else
+      skipped_events+=("$event")
+    fi
+  done
 
-  print "Validating perf events: ${events}"
-  perf stat -e "$events" -- true >/dev/null
+  if (( ${#skipped_events[@]} > 0 )); then
+    print -u2 "Warning: skipping unsupported perf events on this device: ${(j:,:)skipped_events}"
+  fi
+  if (( ${#supported_events[@]} == 0 )); then
+    print -u2 "None of the requested perf events are supported on this device."
+    return 1
+  fi
+
+  PERF_EVENTS="${(j:,:)supported_events}"
+  print "Validated perf events: ${PERF_EVENTS}"
 }
 
 bg_group_needs_opencv() {
@@ -301,7 +323,12 @@ run_local_stage() {
   selected_client_id="$(select_client_id "$stage_name")"
 
   if [[ "$PERF_ENABLED" == "1" ]]; then
-    perf_args=(--enable-perf --perf-fps "$PERF_FPS" --perf-events "$PERF_EVENTS")
+    perf_args=(
+      --enable-perf
+      --perf-mode "$PERF_MODE"
+      --perf-fps "$PERF_FPS"
+      --perf-events "$PERF_EVENTS"
+    )
   else
     perf_args=(--disable-perf)
   fi
@@ -326,6 +353,11 @@ run_local_stage() {
   print "  local_epochs: ${LOCAL_EPOCHS}, batch_size: ${batch_size}"
   print "  reference_trials: ${reference_trials}, analysis_trials: ${analysis_trials}"
   print "  compute_device: cpu (CUDA disabled)"
+  if [[ "$PERF_MODE" == "interval" ]]; then
+    print "  perf: interval at ${PERF_FPS} FPS"
+  else
+    print "  perf: phase-gated (one counter row per operation)"
+  fi
   print "  bg_noise: ${bg_group:-none}"
 
   command=(
@@ -517,8 +549,10 @@ Common overrides:
   DEVICE_ID=my-device
   CLIENT_SELECTION_SEED=260626
   PERF_PROFILE=auto              auto, common, x86, rpi, or jetson
+  PERF_MODE=phase                phase (default) or interval
+                                unsupported events are skipped per device
   PERF_ENABLED=0
-  PERF_FPS=50
+  PERF_FPS=50                    used only by interval mode
   LOCAL_EPOCHS=10
   REFERENCE_TRIALS=1
   ANALYSIS_TRIALS=1
