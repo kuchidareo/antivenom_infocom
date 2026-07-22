@@ -9,7 +9,7 @@ SSH_PASSWORD="${SSH_PASSWORD:-}"
 SMALL_TRASHNET_DATASET="kuchidareo/small_trashnet"
 CIFAR10_DATASET="uoft-cs/cifar10"
 CHINESE_TRAFFIC_SIGN_DATASET="kuchidareo/chinese_trafficsign_dataset"
-DEFAULT_METHODS="clean"
+DEFAULT_METHODS="clean,availability_shortcuts"
 DEFAULT_FL_METHODS="clean,unlearnable_examples,availability_shortcuts,random_label_flipping"
 FL_DATASET="${FL_DATASET:-$SMALL_TRASHNET_DATASET}"
 FL_POISONED_CLIENT_COUNTS="${FL_POISONED_CLIENT_COUNTS:-1,4,7,10}"
@@ -488,6 +488,7 @@ run_model_stages() {
 }
 
 run_augmentation_stages() {
+  local methods="$1"
   local augmentation_profile
   for augmentation_profile in ${(s:,:)AUGMENTATION_VARIANTS}; do
     case "$augmentation_profile" in
@@ -500,7 +501,7 @@ run_augmentation_stages() {
     run_local_ml_stage \
       "augmentation_${augmentation_profile}" \
       "$SMALL_TRASHNET_DATASET" \
-      "clean" \
+      "$methods" \
       "0" \
       "$ANALYSIS_TRIALS" \
       "$BASELINE_BATCH_SIZE" \
@@ -622,7 +623,7 @@ run_all_local_ml() {
   run_model_stages "$methods"
 
   # Augmentation robustness: vary only training-time augmentation intensity.
-  run_augmentation_stages
+  run_augmentation_stages "$methods"
 }
 
 run_models_only() {
@@ -633,8 +634,10 @@ run_models_only() {
 }
 
 run_augmentations_only() {
+  local methods="${1:-$DEFAULT_METHODS}"
+  methods="$(normalize_methods "$methods")"
   prepare_remote_experiment
-  run_augmentation_stages
+  run_augmentation_stages "$methods"
 }
 
 run_fl_experiments() {
@@ -720,36 +723,37 @@ Usage:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
   ./run_experiments.zsh models [poisoning_method]
-  ./run_experiments.zsh augmentations
+  ./run_experiments.zsh augmentations [poisoning_method]
   ./run_experiments.zsh run [poisoning_method]
   ./run_experiments.zsh all [poisoning_method]
 
 Robustness experiment on 192.168.0.141 and 192.168.0.142:
-  The optional poisoning_method applies to the general robustness conditions. Default: clean.
+  The optional poisoning_method applies to all robustness conditions except the
+  dedicated BadSampler stage. Default: clean,availability_shortcuts.
   The dedicated BadSampler condition is skipped if badsampling is already selected.
-  Conditions 14-15 always use saved augmentations of clean training images.
-  1. Base: small_trashnet, no bg, batch size 16 (1 trial).
-  2. BG type I: small_trashnet, group1, batch size 16 (1 trial).
-  3. BG type II: small_trashnet, group2, batch size 16 (1 trial).
-  4. BG type I+II: small_trashnet, both groups, batch size 16 (1 trial).
-  5. Chinese traffic signs, no bg, batch size 16 (1 trial).
-  6. CIFAR-10, no bg, batch size 16 (1 trial).
+  Conditions 14-15 use the selected clean/poisoning methods with moderate or strong augmentation.
+  1. Base: small_trashnet, no bg, batch size 16 (1 trial per method).
+  2. BG type I: small_trashnet, group1, batch size 16 (1 trial per method).
+  3. BG type II: small_trashnet, group2, batch size 16 (1 trial per method).
+  4. BG type I+II: small_trashnet, both groups, batch size 16 (1 trial per method).
+  5. Chinese traffic signs, no bg, batch size 16 (1 trial per method).
+  6. CIFAR-10, no bg, batch size 16 (1 trial per method).
   7. BadSampler: small_trashnet, no bg, batch size 16, SimpleCNN (1 trial).
-  8. small_trashnet, no bg, batch size 4 (1 trial).
-  9. small_trashnet, no bg, batch size 8 (1 trial).
- 10. small_trashnet, no bg, batch size 32 (1 trial).
- 11. ResNet18: small_trashnet, no bg, batch size 16 (1 trial).
- 12. MobileNetV3-Small: small_trashnet, no bg, batch size 16 (1 trial).
- 13. Swin-T: small_trashnet, no bg, batch size 16 (1 trial).
- 14. Moderate augmentation: small_trashnet, no bg, batch size 16 (1 trial).
- 15. Strong augmentation: small_trashnet, no bg, batch size 16 (1 trial).
+  8. small_trashnet, no bg, batch size 4 (1 trial per method).
+  9. small_trashnet, no bg, batch size 8 (1 trial per method).
+ 10. small_trashnet, no bg, batch size 32 (1 trial per method).
+ 11. ResNet18: small_trashnet, no bg, batch size 16 (1 trial per method).
+ 12. MobileNetV3-Small: small_trashnet, no bg, batch size 16 (1 trial per method).
+ 13. Swin-T: small_trashnet, no bg, batch size 16 (1 trial per method).
+ 14. Moderate augmentation: small_trashnet, no bg, batch size 16 (1 trial per method).
+ 15. Strong augmentation: small_trashnet, no bg, batch size 16 (1 trial per method).
 
 Examples:
   ./run_experiments.zsh check
   ./run_experiments.zsh bg-check
   ./run_experiments.zsh run availability_shortcuts
   ./run_experiments.zsh models availability_shortcuts
-  ./run_experiments.zsh augmentations
+  ./run_experiments.zsh augmentations clean,availability_shortcuts
   ./run_experiments.zsh run clean
 
 Supported poisoning methods:
@@ -762,7 +766,7 @@ Supported poisoning methods:
 
 Environment:
   SSH_PASSWORD=...                 optional if SSH keys are configured
-  REFERENCE_TRIALS=1               used by the default clean base condition
+  REFERENCE_TRIALS=1               used only for an explicit clean-only base run
   ANALYSIS_TRIALS=1
   LOCAL_EPOCHS=10
   BASELINE_BATCH_SIZE=16
@@ -799,7 +803,7 @@ main() {
       run_models_only "${1:-$DEFAULT_METHODS}"
       ;;
     augmentations)
-      run_augmentations_only
+      run_augmentations_only "${1:-$DEFAULT_METHODS}"
       ;;
     run|all)
       run_all_local_ml "${1:-$DEFAULT_METHODS}"
