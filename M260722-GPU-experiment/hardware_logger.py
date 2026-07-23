@@ -116,6 +116,11 @@ class HardwareLogger:
 
     def start(self) -> None:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        # Create the file synchronously so permission failures stop the run
+        # before training starts instead of being hidden in the logger thread.
+        with self.path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
         self._process.cpu_percent(interval=None)
         psutil.cpu_percent(interval=None, percpu=True)
         if self.cpu_freq_interval > 0:
@@ -137,9 +142,8 @@ class HardwareLogger:
             self._cpu_freq_thread.join(timeout=5)
 
     def _run(self) -> None:
-        with self.path.open("w", newline="") as f:
+        with self.path.open("a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-            writer.writeheader()
             while not self._stop_event.is_set():
                 writer.writerow(self._sample())
                 f.flush()

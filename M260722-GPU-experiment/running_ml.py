@@ -1,5 +1,8 @@
 import argparse
 from contextlib import nullcontext
+from pathlib import Path
+
+import torch
 
 from dataset_preparation import get_dataloader, get_num_classes, get_poison_fraction, prepare_dataset
 from experiment_config import (
@@ -126,6 +129,33 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
                     f"clean_test epoch={epoch} loss={result['loss']:.6f} "
                     f"accuracy={result['accuracy']:.4f} examples={int(result['num_examples'])}"
                 )
+                if args.save_epoch_checkpoints:
+                    checkpoint_dir = Path(
+                        args.checkpoint_dir or Path(args.log_dir) / "ncu_checkpoints"
+                    )
+                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    checkpoint_path = checkpoint_dir / (
+                        f"{poisoning_method}_{args.trial_id}_epoch_{epoch}.pt"
+                    )
+                    torch.save(
+                        {
+                            "model_state_dict": {
+                                key: value.detach().cpu()
+                                for key, value in model.state_dict().items()
+                            },
+                            "model": args.model,
+                            "num_classes": num_classes,
+                            "seed": args.seed,
+                            "epoch": epoch,
+                            "condition": poisoning_method,
+                            "dataset": args.dataset,
+                            "client_id": args.client_id,
+                            "batch_size": args.batch_size,
+                            "augment": augment,
+                        },
+                        checkpoint_path,
+                    )
+                    print(f"saved_epoch_checkpoint={checkpoint_path}")
 
             train_model(
                 model=model,
@@ -175,6 +205,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--perf-fps", type=float, default=10.0)
+    parser.add_argument(
+        "--save-epoch-checkpoints",
+        action="store_true",
+        help="Save one model checkpoint after every local epoch for NCU replay.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="",
+        help="Epoch-checkpoint directory (default: <log-dir>/ncu_checkpoints).",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
 

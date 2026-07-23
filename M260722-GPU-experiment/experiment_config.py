@@ -79,8 +79,7 @@ ATTACK_NAME_BY_POISONING_METHOD = {
 }
 
 DEVICES = [
-    {"client_id": "client_1", "host": "192.168.0.141"},
-    {"client_id": "client_2", "host": "192.168.0.142"},
+    {"client_id": "client_1", "host": "192.168.0.144"},
 ]
 
 DEFAULT_AUGMENT = {
