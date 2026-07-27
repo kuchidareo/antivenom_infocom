@@ -24,6 +24,7 @@ def train_model(
     training_sequence: str = "",
     stage_index: Any = "",
     input_poisoning_method: str = "",
+    input_augmentation_profile: str = "",
     model_state_condition: str = "",
     epoch_end_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, float]:
@@ -53,6 +54,7 @@ def train_model(
                 stage_index=stage_index,
                 stage_epoch=stage_epoch,
                 input_poisoning_method=input_poisoning_method,
+                input_augmentation_profile=input_augmentation_profile,
                 model_state_condition=model_state_condition,
             )
             outputs = model(images)

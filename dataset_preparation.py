@@ -2749,7 +2749,11 @@ def main() -> None:
         partition_method=args.partition_method,
         noniid_alpha=args.noniid_alpha,
     )
-    has_augmentation_variants = _materialized_augmentation_supported(args.dataset)
+    requested_scenarios = _parse_prepare_scenarios(args.prepare_scenarios)
+    has_augmentation_variants = (
+        _materialized_augmentation_supported(args.dataset)
+        and POISONING_METHOD_CLEAN in requested_scenarios
+    )
     if has_augmentation_variants:
         prepare_augmentation_variants(
             data_dir=args.data_dir,

@@ -33,12 +33,14 @@ PERF_PROFILE="${PERF_PROFILE:-auto}"
 BG_WORKLOAD_PROFILE="${BG_WORKLOAD_PROFILE:-medium}"
 BG_WORKLOAD_TEST_DURATION="${BG_WORKLOAD_TEST_DURATION:-10}"
 BG_WORKLOAD_PID_FILE="${BG_WORKLOAD_PID_FILE:-/tmp/antivenom_robustness_bg.pid}"
-BG_WORKLOAD_OUTPUT="${SCRIPT_DIR}/logs/bg_workloads/run_bg_workloads.out"
+BG_WORKLOAD_OUTPUT="${LOCAL_LOG_DIR}/bg_workloads/run_bg_workloads.out"
+BG_WORKLOAD_CHECK_DIR="${ANTIVENOM_BG_CHECK_DIR:-${ANTIVENOM_ROOT:-/local/antivenom}/state/bg-workload-checks}"
 BG_WORKLOAD_CHECKED_GROUPS=""
 
 RUN_HOST="${HOST_LABEL:-$(hostname)}"
 RUN_DEVICE_ID="${DEVICE_ID:-$RUN_HOST}"
 FIXED_CLIENT_ID="${CLIENT_ID:-}"
+REQUIRED_DATASETS_CSV="${REQUIRED_DATASETS_CSV:-}"
 
 require_identity() {
   if [[ -n "$FIXED_CLIENT_ID" && "$FIXED_CLIENT_ID" != client_<0-9> ]]; then
@@ -128,8 +130,18 @@ check_local_environment() {
   "$PYTHON_BIN" -c 'import datasets, numpy, PIL, psutil, torch, torchvision; print("Python dependencies: ok")'
 
   local data_root dataset_name dataset_path
+  local -a datasets_to_check
+  if [[ -n "$REQUIRED_DATASETS_CSV" ]]; then
+    datasets_to_check=("${(@s:,:)REQUIRED_DATASETS_CSV}")
+  else
+    datasets_to_check=(
+      "$SMALL_TRASHNET_DATASET"
+      "$CHINESE_TRAFFIC_SIGN_DATASET"
+      "$CIFAR10_DATASET"
+    )
+  fi
   for data_root in "$IID_DATA_ROOT" "$NONIID_DATA_ROOT"; do
-    for dataset_name in "$SMALL_TRASHNET_DATASET" "$CHINESE_TRAFFIC_SIGN_DATASET" "$CIFAR10_DATASET"; do
+    for dataset_name in "${datasets_to_check[@]}"; do
       dataset_path="${data_root}/$(dataset_dir_name "$dataset_name")"
       test -d "$dataset_path" || {
         print -u2 "Missing prepared dataset: ${dataset_path}"
@@ -238,7 +250,11 @@ bg_group_needs_opencv() {
 
 check_bg_group() {
   local group="$1"
+  local check_marker="${BG_WORKLOAD_CHECK_DIR}/${group}-${BG_WORKLOAD_PROFILE}.done"
   if [[ ",${BG_WORKLOAD_CHECKED_GROUPS}," == *",${group},"* ]]; then
+    return
+  fi
+  if [[ -f "$check_marker" ]]; then
     return
   fi
 
@@ -262,6 +278,10 @@ check_bg_group() {
     --profile "$BG_WORKLOAD_PROFILE" \
     --test \
     --duration-sec "$BG_WORKLOAD_TEST_DURATION"
+
+  mkdir -p "$BG_WORKLOAD_CHECK_DIR"
+  print "checked_at=$(date --iso-8601=seconds)" >"${check_marker}.tmp.$$"
+  mv -f "${check_marker}.tmp.$$" "$check_marker"
 
   if [[ -n "$BG_WORKLOAD_CHECKED_GROUPS" ]]; then
     BG_WORKLOAD_CHECKED_GROUPS+=",${group}"
@@ -388,10 +408,22 @@ run_local_stage() {
 run_bg_stage() {
   local group="$1"
   shift
+  local stage_name="$1"
+  local dataset_name="$2"
+  local methods="$3"
+  local reference_trials="$4"
+  local analysis_trials="$5"
+  local batch_size="$6"
+  local model_name="$7"
+  local data_root="${8:-$IID_DATA_ROOT}"
+  local partition_method="${9:-iid}"
   local run_exit_code=0
 
   start_bg_workloads "$group"
-  run_local_stage "$@" "$group" || run_exit_code=$?
+  run_local_stage \
+    "$stage_name" "$dataset_name" "$methods" \
+    "$reference_trials" "$analysis_trials" "$batch_size" "$model_name" \
+    "$group" "$data_root" "$partition_method" || run_exit_code=$?
   stop_bg_workloads
   return "$run_exit_code"
 }
@@ -428,6 +460,107 @@ run_batch_size_stages() {
       "$batch_size" \
       "$BASELINE_MODEL"
   done
+}
+
+context_json_value() {
+  local context_file="$1"
+  local expression="$2"
+  jq -er "$expression" "$context_file"
+}
+
+run_context_file() {
+  local context_file="$1"
+  local methods="$2"
+
+  test -f "$context_file" || {
+    print -u2 "Context file does not exist: ${context_file}"
+    return 1
+  }
+  command -v jq >/dev/null || {
+    print -u2 "jq is required to execute a campaign context."
+    return 1
+  }
+
+  local stage_name dataset_name model_name partition_method bg_group
+  local batch_size local_epochs reference_trials analysis_trials context_seed
+  local input_size pruning_method memory_format mkldnn_enabled data_root
+
+  stage_name="$(context_json_value "$context_file" '.stage_name')"
+  dataset_name="$(context_json_value "$context_file" '.dataset')"
+  model_name="$(context_json_value "$context_file" '.model')"
+  partition_method="$(context_json_value "$context_file" '.partition_method')"
+  bg_group="$(context_json_value "$context_file" '.background_workload')"
+  batch_size="$(context_json_value "$context_file" '.batch_size')"
+  local_epochs="$(context_json_value "$context_file" '.local_epochs')"
+  reference_trials="$(context_json_value "$context_file" '.reference_trials')"
+  analysis_trials="$(context_json_value "$context_file" '.analysis_trials')"
+  context_seed="$(context_json_value "$context_file" '.seed')"
+  input_size="$(context_json_value "$context_file" '.input_size')"
+  pruning_method="$(context_json_value "$context_file" '.pruning.method // "none"')"
+  memory_format="$(context_json_value "$context_file" '.memory_format // "contiguous"')"
+  mkldnn_enabled="$(context_json_value "$context_file" 'if has("mkldnn_enabled") then .mkldnn_enabled else true end')"
+
+  # The current prepared datasets are resized to 224x224 and running_ml.py has
+  # no pruning/memory-format command line yet. Reject unsupported contexts
+  # instead of silently recording a context that was not actually executed.
+  [[ "$input_size" == "224" ]] || {
+    print -u2 "Context requests input_size=${input_size}, but only 224 is implemented."
+    return 2
+  }
+  [[ "$pruning_method" == "none" ]] || {
+    print -u2 "Context requests pruning=${pruning_method}, which is not integrated yet."
+    return 2
+  }
+  [[ "$memory_format" == "contiguous" ]] || {
+    print -u2 "Context requests memory_format=${memory_format}, which is not integrated yet."
+    return 2
+  }
+  [[ "$mkldnn_enabled" == "true" ]] || {
+    print -u2 "Context requests mkldnn_enabled=${mkldnn_enabled}, which is not integrated yet."
+    return 2
+  }
+
+  case "$partition_method" in
+    iid)
+      data_root="$IID_DATA_ROOT"
+      ;;
+    dirichlet_noniid)
+      data_root="$NONIID_DATA_ROOT"
+      ;;
+    *)
+      print -u2 "Unsupported context partition_method: ${partition_method}"
+      return 2
+      ;;
+  esac
+
+  if [[ "$bg_group" == "none" ]]; then
+    bg_group=""
+  fi
+
+  methods="$(normalize_methods "$methods")"
+  LOCAL_EPOCHS="$local_epochs"
+  CLIENT_SELECTION_SEED="$context_seed"
+  export ANTIVENOM_CONTEXT_SEED="$context_seed"
+
+  if [[ -n "$bg_group" ]]; then
+    run_bg_stage "$bg_group" \
+      "$stage_name" "$dataset_name" "$methods" \
+      "$reference_trials" "$analysis_trials" "$batch_size" "$model_name" \
+      "$data_root" "$partition_method"
+  else
+    run_local_stage \
+      "$stage_name" "$dataset_name" "$methods" \
+      "$reference_trials" "$analysis_trials" "$batch_size" "$model_name" \
+      "" "$data_root" "$partition_method"
+  fi
+}
+
+run_campaign_context() {
+  local context_file="$1"
+  local methods="${2:-$DEFAULT_METHODS}"
+  REQUIRED_DATASETS_CSV="$(context_json_value "$context_file" '.dataset')"
+  prepare_local_experiment
+  run_context_file "$context_file" "$methods"
 }
 
 prepare_local_experiment() {
@@ -510,18 +643,19 @@ print_experiment_plan() {
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_experiments_local.zsh check
-  ./run_experiments_local.zsh plan
-  ./run_experiments_local.zsh bg-check
-  ./run_experiments_local.zsh models [poisoning_methods]
-  ./run_experiments_local.zsh run [poisoning_methods]
+  ./run_experiment_local.zsh check
+  ./run_experiment_local.zsh plan
+  ./run_experiment_local.zsh bg-check
+  ./run_experiment_local.zsh models [poisoning_methods]
+  ./run_experiment_local.zsh run [poisoning_methods]
+  ./run_experiment_local.zsh context context.json [poisoning_methods]
 
 This script runs training directly on the current machine. It does not use SSH.
 
 The network address is not used. Each stage reproducibly selects a random
 client_0 through client_9. To force one partition for every stage:
-  CLIENT_ID=client_1 ./run_experiments_local.zsh run
-  ./run_experiments_local.zsh run clean,availability_shortcuts
+  CLIENT_ID=client_1 ./run_experiment_local.zsh run
+  ./run_experiment_local.zsh run clean,availability_shortcuts
 
 Default run order (15 stages):
    1. IID Small TrashNet baseline: no bg, batch 16, SimpleCNN
@@ -587,6 +721,14 @@ main() {
     models)
       prepare_local_experiment
       run_model_stages "$(normalize_methods "${2:-$DEFAULT_METHODS}")"
+      ;;
+    context)
+      (( $# >= 2 )) || {
+        print -u2 "context mode requires a context JSON file"
+        usage >&2
+        return 2
+      }
+      run_campaign_context "$2" "${3:-$DEFAULT_METHODS}"
       ;;
     run|all)
       run_all_stages "${2:-$DEFAULT_METHODS}"

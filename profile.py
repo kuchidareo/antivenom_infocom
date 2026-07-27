@@ -13,6 +13,8 @@ If bootstrap fails, inspect:
   /local/antivenom/logs/bootstrap.log
 """
 
+import re
+
 import geni.portal as portal
 import geni.rspec.pg as pg
 
@@ -149,6 +151,17 @@ pc.defineParameter(
     "xl170,c6525-25g",
 )
 
+pc.defineParameter(
+    "campaign_id",
+    (
+        "Optional campaign directory below "
+        "M260717-collaborative-behavioral-modeling/campaigns. "
+        "Leave empty to use the existing fixed experiment plan."
+    ),
+    portal.ParameterType.STRING,
+    "",
+)
+
 params = pc.bindParameters()
 
 
@@ -157,6 +170,7 @@ params = pc.bindParameters()
 # ---------------------------------------------------------------------------
 
 cluster = params.cluster.strip().lower()
+campaign_id = params.campaign_id.strip()
 
 selected_hardware_types = [
     hardware_type.strip()
@@ -195,6 +209,18 @@ if len(selected_hardware_types) > MAX_NODES:
         portal.ParameterError(
             "At most {} nodes may be requested".format(MAX_NODES),
             ["hardware_types"],
+        )
+    )
+
+
+if campaign_id and not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", campaign_id):
+    pc.reportError(
+        portal.ParameterError(
+            (
+                "campaign_id may contain only letters, digits, '.', '_' "
+                "and '-'"
+            ),
+            ["campaign_id"],
         )
     )
 
@@ -258,10 +284,14 @@ for index, hardware_type in enumerate(selected_hardware_types):
         "sudo -n env "
         "ANTIVENOM_CLUSTER='{cluster}' "
         "ANTIVENOM_HARDWARE_TYPE='{hardware_type}' "
+        "ANTIVENOM_NODE_ID='{node_name}' "
+        "ANTIVENOM_CAMPAIGN_ID='{campaign_id}' "
         "/bin/bash '{bootstrap}'"
     ).format(
         cluster=cluster,
         hardware_type=hardware_type,
+        node_name=node_name,
+        campaign_id=campaign_id,
         bootstrap=BOOTSTRAP,
     )
 

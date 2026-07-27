@@ -28,7 +28,7 @@ readonly REPO_DIR="$(
 readonly ANTIVENOM_REPO_DIR="$(cd -- "${REPO_DIR}/.." && pwd -P)"
 readonly ROBUSTNESS_PROJECT_DIR="${ANTIVENOM_REPO_DIR}/M260718-robustness"
 readonly EXPERIMENT_SETUP="${REPO_DIR}/experiment_setup.sh"
-readonly LOCAL_EXPERIMENT_RUNNER="${REPO_DIR}/run_experiments_local.zsh"
+readonly LOCAL_EXPERIMENT_RUNNER="${REPO_DIR}/run_experiment_local.zsh"
 readonly TRAINING_JOB_RUNNER="${REPO_DIR}/run_training_job.sh"
 readonly STATIC_METADATA_COLLECTOR="${REPO_DIR}/collect_static_metadata.sh"
 
@@ -44,6 +44,13 @@ readonly TRAINING_LOG_DIR="${LOG_DIR}/local_ml"
 readonly TRAINING_RUNNER_LOG="${TRAINING_LOG_DIR}/runner.log"
 readonly TRAINING_METHODS="${ANTIVENOM_TRAINING_METHODS:-clean,availability_shortcuts}"
 readonly RESTART_TRAINING="${ANTIVENOM_RESTART_TRAINING:-0}"
+readonly CAMPAIGN_ID="${ANTIVENOM_CAMPAIGN_ID:-}"
+CAMPAIGN_MANIFEST="${ANTIVENOM_CAMPAIGN_MANIFEST:-}"
+if [[ -z "${CAMPAIGN_MANIFEST}" && -n "${CAMPAIGN_ID}" ]]; then
+    CAMPAIGN_MANIFEST="${REPO_DIR}/campaigns/${CAMPAIGN_ID}/manifest.json"
+fi
+readonly CAMPAIGN_MANIFEST
+readonly CAMPAIGN_PACKAGE="${REPO_DIR}/antivenom_campaign"
 
 # 1の場合、perfを利用できなければbootstrapを失敗させる。
 # 必要に応じてprofile.py側から0を設定できる。
@@ -171,6 +178,22 @@ fi
 if [[ ! -f "${STATIC_METADATA_COLLECTOR}" ]]; then
     echo "Static metadata collector not found: ${STATIC_METADATA_COLLECTOR}" >&2
     exit 1
+fi
+
+if [[ -n "${CAMPAIGN_ID}" && ! "${CAMPAIGN_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "Invalid ANTIVENOM_CAMPAIGN_ID: ${CAMPAIGN_ID}" >&2
+    exit 1
+fi
+
+if [[ -n "${CAMPAIGN_MANIFEST}" ]]; then
+    if [[ ! -f "${CAMPAIGN_MANIFEST}" ]]; then
+        echo "Campaign manifest not found: ${CAMPAIGN_MANIFEST}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${CAMPAIGN_PACKAGE}/execute.py" ]]; then
+        echo "Campaign package not found: ${CAMPAIGN_PACKAGE}" >&2
+        exit 1
+    fi
 fi
 
 if [[ ! -f "${ANTIVENOM_REPO_DIR}/dataset_preparation.py" ]]; then
@@ -328,8 +351,10 @@ if [[ ! -x "${VENV}/bin/python" ]]; then
 fi
 
 readonly REQUIREMENTS_HASH="$(
-    sha256sum "${REQUIREMENTS}" |
-        awk '{print $1}'
+    {
+        sha256sum "${REQUIREMENTS}"
+        sha256sum "${TORCH_REQUIREMENTS}"
+    } | sha256sum | awk '{print $1}'
 )"
 
 readonly REQUIREMENTS_STATE="${STATE_DIR}/requirements.sha256"
@@ -497,20 +522,62 @@ PY
 
 
 # ---------------------------------------------------------------------------
+# Campaign validation
+# ---------------------------------------------------------------------------
+
+campaign_datasets=""
+campaign_manifest_hash=""
+if [[ -n "${CAMPAIGN_MANIFEST}" ]]; then
+    PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${VENV}/bin/python" -m antivenom_campaign.cli \
+        validate \
+        --manifest "${CAMPAIGN_MANIFEST}"
+
+    campaign_manifest_hash="$(sha256sum "${CAMPAIGN_MANIFEST}" | awk '{print $1}')"
+
+    campaign_datasets="$(
+        PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+            "${VENV}/bin/python" -m antivenom_campaign.cli \
+            datasets \
+            --manifest "${CAMPAIGN_MANIFEST}" \
+            --cluster "${ANTIVENOM_CLUSTER:-unknown}" \
+            --hardware-type "${ANTIVENOM_HARDWARE_TYPE:-unknown}" \
+            --node-id "${ANTIVENOM_NODE_ID:-}"
+    )"
+    echo "Campaign: ${CAMPAIGN_ID:-custom-manifest}"
+    echo "Campaign manifest: ${CAMPAIGN_MANIFEST}"
+    echo "Campaign manifest SHA-256: ${campaign_manifest_hash}"
+    echo "Datasets required by this node: ${campaign_datasets}"
+fi
+
+
+# ---------------------------------------------------------------------------
 # Dataset preparation
 #
 # Prepare clean and poisoned scenarios for all requested datasets using both
 # IID and Dirichlet non-IID partitions. Existing complete data is reused.
 # ---------------------------------------------------------------------------
 
-env \
-    PYTHON="${VENV}/bin/python" \
-    ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
-    IID_DATA_DIR="${DATASET_DIR}/iid-data" \
-    NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
-    UNLEARNABLE_REPO="${UNLEARNABLE_REPO}" \
-    PREPARE_SCENARIOS="${ANTIVENOM_PREPARE_SCENARIOS:-all}" \
-    bash "${EXPERIMENT_SETUP}" all
+if [[ -n "${campaign_datasets}" ]]; then
+    env \
+        PYTHON="${VENV}/bin/python" \
+        ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
+        IID_DATA_DIR="${DATASET_DIR}/iid-data" \
+        NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
+        UNLEARNABLE_REPO="${UNLEARNABLE_REPO}" \
+        PREPARE_SCENARIOS="${ANTIVENOM_PREPARE_SCENARIOS:-all}" \
+        DATASETS_CSV="${campaign_datasets}" \
+        bash "${EXPERIMENT_SETUP}" all
+else
+    env \
+        PYTHON="${VENV}/bin/python" \
+        ROBUSTNESS_PROJECT_DIR="${ROBUSTNESS_PROJECT_DIR}" \
+        IID_DATA_DIR="${DATASET_DIR}/iid-data" \
+        NONIID_DATA_DIR="${DATASET_DIR}/noniid-data" \
+        UNLEARNABLE_REPO="${UNLEARNABLE_REPO}" \
+        PREPARE_SCENARIOS="${ANTIVENOM_PREPARE_SCENARIOS:-all}" \
+        bash "${EXPERIMENT_SETUP}" all
+fi
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +648,14 @@ launch_training() {
         PERF_ENABLED="${ANTIVENOM_PERF_ENABLED:-1}" \
         PERF_MODE="${ANTIVENOM_PERF_MODE:-phase}" \
         PERF_PROFILE="${ANTIVENOM_PERF_PROFILE:-auto}" \
+        CAMPAIGN_MANIFEST="${CAMPAIGN_MANIFEST}" \
+        CAMPAIGN_CLUSTER="${ANTIVENOM_CLUSTER:-unknown}" \
+        CAMPAIGN_HARDWARE_TYPE="${ANTIVENOM_HARDWARE_TYPE:-unknown}" \
+        CAMPAIGN_NODE_ID="${ANTIVENOM_NODE_ID:-}" \
+        CAMPAIGN_STATE_ROOT="${STATE_DIR}/campaigns" \
+        CAMPAIGN_LOG_ROOT="${LOG_DIR}/campaigns" \
+        CAMPAIGN_RESULT_ROOT="${RESULT_DIR}/campaigns" \
+        ANTIVENOM_RESTART_CONTEXTS="${ANTIVENOM_RESTART_CONTEXTS:-0}" \
         bash "${TRAINING_JOB_RUNNER}" \
         </dev/null >>"${TRAINING_RUNNER_LOG}" 2>&1 &
 
@@ -611,6 +686,9 @@ set +x
     printf 'training_status=%s\n' "${training_status}"
     printf 'training_pid=%s\n' "${training_pid}"
     printf 'training_log=%s\n' "${TRAINING_RUNNER_LOG}"
+    printf 'campaign_id=%s\n' "${CAMPAIGN_ID}"
+    printf 'campaign_manifest=%s\n' "${CAMPAIGN_MANIFEST}"
+    printf 'campaign_manifest_sha256=%s\n' "${campaign_manifest_hash}"
 } > "${READY_TMP}"
 
 mv -f "${READY_TMP}" "${READY_FILE}"

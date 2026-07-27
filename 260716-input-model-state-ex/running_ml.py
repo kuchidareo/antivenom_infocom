@@ -31,6 +31,9 @@ from perf_logger import DEFAULT_PERF_EVENTS, PerfLogger
 from training_utils import evaluate_model, train_model
 
 
+AUGMENTATION_SEQUENCE_PROFILES = ("baseline", "moderate", "strong")
+
+
 def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     set_all_seeds(args.seed)
     augment = augment_from_args(args)
@@ -163,6 +166,32 @@ def parse_input_sequences(value: str):
     if not sequences:
         raise argparse.ArgumentTypeError("At least one input sequence is required.")
     return sequences
+
+
+def parse_augmentation_sequences(value: str):
+    sequences = []
+    for sequence_text in (item.strip() for item in value.split(",")):
+        if not sequence_text:
+            continue
+        profiles = tuple(item.strip() for item in sequence_text.split(":"))
+        if len(profiles) not in {1, 2} or any(
+            profile not in AUGMENTATION_SEQUENCE_PROFILES for profile in profiles
+        ):
+            raise argparse.ArgumentTypeError(
+                "Each augmentation sequence must contain one or two profiles "
+                f"from {AUGMENTATION_SEQUENCE_PROFILES}, separated by ':'. "
+                f"Received {sequence_text!r}."
+            )
+        sequences.append(profiles)
+    if not sequences:
+        raise argparse.ArgumentTypeError("At least one augmentation sequence is required.")
+    return sequences
+
+
+def augment_for_profile(args: argparse.Namespace, profile: str) -> dict:
+    augment = augment_from_args(args)
+    augment["_profile"] = profile
+    return augment
 
 
 def run_one_input_sequence(
@@ -402,6 +431,230 @@ def run_one_input_sequence(
     return str(logger.path)
 
 
+def run_one_augmentation_sequence(
+    args: argparse.Namespace,
+    first_profile: str,
+    second_profile: str | None,
+    stage_epochs: int,
+) -> str:
+    """Train continuously while switching only the saved augmentation input."""
+    set_all_seeds(args.seed)
+    profiles = (
+        (first_profile,)
+        if second_profile is None
+        else (first_profile, second_profile)
+    )
+    augments = {profile: augment_for_profile(args, profile) for profile in set(profiles)}
+    resize = augments[first_profile].get("resize", [64, 64])
+    input_size = (int(resize[0]), int(resize[1]))
+    num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
+    model = get_model(
+        args.model,
+        num_classes=num_classes,
+        input_size=input_size,
+        batch_size=args.batch_size,
+        model_depth=args.model_depth,
+        width_multiplier=args.model_width_multiplier,
+        target_pam_mb=args.model_target_pam_mb,
+        pam_calibration_steps=args.model_pam_calibration_steps,
+    )
+    model_metadata = getattr(model, "model_metadata", {})
+    args.resolved_model_width_multiplier = model_metadata.get(
+        "model_width_multiplier", args.model_width_multiplier
+    )
+    args.resolved_model_estimated_pam_mb = model_metadata.get(
+        "model_estimated_pam_mb", ""
+    )
+    args.resolved_model_parameter_count = model_metadata.get(
+        "model_parameter_count", ""
+    )
+
+    loaders = {
+        profile: get_dataloader(
+            data_dir=args.data_dir,
+            dataset_name=args.dataset,
+            client_id=args.client_id,
+            poisoning_method=POISONING_METHOD_CLEAN,
+            split=args.dataset_split,
+            augment=augments[profile],
+            batch_size=args.batch_size,
+            shuffle=True,
+        )
+        for profile in set(profiles)
+    }
+    evaluation_augment = augment_for_profile(args, "baseline")
+    evaluation_augment["horizontal_flip"] = False
+    clean_evaluation_loader = get_dataloader(
+        data_dir=args.data_dir,
+        dataset_name=args.dataset,
+        client_id="all",
+        poisoning_method=POISONING_METHOD_CLEAN,
+        split="test",
+        augment=evaluation_augment,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    total_epochs = stage_epochs * len(profiles)
+    sequence = "_to_".join(profiles)
+    training_sequence = f"augmentation_{sequence}"
+    print(
+        f"Starting augmentation sequence={sequence} trial={args.trial_id} "
+        f"stage_epochs={stage_epochs} total_epochs={total_epochs}"
+    )
+
+    original_local_epochs = args.local_epochs
+    original_experiment_id = args.experiment_id
+    args.local_epochs = total_epochs
+    args.evaluation_method = POISONING_METHOD_CLEAN
+    args.evaluation_split = "clean_test"
+    args.evaluation_num_examples = len(clean_evaluation_loader.dataset)
+    args.experiment_id = original_experiment_id or (
+        f"augmentation_state_{sequence}_{args.trial_id}_{args.client_id}"
+    )
+    condition = condition_columns(
+        args=args,
+        run_type="local_ml_augmentation_state",
+        poisoning_method=POISONING_METHOD_CLEAN,
+        is_poisoned_client=False,
+        poisoned_client_count=0,
+        poisoned_client_ids=[],
+        poison_fraction=0.0,
+        attack_name="augmentation_state_transition",
+    )
+    args.local_epochs = original_local_epochs
+    args.experiment_id = original_experiment_id
+
+    state = TrainingState(
+        round=0,
+        epoch=0,
+        batch_idx=0,
+        phase="idle",
+        training_sequence=training_sequence,
+        stage_index=0,
+        stage_epoch=0,
+        input_poisoning_method=POISONING_METHOD_CLEAN,
+        input_augmentation_profile=first_profile,
+        model_state_condition="stage_started_from_initial",
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    with HardwareLogger(
+        log_dir=args.log_dir,
+        condition=condition,
+        training_state=state,
+        fps=args.hardware_fps,
+    ) as logger:
+        perf_path = logger.path.with_name(f"{logger.path.stem}_perf.csv")
+        metrics_logger = MetricsLogger(
+            path=logger.path.with_name(f"{logger.path.stem}_metrics.csv"),
+            condition=condition,
+        )
+        with PerfLogger(
+            log_dir=args.log_dir,
+            condition=condition,
+            training_state=state,
+            path=perf_path,
+            events=parse_perf_events(args.perf_events),
+            fps=args.perf_fps,
+        ):
+            for stage_index, profile in enumerate(profiles):
+                stage_augment = augments[profile]
+                model_state_condition = (
+                    "stage_started_from_initial"
+                    if stage_index == 0
+                    else f"stage_started_from_{first_profile}_{stage_epochs}_epochs"
+                )
+                state.update(
+                    epoch=stage_index * stage_epochs,
+                    batch_idx=0,
+                    phase="idle",
+                    training_sequence=training_sequence,
+                    stage_index=stage_index,
+                    stage_epoch=0,
+                    input_poisoning_method=POISONING_METHOD_CLEAN,
+                    input_augmentation_profile=profile,
+                    model_state_condition=model_state_condition,
+                )
+                state.update_condition(
+                    dataset_split=args.dataset_split,
+                    client_partition_id=args.client_id,
+                    augmentation_profile=profile,
+                    augment_enabled=bool(stage_augment.get("enabled", True)),
+                    augment_resize="x".join(str(value) for value in stage_augment.get("resize", [])),
+                    augment_horizontal_flip=bool(stage_augment.get("horizontal_flip", False)),
+                    augment_normalize=bool(stage_augment.get("normalize", False)),
+                    poisoning_method=POISONING_METHOD_CLEAN,
+                    is_poisoned_client=False,
+                    poisoned_client_count=0,
+                    poisoned_client_ids="",
+                    poison_fraction=0.0,
+                )
+                print(
+                    f"  stage={stage_index} global_epochs="
+                    f"{stage_index * stage_epochs}-{(stage_index + 1) * stage_epochs - 1} "
+                    f"augmentation={profile} model_state={model_state_condition}"
+                )
+
+                def evaluate_clean_data(global_epoch: int, current_stage_epoch: int) -> None:
+                    state.update(
+                        epoch=global_epoch,
+                        batch_idx=0,
+                        phase="evaluation",
+                        stage_epoch=current_stage_epoch,
+                        input_augmentation_profile="baseline",
+                    )
+                    state.update_condition(
+                        dataset_split="test",
+                        client_partition_id="all",
+                        augmentation_profile="baseline",
+                    )
+                    result = evaluate_model(
+                        model=model,
+                        data_loader=clean_evaluation_loader,
+                        state=state,
+                        round_id=0,
+                        metrics_logger=metrics_logger,
+                        metric_event="clean_test_epoch",
+                        metric_split="clean_test",
+                    )
+                    print(
+                        f"    clean_test epoch={global_epoch} "
+                        f"loss={result['loss']:.6f} accuracy={result['accuracy']:.4f}"
+                    )
+                    state.update(
+                        epoch=global_epoch,
+                        batch_idx=0,
+                        stage_epoch=current_stage_epoch,
+                        input_augmentation_profile=profile,
+                    )
+                    state.update_condition(
+                        dataset_split=args.dataset_split,
+                        client_partition_id=args.client_id,
+                        augmentation_profile=profile,
+                    )
+
+                train_model(
+                    model=model,
+                    train_loader=loaders[profile],
+                    epochs=stage_epochs,
+                    learning_rate=args.learning_rate,
+                    state=state,
+                    round_id=0,
+                    metrics_logger=metrics_logger,
+                    optimizer=optimizer,
+                    epoch_offset=stage_index * stage_epochs,
+                    training_sequence=training_sequence,
+                    stage_index=stage_index,
+                    input_poisoning_method=POISONING_METHOD_CLEAN,
+                    input_augmentation_profile=profile,
+                    model_state_condition=model_state_condition,
+                    epoch_end_callback=evaluate_clean_data,
+                )
+    print(f"Completed augmentation sequence={sequence}; hardware_log={logger.path}")
+    return str(logger.path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_common_args(parser)
@@ -453,7 +706,26 @@ def main() -> None:
         default=10,
         help="Epochs per stage in --input-sequences mode.",
     )
+    parser.add_argument(
+        "--augmentation-sequences",
+        default="",
+        help=(
+            "Run a continuous one- or two-stage augmentation experiment while "
+            "retaining model and Adam state. Example: baseline:strong."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.input_sequences and args.augmentation_sequences:
+        parser.error("Use only one of --input-sequences and --augmentation-sequences.")
+    parsed_input_sequences = (
+        parse_input_sequences(args.input_sequences) if args.input_sequences else []
+    )
+    parsed_augmentation_sequences = (
+        parse_augmentation_sequences(args.augmentation_sequences)
+        if args.augmentation_sequences
+        else []
+    )
 
     device = get_device_config(args.client_id)
     if not args.host:
@@ -462,6 +734,14 @@ def main() -> None:
         args.device_id = args.host
 
     augment = augment_from_args(args)
+    if parsed_augmentation_sequences:
+        prepare_scenarios = POISONING_METHOD_CLEAN
+    elif parsed_input_sequences:
+        prepare_scenarios = sorted(
+            {method for sequence in parsed_input_sequences for method in sequence}
+        )
+    else:
+        prepare_scenarios = "all"
     prepare_dataset(
         data_dir=args.data_dir,
         dataset_name=args.dataset,
@@ -471,20 +751,37 @@ def main() -> None:
         batch_size=args.batch_size,
         test_fraction=args.test_fraction,
         test_seed=args.test_seed,
+        prepare_scenarios=prepare_scenarios,
     )
     if args.prepare_only:
         return
 
-    if args.input_sequences:
+    if parsed_augmentation_sequences:
         if args.stage_epochs <= 0:
             parser.error("--stage-epochs must be positive.")
-        sequences = parse_input_sequences(args.input_sequences)
+        base_seed = args.seed
+        for trial in range(args.trials):
+            args.trial_id = f"trial_{trial}"
+            args.seed = base_seed + 1000 + trial
+            args.run_role = "augmentation_state_analysis"
+            for profiles in parsed_augmentation_sequences:
+                run_one_augmentation_sequence(
+                    args,
+                    first_profile=profiles[0],
+                    second_profile=profiles[1] if len(profiles) == 2 else None,
+                    stage_epochs=args.stage_epochs,
+                )
+        return
+
+    if parsed_input_sequences:
+        if args.stage_epochs <= 0:
+            parser.error("--stage-epochs must be positive.")
         base_seed = args.seed
         for trial in range(args.trials):
             args.trial_id = f"trial_{trial}"
             args.seed = base_seed + 1000 + trial
             args.run_role = "input_model_state_analysis"
-            for methods in sequences:
+            for methods in parsed_input_sequences:
                 run_one_input_sequence(
                     args,
                     first_method=methods[0],

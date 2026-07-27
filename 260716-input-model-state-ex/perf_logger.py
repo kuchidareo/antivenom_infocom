@@ -52,6 +52,7 @@ BASE_COLUMNS = [
     "stage_index",
     "stage_epoch",
     "input_poisoning_method",
+    "input_augmentation_profile",
     "model_state_condition",
     "perf_pid",
     "perf_elapsed_sec",

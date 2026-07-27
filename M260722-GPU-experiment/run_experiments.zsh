@@ -98,7 +98,8 @@ check_remote_environment() {
       cd '$REMOTE_PROJECT_DIR'
       '$REMOTE_PYTHON' running_ml.py --help >/dev/null
       '$REMOTE_PYTHON' gpu_logger.py --help >/dev/null
-      '$REMOTE_PYTHON' -c 'import gpu_logger; print("ncu", gpu_logger.find_ncu())'
+      printf 'ncu '
+      '$REMOTE_PYTHON' -c 'import gpu_logger; print(gpu_logger.find_ncu())'
       sudo -n true
     "
   done

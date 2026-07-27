@@ -49,6 +49,7 @@ class TrainingState:
     stage_index: Any = ""
     stage_epoch: Any = ""
     input_poisoning_method: str = ""
+    input_augmentation_profile: str = ""
     model_state_condition: str = ""
     condition_overrides: Dict[str, Any] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -64,6 +65,7 @@ class TrainingState:
         stage_index: Any = None,
         stage_epoch: Any = None,
         input_poisoning_method: Optional[str] = None,
+        input_augmentation_profile: Optional[str] = None,
         model_state_condition: Optional[str] = None,
     ) -> None:
         if phase is not None and phase not in PHASES:
@@ -85,6 +87,8 @@ class TrainingState:
                 self.stage_epoch = stage_epoch
             if input_poisoning_method is not None:
                 self.input_poisoning_method = input_poisoning_method
+            if input_augmentation_profile is not None:
+                self.input_augmentation_profile = input_augmentation_profile
             if model_state_condition is not None:
                 self.model_state_condition = model_state_condition
 
@@ -99,6 +103,7 @@ class TrainingState:
                 "stage_index": self.stage_index,
                 "stage_epoch": self.stage_epoch,
                 "input_poisoning_method": self.input_poisoning_method,
+                "input_augmentation_profile": self.input_augmentation_profile,
                 "model_state_condition": self.model_state_condition,
             }
             snapshot.update(self.condition_overrides)
