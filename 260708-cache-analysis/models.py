@@ -35,6 +35,88 @@ class SimpleCNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+class Attention(nn.Module):
+    def __init__(self, dim: int, heads: int) -> None:
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError("Attention dimension must be divisible by the number of heads.")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim**-0.5
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+        self.last_attention: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, dim = x.shape
+        qkv = (
+            self.qkv(x)
+            .reshape(batch, tokens, 3, self.heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
+        query, key, value = qkv.unbind(0)
+        weights = ((query @ key.transpose(-2, -1)) * self.scale).softmax(-1)
+        self.last_attention = weights.detach().float().cpu().contiguous()
+        attended = (weights @ value).transpose(1, 2).reshape(batch, tokens, dim)
+        return self.proj(attended)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, mlp_ratio: int) -> None:
+        super().__init__()
+        hidden = dim * mlp_ratio
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, heads)
+        self.norm2 = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.gelu = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        return x + self.fc2(self.gelu(self.fc1(self.norm2(x))))
+
+
+class TinyViT(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_classes: int,
+        input_size: Tuple[int, int] = (32, 32),
+        patch_size: int = 4,
+        embed_dim: int = 128,
+        heads: int = 4,
+        mlp_ratio: int = 2,
+        depth: int = 4,
+    ) -> None:
+        super().__init__()
+        height, width = input_size
+        if height != width:
+            raise ValueError("TinyViT requires a square input.")
+        if height % patch_size != 0:
+            raise ValueError("TinyViT input size must be divisible by patch size.")
+
+        self.patch_embed = nn.Conv2d(3, embed_dim, patch_size, stride=patch_size)
+        token_count = (height // patch_size) ** 2 + 1
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, token_count, embed_dim))
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(embed_dim, heads, mlp_ratio) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, num_classes)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat([cls_token, x], dim=1) + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        return self.classifier(self.norm(x)[:, 0])
+
+
 def _make_divisible(value: float, divisor: int = 8, minimum: int = 8) -> int:
     return max(minimum, int(round(value / divisor) * divisor))
 
@@ -157,6 +239,26 @@ def get_model(
         return model
     if model_name.lower() in {"resnet18", "resnet_18"}:
         return _build_resnet18(num_classes=num_classes, input_size=input_size)
+    if model_name.lower() in {"tiny_vit", "tinyvit", "vit"}:
+        model = TinyViT(
+            num_classes=num_classes,
+            input_size=input_size,
+            depth=model_depth,
+        )
+        model.model_metadata = {
+            "model_depth": model_depth,
+            "model_width_multiplier": 1.0,
+            "model_target_pam_mb": "",
+            "model_estimated_pam_mb": "",
+            "model_parameter_count": count_parameters(model),
+            "input_size": f"{input_size[0]}x{input_size[1]}",
+            "patch_size": 4,
+            "embed_dim": 128,
+            "attention_heads": 4,
+            "mlp_ratio": 2,
+            "pretrained": False,
+        }
+        return model
     if model_name in {"pam_cnn", "adaptive_cnn", "scalable_cnn", "ScalableCNN"}:
         image_size = int(input_size[0])
 

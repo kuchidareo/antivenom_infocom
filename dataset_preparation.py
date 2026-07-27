@@ -1,11 +1,13 @@
 import argparse
+import colorsys
 import csv
+import hashlib
+import importlib.util
 import json
 import math
 import os
 import random
 import re
-import sys
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -72,7 +74,7 @@ AUGMENTATION_PROFILES = _config_value(
 )
 DEFAULT_AVAILABILITY_SHORTCUT_EPS = _config_value("DEFAULT_AVAILABILITY_SHORTCUT_EPS", 6.0)
 DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE = _config_value(
-    "DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE", 4
+    "DEFAULT_AVAILABILITY_SHORTCUT_PATCH_SIZE", 8
 )
 DEFAULT_BATCH_SIZE = _config_value("DEFAULT_BATCH_SIZE", 16)
 DEFAULT_BADSAMPLER_KAPPA = _config_value("DEFAULT_BADSAMPLER_KAPPA", 2.0)
@@ -174,6 +176,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 METADATA_NAME = "partition_metadata.csv"
 PREPARED_MARKER = "PREPARED"
 REFERENCE_DATASET_NAME = "kuchidareo/small_trashnet"
+MATERIALIZED_AUGMENTATION_DATASET_SLUGS = {"small_trashnet", "cifar10"}
 MATCH_REFERENCE_SIZE_DATASETS = {
     "kuchidareo/chinese_trafficsign_dataset",
     "uoft-cs/cifar10",
@@ -187,14 +190,21 @@ PREPARE_SCENARIOS = [
     POISONING_METHOD_AVAILABILITY_SHORTCUTS,
     POISONING_METHOD_BADSAMPLING,
 ]
-AVAILABILITY_SHORTCUT_GENERATOR = "sklearn_make_classification_class_sep_10_jpeg_q100_v2"
+AVAILABILITY_SHORTCUT_GENERATOR = "classwise_color_patch_jpeg_v4"
 AVAILABILITY_SHORTCUT_CLASS_SEP = 10.0
 AVAILABILITY_SHORTCUT_REFERENCE_IMAGE_SIZE = 32
+AVAILABILITY_SHORTCUT_FREQUENCY = 3.0
+AVAILABILITY_SHORTCUT_MANIFEST_NAME = "shortcut_bank.json"
 AVAILABILITY_SHORTCUT_JPEG_QUALITY = 100
 AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING = 0
 AUGMENTATION_PROFILE_DIR = "augmented"
 AUGMENTATION_VARIANT_NAMES = ("moderate", "strong")
 BADSAMPLER_PLAN_NAME = "sampling_plan.json"
+UE_GENERATION_VERSION = "alternating_samplewise_min_min_v2"
+UE_MANIFEST_NAME = "ue_manifest.json"
+DEFAULT_UNLEARNABLE_REPO = str(
+    Path(__file__).resolve().parent / "Unlearnable-Examples"
+)
 
 METADATA_FIELDNAMES = [
     "image_path",
@@ -208,10 +218,23 @@ METADATA_FIELDNAMES = [
     "replacement_label",
     "shortcut_eps",
     "shortcut_patch_size",
+    "shortcut_frequency",
+    "shortcut_seed",
+    "shortcut_num_classes",
     "shortcut_generator",
+    "shortcut_operation",
     "shortcut_class_sep",
     "shortcut_jpeg_quality",
     "shortcut_jpeg_subsampling",
+    "ue_epsilon",
+    "ue_steps",
+    "ue_step_size",
+    "ue_warmup_epochs",
+    "ue_outer_iterations",
+    "ue_surrogate_steps_per_outer",
+    "ue_stop_error",
+    "ue_surrogate",
+    "ue_generation_version",
     "client_id",
     "partition_id",
     "partition_method",
@@ -326,6 +349,7 @@ def prepared_data_exists(
     num_clients: int = DEFAULT_NUM_CLIENTS,
     dataset_name: Optional[str] = None,
     partition_method: Optional[str] = None,
+    expected_ue_manifest: Optional[Dict[str, Any]] = None,
 ) -> bool:
     root = _dataset_root(data_dir, dataset_name)
     if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
@@ -349,6 +373,11 @@ def prepared_data_exists(
     if not shortcut_rows or any(
         row.get("shortcut_generator") != AVAILABILITY_SHORTCUT_GENERATOR
         for row in shortcut_rows
+    ):
+        return False
+    if expected_ue_manifest is not None and not _unlearnable_manifest_matches(
+        root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+        expected_ue_manifest,
     ):
         return False
     required_modes = [
@@ -659,7 +688,12 @@ def prune_unreferenced_images(*, data_dir: str, dataset_name: str) -> int:
         for row in rows
     }
     removed = 0
-    for image_path in root.rglob("*.jpeg"):
+    image_paths = (
+        path
+        for suffix in ("*.jpeg", "*.jpg", "*.png")
+        for path in root.rglob(suffix)
+    )
+    for image_path in image_paths:
         if image_path.resolve() not in referenced:
             image_path.unlink()
             removed += 1
@@ -780,6 +814,48 @@ def _mode_complete(root: Path, mode: str, num_clients: int) -> bool:
     return all((root / mode / f"client_{idx}").exists() for idx in range(num_clients))
 
 
+def _unlearnable_manifest(
+    *,
+    epsilon: float,
+    steps: int,
+    step_size: float,
+    warmup_epochs: int,
+    outer_iterations: int,
+    surrogate_steps_per_outer: int,
+    stop_error: float,
+    seed: int,
+    resize: Sequence[int],
+    unlearnable_repo: str,
+) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {
+        "method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+        "epsilon": float(epsilon),
+        "steps": int(steps),
+        "step_size": float(step_size),
+        "warmup_epochs": int(warmup_epochs),
+        "outer_iterations": int(outer_iterations),
+        "surrogate_steps_per_outer": int(surrogate_steps_per_outer),
+        "stop_error": float(stop_error),
+        "seed": int(seed),
+        "resize": [int(value) for value in resize],
+        "surrogate": "resnet18",
+        "repo": str(Path(unlearnable_repo).resolve()),
+        "generation_version": UE_GENERATION_VERSION,
+    }
+    serialized = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    manifest["cache_key"] = hashlib.sha256(serialized.encode()).hexdigest()
+    return manifest
+
+
+def _unlearnable_manifest_matches(output_root: Path, expected: Dict[str, Any]) -> bool:
+    manifest_path = output_root / UE_MANIFEST_NAME
+    try:
+        actual = json.loads(manifest_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False
+    return actual.get("cache_key") == expected.get("cache_key")
+
+
 def _metadata_has_method(rows: Sequence[Dict[str, Any]], poisoning_method: str) -> bool:
     return any(row.get("poisoning_method") == poisoning_method for row in rows)
 
@@ -812,7 +888,14 @@ def _scenario_mode(scenario: str) -> str:
     return f"poisoned/{scenario}"
 
 
-def _scenario_complete(root: Path, scenario: str, rows: Sequence[Dict[str, Any]], num_clients: int) -> bool:
+def _scenario_complete(
+    root: Path,
+    scenario: str,
+    rows: Sequence[Dict[str, Any]],
+    num_clients: int,
+    *,
+    expected_ue_manifest: Optional[Dict[str, Any]] = None,
+) -> bool:
     if scenario == POISONING_METHOD_BADSAMPLING:
         return all(
             (root / "poisoned" / scenario / f"client_{idx}" / BADSAMPLER_PLAN_NAME).exists()
@@ -820,6 +903,13 @@ def _scenario_complete(root: Path, scenario: str, rows: Sequence[Dict[str, Any]]
         )
     if not (_mode_complete(root, _scenario_mode(scenario), num_clients) and _metadata_has_method(rows, scenario)):
         return False
+    if scenario == POISONING_METHOD_UNLEARNABLE_EXAMPLES:
+        if expected_ue_manifest is None:
+            return False
+        return _unlearnable_manifest_matches(
+            root / "poisoned" / POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+            expected_ue_manifest,
+        )
     if scenario == POISONING_METHOD_AVAILABILITY_SHORTCUTS:
         shortcut_rows = [
             row
@@ -873,16 +963,44 @@ def _build_unlearnable_example_images(
     step_size: float,
     batch_size: int,
     unlearnable_repo: str,
-) -> None:
+    warmup_epochs: int,
+    outer_iterations: int,
+    surrogate_steps_per_outer: int,
+    stop_error: float,
+) -> Dict[str, Any]:
+    import numpy as np
+
     torch, transforms, DataLoader, Dataset = _require_torch()
 
     repo_path = Path(unlearnable_repo).resolve()
-    if repo_path.exists():
-        sys.path.insert(0, str(repo_path))
-    try:
-        from toolbox import PerturbationTool
-    except Exception:
-        PerturbationTool = None
+    toolbox_path = repo_path / "toolbox.py"
+    if not toolbox_path.is_file():
+        raise FileNotFoundError(
+            f"Official Unlearnable-Examples repository was not found: {repo_path}"
+        )
+    module_spec = importlib.util.spec_from_file_location(
+        "_antivenom_unlearnable_examples_toolbox",
+        toolbox_path,
+    )
+    if module_spec is None or module_spec.loader is None:
+        raise ImportError(f"Could not load official UE toolbox: {toolbox_path}")
+    toolbox_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(toolbox_module)
+    PerturbationTool = toolbox_module.PerturbationTool
+
+    if not clean_records:
+        raise ValueError("Cannot generate unlearnable examples without clean training records.")
+    if len(resize) != 2 or any(int(value) <= 0 for value in resize):
+        raise ValueError(f"UE resize must contain two positive dimensions, got {resize!r}.")
+    if epsilon <= 0 or num_steps <= 0 or step_size <= 0:
+        raise ValueError("UE epsilon, steps, and step size must be positive.")
+    if warmup_epochs < 0 or outer_iterations <= 0 or surrogate_steps_per_outer < 0:
+        raise ValueError(
+            "UE warm-up epochs and surrogate steps must be non-negative, and outer "
+            "iterations must be positive."
+        )
+    if not 0.0 <= stop_error <= 1.0:
+        raise ValueError("UE stop error must be in [0, 1].")
 
     set_all_seeds(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -900,73 +1018,198 @@ def _build_unlearnable_example_images(
             image = Image.open(record["clean_path"]).convert("RGB")
             return transform(image), int(record["label"]), idx
 
-    loader = DataLoader(CleanRecordDataset(clean_records), batch_size=batch_size, shuffle=False, num_workers=0)
-    model = torch.nn.Sequential(
-        torch.nn.Conv2d(3, 16, kernel_size=3, padding=1),
-        torch.nn.BatchNorm2d(16),
-        torch.nn.ReLU(inplace=True),
-        torch.nn.MaxPool2d(2),
-        torch.nn.Conv2d(16, 32, kernel_size=3, padding=1),
-        torch.nn.BatchNorm2d(32),
-        torch.nn.ReLU(inplace=True),
-        torch.nn.MaxPool2d(2),
-        torch.nn.Conv2d(32, 64, kernel_size=3, padding=1),
-        torch.nn.BatchNorm2d(64),
-        torch.nn.ReLU(inplace=True),
-        torch.nn.AdaptiveAvgPool2d((1, 1)),
-        torch.nn.Flatten(),
-        torch.nn.Dropout(p=0.1),
-        torch.nn.Linear(64, num_classes),
-    ).to(device)
+    loader = DataLoader(
+        CleanRecordDataset(clean_records),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+    from torchvision.models import resnet18
+
+    model = resnet18(weights=None, num_classes=num_classes).to(device)
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.1,
+        momentum=0.9,
+        weight_decay=5e-4,
+    )
 
-    # One light surrogate pass keeps the unlearnable-example perturbation deterministic
-    # without turning data preparation into a full training run.
-    model.train()
-    for images, labels, _ in loader:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        loss = criterion(model(images), labels)
-        loss.backward()
-        optimizer.step()
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / UE_MANIFEST_NAME
+    manifest_path.unlink(missing_ok=True)
+    image_height, image_width = (int(resize[0]), int(resize[1]))
+    delta_path = output_root / "perturbations.npy"
+    delta_bank = np.lib.format.open_memmap(
+        delta_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(len(clean_records), 3, image_height, image_width),
+    )
+    delta_bank[:] = 0.0
+    delta_bank.flush()
 
-    model.eval()
-    if PerturbationTool is not None:
-        tool = PerturbationTool(
-            seed=seed,
-            epsilon=epsilon / 255.0,
-            num_steps=num_steps,
-            step_size=step_size / 255.0,
+    for warmup_epoch in range(warmup_epochs):
+        model.train()
+        total_loss = 0.0
+        total_examples = 0
+        for images, labels, _ in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(images), labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            total_loss += float(loss.detach()) * labels.numel()
+            total_examples += labels.numel()
+        print(
+            f"UE warmup={warmup_epoch + 1}/{warmup_epochs}, "
+            f"loss={total_loss / max(total_examples, 1):.6f}",
+            flush=True,
         )
-    else:
-        tool = None
 
-    for images, labels, indices in loader:
-        images, labels = images.to(device), labels.to(device)
-        if tool is not None:
-            poisoned, _ = tool.min_min_attack(images, labels, model, optimizer, criterion)
-        else:
-            poisoned = _fallback_min_min(images, labels, model, criterion, epsilon / 255.0, step_size / 255.0, num_steps)
-        for tensor, record_idx in zip(poisoned, indices):
+    tool = PerturbationTool(
+        seed=seed,
+        epsilon=epsilon / 255.0,
+        num_steps=num_steps,
+        step_size=step_size / 255.0,
+    )
+    surrogate_iterator = iter(loader)
+    completed_outer_iterations = 0
+    poisoned_train_accuracy = 0.0
+
+    for outer in range(outer_iterations):
+        model.train()
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+
+        for _ in range(surrogate_steps_per_outer):
+            try:
+                images, labels, indices = next(surrogate_iterator)
+            except StopIteration:
+                surrogate_iterator = iter(loader)
+                images, labels, indices = next(surrogate_iterator)
+
+            index_array = indices.numpy()
+            current_delta = torch.from_numpy(
+                np.array(delta_bank[index_array], copy=True)
+            )
+            poisoned_images = (images + current_delta).clamp(0.0, 1.0)
+            poisoned_images = poisoned_images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(poisoned_images), labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
+        for images, labels, indices in loader:
+            index_array = indices.numpy()
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            current_delta = torch.from_numpy(
+                np.array(delta_bank[index_array], copy=True)
+            ).to(device, non_blocking=True)
+            _, updated_delta = tool.min_min_attack(
+                images,
+                labels,
+                model,
+                optimizer,
+                criterion,
+                random_noise=current_delta,
+            )
+            delta_bank[index_array] = (
+                updated_delta.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+        delta_bank.flush()
+
+        total = 0
+        correct = 0
+        model.eval()
+        with torch.no_grad():
+            for images, labels, indices in loader:
+                index_array = indices.numpy()
+                delta = torch.from_numpy(np.array(delta_bank[index_array], copy=True))
+                poisoned_images = (images + delta).clamp(0.0, 1.0)
+                poisoned_images = poisoned_images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                predictions = model(poisoned_images).argmax(dim=1)
+                total += labels.numel()
+                correct += int((predictions == labels).sum())
+
+        completed_outer_iterations = outer + 1
+        poisoned_train_accuracy = correct / max(total, 1)
+        poisoned_train_error = 1.0 - poisoned_train_accuracy
+        print(
+            f"UE outer={completed_outer_iterations}/{outer_iterations}, "
+            f"poisoned_train_accuracy={poisoned_train_accuracy:.4f}, "
+            f"error={poisoned_train_error:.4f}",
+            flush=True,
+        )
+
+        checkpoint_path = output_root / "generator_last.pt"
+        temporary_checkpoint = checkpoint_path.with_suffix(".pt.tmp")
+        torch.save(
+            {
+                "outer_iteration": completed_outer_iterations,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "delta_path": str(delta_path),
+                "poisoned_train_accuracy": poisoned_train_accuracy,
+                "epsilon": epsilon,
+                "num_steps": num_steps,
+                "step_size": step_size,
+                "seed": seed,
+                "resize": list(resize),
+            },
+            temporary_checkpoint,
+        )
+        os.replace(temporary_checkpoint, checkpoint_path)
+
+        if poisoned_train_error <= stop_error:
+            break
+
+    for images, _, indices in loader:
+        index_array = indices.numpy()
+        delta = torch.from_numpy(np.array(delta_bank[index_array], copy=True))
+        poisoned_images = (images + delta).clamp(0.0, 1.0)
+        for tensor, record_idx in zip(poisoned_images, indices):
             record = clean_records[int(record_idx)]
-            out_path = output_root / record["client_id"] / record["relative_path"]
-            _save_jpeg(_pil_from_tensor(tensor), out_path)
+            relative_path = Path(record["relative_path"]).with_suffix(".png")
+            out_path = output_root / record["client_id"] / relative_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            _pil_from_tensor(tensor).save(out_path, format="PNG")
 
-
-def _fallback_min_min(images: Any, labels: Any, model: Any, criterion: Any, epsilon: float, step_size: float, steps: int) -> Any:
-    import torch
-
-    eta = torch.zeros_like(images)
-    perturbed = images.detach().clone()
-    for _ in range(steps):
-        perturbed.requires_grad_(True)
-        model.zero_grad()
-        loss = criterion(model(perturbed), labels)
-        loss.backward()
-        eta = torch.clamp(eta - step_size * perturbed.grad.detach().sign(), -epsilon, epsilon)
-        perturbed = torch.clamp(images + eta, 0, 1).detach()
-    return perturbed
+    manifest = _unlearnable_manifest(
+        epsilon=epsilon,
+        steps=num_steps,
+        step_size=step_size,
+        warmup_epochs=warmup_epochs,
+        outer_iterations=outer_iterations,
+        surrogate_steps_per_outer=surrogate_steps_per_outer,
+        stop_error=stop_error,
+        seed=seed,
+        resize=resize,
+        unlearnable_repo=unlearnable_repo,
+    )
+    manifest.update(
+        {
+            "completed_outer_iterations": completed_outer_iterations,
+            "poisoned_train_accuracy": poisoned_train_accuracy,
+            "delta_path": str(delta_path),
+        }
+    )
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary_manifest, manifest_path)
+    return manifest
 
 
 def _copy_clean_image(record: Dict[str, Any], output_root: Path) -> Path:
@@ -1055,6 +1298,106 @@ def _normalize_l2norm(data: Any, norm_limit: float) -> Any:
 
 
 def _make_availability_shortcut_rows(
+    clean_records: Sequence[Dict[str, Any]],
+    *,
+    output_root: Path,
+    class_names: Sequence[str],
+    seed: int,
+    resize: Sequence[int],
+    eps: float,
+    patch_size: int,
+) -> List[Dict[str, Any]]:
+    del eps  # The visible validation attack overwrites a patch and is not epsilon-bounded.
+    if not clean_records:
+        return []
+    if len(resize) != 2 or any(int(value) <= 0 for value in resize):
+        raise ValueError(f"Shortcut resize must contain two positive dimensions, got {resize!r}.")
+    if patch_size <= 0:
+        raise ValueError(f"shortcut patch size must be positive, got {patch_size}.")
+
+    labels = sorted({int(record["label"]) for record in clean_records})
+    num_classes = len(labels)
+    if labels != list(range(num_classes)):
+        raise ValueError(
+            "Availability-shortcut labels must be contiguous from zero; "
+            f"got {labels}."
+        )
+
+    colors = [
+        tuple(
+            int(round(channel * 255))
+            for channel in colorsys.hsv_to_rgb(class_index / num_classes, 1.0, 1.0)
+        )
+        for class_index in range(num_classes)
+    ]
+    height, width = (int(resize[0]), int(resize[1]))
+    materialized_patch_size = min(patch_size, height, width)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "generator": AVAILABILITY_SHORTCUT_GENERATOR,
+        "application": "materialized_before_training_augmentation",
+        "operation": "overwrite_top_left_patch_jpeg",
+        "image_format": "JPEG",
+        "jpeg_quality": AVAILABILITY_SHORTCUT_JPEG_QUALITY,
+        "jpeg_subsampling": AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
+        "seed": int(seed),
+        "patch_size": materialized_patch_size,
+        "num_classes": num_classes,
+        "class_names": list(class_names),
+        "requested_resize": [int(value) for value in resize],
+    }
+    (output_root / AVAILABILITY_SHORTCUT_MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for record in clean_records:
+        label = int(record["label"])
+        image = Image.open(record["clean_path"]).convert("RGB").resize((width, height))
+        image.paste(
+            colors[label],
+            (0, 0, materialized_patch_size, materialized_patch_size),
+        )
+        relative_path = Path(record["relative_path"]).with_suffix(".jpeg")
+        out_path = output_root / str(record["client_id"]) / relative_path
+        _save_jpeg(
+            image,
+            out_path,
+            quality=AVAILABILITY_SHORTCUT_JPEG_QUALITY,
+            subsampling=AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
+        )
+        poisoned = dict(record)
+        poisoned.update(
+            {
+                "image_path": str(out_path),
+                "relative_path": str(relative_path),
+                "label": label,
+                "class_name": _class_name_for_label(class_names, label),
+                "is_poisoned": True,
+                "poisoning_method": POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+                "original_label": label,
+                "original_class_name": record["class_name"],
+                "label_changed": False,
+                "shortcut_eps": "",
+                "shortcut_patch_size": materialized_patch_size,
+                "shortcut_frequency": "",
+                "shortcut_seed": seed,
+                "shortcut_num_classes": num_classes,
+                "shortcut_generator": AVAILABILITY_SHORTCUT_GENERATOR,
+                "shortcut_operation": "overwrite_top_left_patch_jpeg",
+                "shortcut_class_sep": "",
+                "shortcut_jpeg_quality": AVAILABILITY_SHORTCUT_JPEG_QUALITY,
+                "shortcut_jpeg_subsampling": AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
+            }
+        )
+        rows.append(poisoned)
+    return rows
+
+
+# Disabled legacy implementation retained for comparison. Dataset preparation now
+# materializes the class-color patch as JPEG above.
+def _make_availability_shortcut_rows_sklearn_disabled(
     clean_records: Sequence[Dict[str, Any]],
     *,
     output_root: Path,
@@ -1177,7 +1520,7 @@ def _make_availability_shortcut_rows(
                 "label_changed": False,
                 "shortcut_eps": eps,
                 "shortcut_patch_size": patch_size,
-                "shortcut_generator": AVAILABILITY_SHORTCUT_GENERATOR,
+                "shortcut_generator": "sklearn_make_classification_class_sep_10_jpeg_q100_v2",
                 "shortcut_class_sep": AVAILABILITY_SHORTCUT_CLASS_SEP,
                 "shortcut_jpeg_quality": AVAILABILITY_SHORTCUT_JPEG_QUALITY,
                 "shortcut_jpeg_subsampling": AVAILABILITY_SHORTCUT_JPEG_SUBSAMPLING,
@@ -1200,6 +1543,10 @@ def _append_unlearnable_example_rows(
     poison_step_size: float,
     batch_size: int,
     unlearnable_repo: str,
+    poison_warmup_epochs: int,
+    poison_outer_iterations: int,
+    poison_surrogate_steps_per_outer: int,
+    poison_stop_error: float,
 ) -> None:
     _build_unlearnable_example_images(
         clean_records,
@@ -1212,22 +1559,37 @@ def _append_unlearnable_example_rows(
         step_size=poison_step_size,
         batch_size=batch_size,
         unlearnable_repo=unlearnable_repo,
+        warmup_epochs=poison_warmup_epochs,
+        outer_iterations=poison_outer_iterations,
+        surrogate_steps_per_outer=poison_surrogate_steps_per_outer,
+        stop_error=poison_stop_error,
     )
 
     for record in clean_records:
+        ue_relative_path = Path(record["relative_path"]).with_suffix(".png")
         poisoned_path = (
             root
             / "poisoned"
             / POISONING_METHOD_UNLEARNABLE_EXAMPLES
             / record["client_id"]
-            / record["relative_path"]
+            / ue_relative_path
         )
         poisoned = dict(record)
         poisoned.update(
             {
                 "image_path": str(poisoned_path),
+                "relative_path": str(ue_relative_path),
                 "is_poisoned": True,
                 "poisoning_method": POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+                "ue_epsilon": poison_epsilon,
+                "ue_steps": poison_steps,
+                "ue_step_size": poison_step_size,
+                "ue_warmup_epochs": poison_warmup_epochs,
+                "ue_outer_iterations": poison_outer_iterations,
+                "ue_surrogate_steps_per_outer": poison_surrogate_steps_per_outer,
+                "ue_stop_error": poison_stop_error,
+                "ue_surrogate": "resnet18",
+                "ue_generation_version": UE_GENERATION_VERSION,
             }
         )
         metadata_rows.append(poisoned)
@@ -1301,6 +1663,10 @@ def _append_requested_poisoning_rows(
     poison_step_size: float,
     batch_size: int,
     unlearnable_repo: str,
+    poison_warmup_epochs: int,
+    poison_outer_iterations: int,
+    poison_surrogate_steps_per_outer: int,
+    poison_stop_error: float,
     random_label_flip_fraction: float,
     target_label: int,
     replacement_label: int,
@@ -1327,6 +1693,10 @@ def _append_requested_poisoning_rows(
             poison_step_size=poison_step_size,
             batch_size=batch_size,
             unlearnable_repo=unlearnable_repo,
+            poison_warmup_epochs=poison_warmup_epochs,
+            poison_outer_iterations=poison_outer_iterations,
+            poison_surrogate_steps_per_outer=poison_surrogate_steps_per_outer,
+            poison_stop_error=poison_stop_error,
         )
 
     if POISONING_METHOD_RANDOM_LABEL_FLIPPING in requested_scenarios:
@@ -1363,7 +1733,7 @@ def _append_requested_poisoning_rows(
                 clean_records,
                 output_root=root / "poisoned" / POISONING_METHOD_AVAILABILITY_SHORTCUTS,
                 class_names=class_names,
-                seed=seed + 47,
+                seed=seed,
                 resize=resize,
                 eps=shortcut_eps,
                 patch_size=shortcut_patch_size,
@@ -1379,11 +1749,15 @@ def prepare_dataset(
     seed: int = 0,
     force: bool = False,
     resize: Sequence[int] = (64, 64),
-    poison_epsilon: float = 8.0,
-    poison_steps: int = 5,
-    poison_step_size: float = 0.8,
+    poison_epsilon: float = 16.0,
+    poison_steps: int = 20,
+    poison_step_size: float = 1.6,
+    poison_warmup_epochs: int = 10,
+    poison_outer_iterations: int = 10,
+    poison_surrogate_steps_per_outer: int = 100,
+    poison_stop_error: float = 0.01,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    unlearnable_repo: str = "../Unlearnable-Examples",
+    unlearnable_repo: str = DEFAULT_UNLEARNABLE_REPO,
     random_label_flip_fraction: float = DEFAULT_RANDOM_LABEL_FLIP_FRACTION,
     target_label: int = DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL,
     replacement_label: int = DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL,
@@ -1399,6 +1773,18 @@ def prepare_dataset(
     partition_method = _canonical_partition_method(partition_method)
     root = _dataset_root(data_dir, dataset_name)
     requested_scenarios = _parse_prepare_scenarios(prepare_scenarios)
+    expected_ue_manifest = _unlearnable_manifest(
+        epsilon=poison_epsilon,
+        steps=poison_steps,
+        step_size=poison_step_size,
+        warmup_epochs=poison_warmup_epochs,
+        outer_iterations=poison_outer_iterations,
+        surrogate_steps_per_outer=poison_surrogate_steps_per_outer,
+        stop_error=poison_stop_error,
+        seed=seed,
+        resize=resize,
+        unlearnable_repo=unlearnable_repo,
+    )
     existing_rows = _read_metadata_rows(root)
     if existing_rows and _metadata_partition_method(existing_rows) != partition_method:
         if not force or POISONING_METHOD_CLEAN not in requested_scenarios:
@@ -1450,7 +1836,13 @@ def prepare_dataset(
             f"in {root / METADATA_NAME}"
         )
     if (
-        prepared_data_exists(data_dir, num_clients, dataset_name, partition_method)
+        prepared_data_exists(
+            data_dir,
+            num_clients,
+            dataset_name,
+            partition_method,
+            expected_ue_manifest,
+        )
         and not force
         and set(requested_scenarios) == set(PREPARE_SCENARIOS)
     ):
@@ -1469,7 +1861,16 @@ def prepare_dataset(
             scenario
             for scenario in requested_scenarios
             if scenario != POISONING_METHOD_CLEAN
-            and (force or not _scenario_complete(root, scenario, existing_rows, num_clients))
+            and (
+                force
+                or not _scenario_complete(
+                    root,
+                    scenario,
+                    existing_rows,
+                    num_clients,
+                    expected_ue_manifest=expected_ue_manifest,
+                )
+            )
         ]
         if not missing_or_requested:
             return _finalize_prepared_dataset(root)
@@ -1492,6 +1893,10 @@ def prepare_dataset(
             poison_step_size=poison_step_size,
             batch_size=batch_size,
             unlearnable_repo=unlearnable_repo,
+            poison_warmup_epochs=poison_warmup_epochs,
+            poison_outer_iterations=poison_outer_iterations,
+            poison_surrogate_steps_per_outer=poison_surrogate_steps_per_outer,
+            poison_stop_error=poison_stop_error,
             random_label_flip_fraction=random_label_flip_fraction,
             target_label=target_label,
             replacement_label=replacement_label,
@@ -1574,7 +1979,11 @@ def prepare_dataset(
                 "replacement_label": "",
                 "shortcut_eps": "",
                 "shortcut_patch_size": "",
+                "shortcut_frequency": "",
+                "shortcut_seed": "",
+                "shortcut_num_classes": "",
                 "shortcut_generator": "",
+                "shortcut_operation": "",
                 "shortcut_class_sep": "",
                 "shortcut_jpeg_quality": "",
                 "shortcut_jpeg_subsampling": "",
@@ -1617,6 +2026,10 @@ def prepare_dataset(
         poison_step_size=poison_step_size,
         batch_size=batch_size,
         unlearnable_repo=unlearnable_repo,
+        poison_warmup_epochs=poison_warmup_epochs,
+        poison_outer_iterations=poison_outer_iterations,
+        poison_surrogate_steps_per_outer=poison_surrogate_steps_per_outer,
+        poison_stop_error=poison_stop_error,
         random_label_flip_fraction=random_label_flip_fraction,
         target_label=target_label,
         replacement_label=replacement_label,
@@ -1641,7 +2054,25 @@ def prepare_dataset(
     return _finalize_prepared_dataset(root)
 
 
-def write_augmentation_profile_manifests(root: Path) -> Path:
+def _materialized_augmentation_supported(dataset_name: str) -> bool:
+    return dataset_slug(dataset_name) in MATERIALIZED_AUGMENTATION_DATASET_SLUGS
+
+
+def _augmentation_profile_for_dataset(
+    profile_name: str,
+    dataset_name: str,
+) -> Dict[str, Any]:
+    profile = dict(AUGMENTATION_PROFILES[profile_name])
+    if dataset_slug(dataset_name) == "cifar10":
+        profile["resize"] = [32, 32]
+    return profile
+
+
+def write_augmentation_profile_manifests(
+    root: Path,
+    dataset_name: Optional[str] = None,
+) -> Path:
+    effective_dataset_name = dataset_name or root.name
     profile_root = root / AUGMENTATION_PROFILE_DIR
     profile_root.mkdir(parents=True, exist_ok=True)
     for profile_name in AUGMENTATION_VARIANT_NAMES:
@@ -1652,7 +2083,9 @@ def write_augmentation_profile_manifests(root: Path) -> Path:
             "application": "materialized_once",
             "source": "clean_train",
             "test_augmentation": False,
-            "transform": AUGMENTATION_PROFILES[profile_name],
+            "transform": _augmentation_profile_for_dataset(
+                profile_name, effective_dataset_name
+            ),
         }
         (profile_dir / "augmentation.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -1679,6 +2112,7 @@ def prepare_augmentation_variants(
     force: bool = False,
 ) -> Path:
     root = _dataset_root(data_dir, dataset_name)
+    effective_dataset_name = dataset_name or DATASET_NAME
     rows = _read_metadata_rows(root)
     clean_training_rows = [
         dict(row)
@@ -1706,7 +2140,9 @@ def prepare_augmentation_variants(
             "seed": seed,
             "source": "clean_train",
             "num_images": len(clean_training_rows),
-            "transform": AUGMENTATION_PROFILES[profile_name],
+            "transform": _augmentation_profile_for_dataset(
+                profile_name, effective_dataset_name
+            ),
         }
         marker_matches = False
         if marker_path.exists() and not force:
@@ -1720,7 +2156,9 @@ def prepare_augmentation_variants(
             ):
                 continue
 
-        materialize_augment = dict(AUGMENTATION_PROFILES[profile_name])
+        materialize_augment = _augmentation_profile_for_dataset(
+            profile_name, effective_dataset_name
+        )
         materialize_augment["normalize"] = False
         transform = build_transform(materialize_augment)
         for record in clean_training_rows:
@@ -1743,8 +2181,8 @@ def prepare_augmentation_variants(
 
 
 def _finalize_prepared_dataset(root: Path) -> Path:
-    if root.name == dataset_slug(REFERENCE_DATASET_NAME):
-        write_augmentation_profile_manifests(root)
+    if root.name in MATERIALIZED_AUGMENTATION_DATASET_SLUGS:
+        write_augmentation_profile_manifests(root, root.name)
     return root
 
 
@@ -1830,7 +2268,7 @@ class LocalImageDataset:
         split: str = "train",
         transform: Any = None,
     ) -> None:
-        torch, _, _, Dataset = _require_torch()
+        _, _, _, Dataset = _require_torch()
 
         class _Dataset(Dataset):
             def __init__(self, outer: "LocalImageDataset") -> None:
@@ -1860,6 +2298,24 @@ class LocalImageDataset:
             poisoning_method=poisoning_method,
             split=split,
         )
+        if poisoning_method == POISONING_METHOD_AVAILABILITY_SHORTCUTS:
+            if split != "train":
+                raise ValueError(
+                    "Availability shortcuts are only defined for the training split; "
+                    "use clean data for evaluation."
+                )
+            if not self.records:
+                raise ValueError(
+                    f"No availability-shortcut records found for client {client_id!r}."
+                )
+            generators = {record.get("shortcut_generator", "") for record in self.records}
+            if generators != {AVAILABILITY_SHORTCUT_GENERATOR}:
+                raise ValueError(
+                    "Availability-shortcut metadata is stale or inconsistent. "
+                    "Regenerate it with dataset_preparation.py --force; "
+                    f"found generators={sorted(generators)!r}."
+                )
+
         if poisoning_method == POISONING_METHOD_BADSAMPLING:
             if split != "train":
                 raise ValueError("BadSampler is only valid for the training split.")
@@ -2245,10 +2701,14 @@ def main() -> None:
             f"Example: --prepare-scenarios {POISONING_METHOD_AVAILABILITY_SHORTCUTS}"
         ),
     )
-    parser.add_argument("--poison-epsilon", type=float, default=8.0)
-    parser.add_argument("--poison-steps", type=int, default=5)
-    parser.add_argument("--poison-step-size", type=float, default=0.8)
-    parser.add_argument("--unlearnable-repo", default="../Unlearnable-Examples")
+    parser.add_argument("--poison-epsilon", type=float, default=16.0)
+    parser.add_argument("--poison-steps", type=int, default=20)
+    parser.add_argument("--poison-step-size", type=float, default=1.6)
+    parser.add_argument("--poison-warmup-epochs", type=int, default=10)
+    parser.add_argument("--poison-outer-iterations", type=int, default=10)
+    parser.add_argument("--poison-surrogate-steps-per-outer", type=int, default=100)
+    parser.add_argument("--poison-stop-error", type=float, default=0.01)
+    parser.add_argument("--unlearnable-repo", default=DEFAULT_UNLEARNABLE_REPO)
     parser.add_argument("--random-label-flip-fraction", type=float, default=DEFAULT_RANDOM_LABEL_FLIP_FRACTION)
     parser.add_argument("--target-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL)
     parser.add_argument("--replacement-label", type=int, default=DEFAULT_TARGET_LABEL_FLIP_REPLACEMENT_LABEL)
@@ -2257,7 +2717,7 @@ def main() -> None:
     parser.add_argument(
         "--prune-unreferenced",
         action="store_true",
-        help="Delete JPEG files under this dataset root that are not referenced by metadata.",
+        help="Delete image files under this dataset root that are not referenced by metadata.",
     )
     args = parser.parse_args()
     augment = augment_from_args(args)
@@ -2272,6 +2732,10 @@ def main() -> None:
         poison_epsilon=args.poison_epsilon,
         poison_steps=args.poison_steps,
         poison_step_size=args.poison_step_size,
+        poison_warmup_epochs=args.poison_warmup_epochs,
+        poison_outer_iterations=args.poison_outer_iterations,
+        poison_surrogate_steps_per_outer=args.poison_surrogate_steps_per_outer,
+        poison_stop_error=args.poison_stop_error,
         batch_size=args.batch_size,
         unlearnable_repo=args.unlearnable_repo,
         random_label_flip_fraction=args.random_label_flip_fraction,
@@ -2285,9 +2749,7 @@ def main() -> None:
         partition_method=args.partition_method,
         noniid_alpha=args.noniid_alpha,
     )
-    has_augmentation_variants = (
-        dataset_slug(args.dataset) == dataset_slug(REFERENCE_DATASET_NAME)
-    )
+    has_augmentation_variants = _materialized_augmentation_supported(args.dataset)
     if has_augmentation_variants:
         prepare_augmentation_variants(
             data_dir=args.data_dir,

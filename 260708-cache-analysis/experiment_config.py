@@ -124,6 +124,7 @@ CSV_COLUMNS = [
     "num_rounds",
     "learning_rate",
     "augment_enabled",
+    "augmentation_profile",
     "augment_resize",
     "augment_horizontal_flip",
     "augment_normalize",
@@ -183,6 +184,7 @@ CONDITION_COLUMNS = [
     "num_rounds",
     "learning_rate",
     "augment_enabled",
+    "augmentation_profile",
     "augment_resize",
     "augment_horizontal_flip",
     "augment_normalize",
@@ -324,6 +326,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="")
     parser.add_argument("--augment", default=json.dumps(DEFAULT_AUGMENT))
     parser.add_argument("--dataset-split", default="train")
+    parser.add_argument(
+        "--partition-method",
+        choices=("iid", "dirichlet_noniid"),
+        default="iid",
+    )
+    parser.add_argument("--noniid-alpha", type=float, default=0.3)
     parser.add_argument("--experiment-id", default="")
 
 
@@ -363,7 +371,7 @@ def condition_columns(
         "seed": getattr(args, "seed", DEFAULT_BASE_SEED),
         "dataset": getattr(args, "dataset", DATASET_NAME),
         "dataset_split": getattr(args, "dataset_split", "train"),
-        "partition_method": "iid",
+        "partition_method": getattr(args, "partition_method", "iid"),
         "num_clients": getattr(args, "num_clients", DEFAULT_NUM_CLIENTS),
         "client_partition_id": client_id,
         "model": getattr(args, "model", DEFAULT_MODEL),
@@ -377,6 +385,7 @@ def condition_columns(
         "num_rounds": getattr(args, "num_rounds", DEFAULT_NUM_ROUNDS),
         "learning_rate": getattr(args, "learning_rate", DEFAULT_LEARNING_RATE),
         "augment_enabled": bool(augment.get("enabled", True)),
+        "augmentation_profile": str(augment.get("_profile", "baseline")),
         "augment_resize": "x".join(str(v) for v in augment.get("resize", [])),
         "augment_horizontal_flip": bool(augment.get("horizontal_flip", False)),
         "augment_normalize": bool(augment.get("normalize", False)),

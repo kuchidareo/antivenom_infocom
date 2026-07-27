@@ -34,6 +34,9 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         seed=args.seed,
         resize=augment.get("resize", [64, 64]),
         batch_size=args.batch_size,
+        prepare_scenarios=poisoning_method,
+        partition_method=args.partition_method,
+        noniid_alpha=args.noniid_alpha,
     )
     num_classes = get_num_classes(args.data_dir, dataset_name=args.dataset)
     resize = augment.get("resize", [64, 64])
@@ -187,6 +190,9 @@ def main() -> None:
         seed=args.seed,
         resize=augment.get("resize", [64, 64]),
         batch_size=args.batch_size,
+        prepare_scenarios=POISONING_METHOD_CLEAN,
+        partition_method=args.partition_method,
+        noniid_alpha=args.noniid_alpha,
     )
     if args.prepare_only:
         return
