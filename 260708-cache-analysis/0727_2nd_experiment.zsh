@@ -15,13 +15,13 @@ REMOTE_IID_DATA_DIR="${REMOTE_IID_DATA_DIR:-${REMOTE_REPO_DIR}/iid-data}"
 REMOTE_NONIID_DATA_DIR="${REMOTE_NONIID_DATA_DIR:-${REMOTE_REPO_DIR}/non-iid-data}"
 LOCAL_IID_DATA_DIR="${LOCAL_IID_DATA_DIR:-${LOCAL_REPO_DIR}/iid-data}"
 LOCAL_NONIID_DATA_DIR="${LOCAL_NONIID_DATA_DIR:-${LOCAL_REPO_DIR}/non-iid-data}"
-REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/cache_0727_jetson_cpu/${JETSON_HOST}}"
-LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${SCRIPT_DIR}/collected_logs/logs_0727_jetson_cpu}"
+REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/cache_0727_jetson_cpu_20_trials/${JETSON_HOST}}"
+LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${SCRIPT_DIR}/collected_logs/logs_0727_jetson_cpu_20_trials}"
 
 MONITORING_FPS="${MONITORING_FPS:-50}"
 PERF_FPS="${PERF_FPS:-$MONITORING_FPS}"
 HARDWARE_FPS="${HARDWARE_FPS:-$MONITORING_FPS}"
-TRIALS="${TRIALS:-1}"
+TRIALS="${TRIALS:-20}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 BASE_SEED="${BASE_SEED:-260727}"
@@ -80,7 +80,7 @@ Small TrashNet availability-shortcut stages are intentionally omitted.
 
 Defaults:
   client partition: client_1
-  trials:           1
+  trials:           20
   epochs:           10
   batch size:       16
   learning rate:    0.001

@@ -36,8 +36,9 @@ from execution_profiles import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "cache_0727_jetson_cpu" / "192.168.0.141"
-DEFAULT_OUTPUT = DEFAULT_INPUT / "profile_outputs"
+DEFAULT_COLLECTION = SCRIPT_DIR / "cache_0727_jetson_cpu_20_trials"
+DEFAULT_INPUT = DEFAULT_COLLECTION / "192.168.0.141"
+DEFAULT_OUTPUT = DEFAULT_COLLECTION / "distribution_profile_cache_per_instruction"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -45,6 +46,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--phase", default="forward")
+    parser.add_argument(
+        "--counter-normalization",
+        choices=("raw", "per_instruction"),
+        default="per_instruction",
+        help=(
+            "Normalize every interval counter by its batch's total retired instructions before "
+            "profile fitting. The default makes the profile mean counter/instruction."
+        ),
+    )
     parser.add_argument("--conditions", nargs="+")
     parser.add_argument("--epochs", nargs="+", type=int, default=list(range(10)))
     parser.add_argument(
@@ -108,6 +118,7 @@ def plot_profile(
     batches: int,
     output_prefix: Path,
     dpi: int,
+    counter_normalization: str,
 ) -> None:
     centers = (edges[:-1] + edges[1:]) / 2.0
     x_step, mu_step = step_coordinates(edges, mu)
@@ -129,11 +140,20 @@ def plot_profile(
         alpha=0.18,
         label=f"Approx. rate variation for median interval width h={representative_width:.3f}",
     )
-    mean_axis.plot(x_step, mu_step, color="#155b8a", linewidth=2.0, label="Estimated mean increment rate")
+    mean_label = (
+        "Estimated mean counter / instruction"
+        if counter_normalization == "per_instruction"
+        else "Estimated mean increment rate"
+    )
+    mean_axis.plot(x_step, mu_step, color="#155b8a", linewidth=2.0, label=mean_label)
     mean_axis.scatter(midpoint, observed_rate, s=15, color="#c84c3a", alpha=0.58, label="Observed interval rate")
     for start, end, rate in zip(observations["a"], observations["b"], observed_rate):
         mean_axis.hlines(rate, start, end, color="#c84c3a", alpha=0.18, linewidth=0.8)
-    mean_axis.set_ylabel("Counter increment / progress")
+    mean_axis.set_ylabel(
+        "Counter / retired instruction"
+        if counter_normalization == "per_instruction"
+        else "Counter increment / progress"
+    )
     mean_axis.grid(True, color="#d9dde1", linewidth=0.55)
     mean_axis.legend(loc="best", fontsize=8, frameon=False)
     mean_axis.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
@@ -171,6 +191,7 @@ def plot_reconstruction(
     counter: str,
     path: Path,
     dpi: int,
+    counter_normalization: str,
 ) -> None:
     observed = observations["observed_increment"].to_numpy(dtype=float)
     residual = observed - predicted
@@ -180,8 +201,9 @@ def plot_reconstruction(
     figure, axes = plt.subplots(1, 2, figsize=(10.8, 4.2))
     axes[0].scatter(observed, predicted, s=18, alpha=0.65, color="#276b91")
     axes[0].plot([lower, upper], [lower, upper], color="#343638", linewidth=1.0, linestyle="--")
-    axes[0].set_xlabel("Observed interval increment")
-    axes[0].set_ylabel("Reconstructed interval increment")
+    unit = "normalized interval value" if counter_normalization == "per_instruction" else "interval increment"
+    axes[0].set_xlabel(f"Observed {unit}")
+    axes[0].set_ylabel(f"Reconstructed {unit}")
     axes[0].grid(True, color="#d9dde1", linewidth=0.55)
     axes[1].scatter(midpoint, residual, s=18, alpha=0.65, color="#b64b40")
     axes[1].axhline(0.0, color="#343638", linewidth=1.0, linestyle="--")
@@ -200,7 +222,10 @@ def plot_overviews(profiles: pd.DataFrame, output_dir: Path, dpi: int) -> int:
         return 0
     count = 0
     epoch_colors = plt.get_cmap("viridis", 10)
-    for (condition, counter), group in profiles.groupby(["condition", "counter"], sort=True):
+    multiple_runs = profiles.groupby("condition")["run_id"].nunique().to_dict()
+    for (condition, run_id, trial_id, counter), group in profiles.groupby(
+        ["condition", "run_id", "trial_id", "counter"], sort=True
+    ):
         figure, axes = plt.subplots(2, 1, figsize=(10.8, 7.0), sharex=True)
         for epoch, epoch_frame in group.groupby("epoch", sort=True):
             epoch_frame = epoch_frame.sort_values("bin_index")
@@ -218,7 +243,12 @@ def plot_overviews(profiles: pd.DataFrame, output_dir: Path, dpi: int) -> int:
                 color=color,
                 linewidth=1.5,
             )
-        axes[0].set_ylabel("Mean increment rate")
+        normalization = str(group["counter_normalization"].iloc[0])
+        axes[0].set_ylabel(
+            "Mean counter / instruction"
+            if normalization == "per_instruction"
+            else "Mean increment rate"
+        )
         axes[1].set_ylabel("Variance rate")
         axes[1].set_xlabel("Relative retired-instruction progress p")
         axes[1].set_xlim(0, 1)
@@ -226,9 +256,12 @@ def plot_overviews(profiles: pd.DataFrame, output_dir: Path, dpi: int) -> int:
             axis.grid(True, color="#d9dde1", linewidth=0.55)
             axis.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
         axes[0].legend(ncol=5, fontsize=7, frameon=False)
-        figure.suptitle(f"{condition} | {counter} | epoch profiles")
+        figure.suptitle(f"{condition} | {trial_id} | {counter} | epoch profiles")
         figure.tight_layout(rect=(0.01, 0.01, 0.99, 0.94))
-        path = output_dir / safe_name(str(condition)) / "overviews" / f"{safe_name(str(counter))}_epochs_overlay.png"
+        condition_dir = output_dir / safe_name(str(condition))
+        if multiple_runs.get(condition, 0) > 1:
+            condition_dir = condition_dir / "trials" / safe_name(str(trial_id))
+        path = condition_dir / "overviews" / f"{safe_name(str(counter))}_epochs_overlay.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
         plt.close(figure)
@@ -276,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     diagnostic_rows: list[dict] = []
     observation_rows: list[dict] = []
     warning_messages: list[str] = []
+    runs_per_condition: dict[str, int] = {}
+    for run in runs:
+        runs_per_condition[run.condition] = runs_per_condition.get(run.condition, 0) + 1
 
     for run_index, run in enumerate(runs):
         print(f"[{run_index + 1}/{len(runs)}] {run.condition}: {run.perf_path.name}", flush=True)
@@ -299,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                         {
                             "condition": run.condition,
                             "run_id": run.run_id,
+                            "trial_id": run.trial_id,
                             "epoch": epoch,
                             "counter": counter,
                             "status": "skipped",
@@ -310,11 +347,13 @@ def main(argv: list[str] | None = None) -> int:
                 base_diagnostic = {
                     "condition": run.condition,
                     "run_id": run.run_id,
+                    "trial_id": run.trial_id,
                     "epoch": epoch,
                     "counter": counter,
                     "phase": args.phase,
                     "instruction_column": instruction_column,
                     "counter_column": counter_column,
+                    "counter_normalization": args.counter_normalization,
                     "partial_batch_policy": "included" if args.include_partial_batch else "excluded",
                 }
                 try:
@@ -327,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                         partial=partial,
                         include_partial=args.include_partial_batch,
                         pmu_scaling=args.pmu_scaling,
+                        counter_normalization=args.counter_normalization,
                     )
                 except (ValueError, KeyError) as exc:
                     diagnostic_rows.append({**base_diagnostic, "status": "skipped", "reason": str(exc)})
@@ -434,6 +474,7 @@ def main(argv: list[str] | None = None) -> int:
                         {
                             "condition": run.condition,
                             "run_id": run.run_id,
+                            "trial_id": run.trial_id,
                             "epoch": epoch,
                             "counter": counter,
                             "bin_index": bin_index,
@@ -442,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
                             "progress_center": (start + end) / 2.0,
                             "estimated_mean_rate": mean_rate,
                             "estimated_variance_rate": variance_rate,
+                            "counter_normalization": args.counter_normalization,
                             "tau_squared": fitted.tau2,
                             "N": n,
                             "K": bin_diagnostic.k,
@@ -454,19 +496,25 @@ def main(argv: list[str] | None = None) -> int:
                         {
                             "condition": run.condition,
                             "run_id": run.run_id,
+                            "trial_id": run.trial_id,
                             "epoch": epoch,
                             "counter": counter,
                             "observation_index": observation_index,
                             "batch_idx": int(row["batch_idx"]),
                             "progress_start": row["a"],
                             "progress_end": row["b"],
+                            "batch_total_instructions": row["batch_total_instructions"],
+                            "raw_counter_increment": row["raw_counter_increment"],
                             "observed_increment": row["observed_increment"],
                             "predicted_increment": fitted.predicted[observation_index],
                             "residual": fitted.residuals[observation_index],
                         }
                     )
                 if not args.no_plots:
-                    epoch_dir = output_dir / safe_name(run.condition) / f"epoch_{epoch:02d}"
+                    condition_dir = output_dir / safe_name(run.condition)
+                    if runs_per_condition[run.condition] > 1:
+                        condition_dir = condition_dir / "trials" / safe_name(run.trial_id)
+                    epoch_dir = condition_dir / f"epoch_{epoch:02d}"
                     prefix = epoch_dir / f"{safe_name(counter)}_profile"
                     plot_profile(
                         observations=observations,
@@ -482,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
                         batches=int(construction["used_batches"]),
                         output_prefix=prefix,
                         dpi=args.dpi,
+                        counter_normalization=args.counter_normalization,
                     )
                     plot_reconstruction(
                         observations,
@@ -491,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
                         counter=counter,
                         path=epoch_dir / f"{safe_name(counter)}_reconstruction.png",
                         dpi=args.dpi,
+                        counter_normalization=args.counter_normalization,
                     )
 
     profile_frame, diagnostic_frame = write_tables(output_dir, profile_rows, diagnostic_rows, observation_rows)
@@ -506,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         "phase": args.phase,
         "include_partial_batch": args.include_partial_batch,
         "pmu_scaling": args.pmu_scaling,
+        "counter_normalization": args.counter_normalization,
         "successful_epoch_counter_profiles": successful,
         "skipped_epoch_counter_profiles": skipped,
         "profile_rows": len(profile_frame),

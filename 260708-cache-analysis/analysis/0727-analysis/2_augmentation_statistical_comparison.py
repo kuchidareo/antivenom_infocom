@@ -23,9 +23,10 @@ import pandas as pd
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "cache_0727_jetson_cpu-2nd" / "192.168.0.141"
-DEFAULT_PROFILE_DIR = SCRIPT_DIR / "cache_0727_jetson_cpu-2nd" / "distribution_profile_cache"
-DEFAULT_OUTPUT = SCRIPT_DIR / "cache_0727_jetson_cpu-2nd" / "distribution_statistical_comparison"
+DEFAULT_COLLECTION = SCRIPT_DIR / "cache_0727_jetson_cpu_20_trials"
+DEFAULT_INPUT = DEFAULT_COLLECTION / "192.168.0.141"
+DEFAULT_PROFILE_DIR = DEFAULT_COLLECTION / "distribution_profile_cache_per_instruction"
+DEFAULT_OUTPUT = DEFAULT_COLLECTION / "distribution_statistical_comparison_per_instruction"
 TARGET_LABELS = {
     "availability_shortcut": "shortcut",
     "non_iid": "non-IID",
@@ -54,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-paired-epochs", type=int, default=5)
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--dpi", type=int, default=160)
+    parser.add_argument(
+        "--profile-cv-folds",
+        type=int,
+        default=0,
+        help="Batch CV folds used only when profiles must be estimated; 0 avoids repeated fitting.",
+    )
     parser.add_argument("--rebuild-profiles", action="store_true")
     parser.add_argument("--no-auto-estimate", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -66,6 +73,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--alpha must be in (0, 1)")
     if not args.epochs or any(epoch < 0 for epoch in args.epochs):
         parser.error("--epochs must contain non-negative values")
+    if args.profile_cv_folds < 0:
+        parser.error("--profile-cv-folds must be non-negative")
     return args
 
 
@@ -76,18 +85,34 @@ def condition_name(dataset: str, model: str, role: str) -> str:
     return f"{prefix}_{role}"
 
 
-def requested_condition_map(datasets: list[str], models: list[str]) -> dict[tuple[str, str], dict[str, str]]:
+def condition_name_candidates(dataset: str, model: str, role: str) -> tuple[str, ...]:
+    """Support both the cache-study and motivational-study directory names."""
+    canonical = condition_name(dataset, model, role)
+    motivational = f"{dataset}_{model}_{role}"
+    return tuple(dict.fromkeys((canonical, motivational)))
+
+
+def requested_condition_map(
+    datasets: list[str],
+    models: list[str],
+    available: set[str] | None = None,
+) -> dict[tuple[str, str], dict[str, str]]:
     output: dict[tuple[str, str], dict[str, str]] = {}
     for dataset in datasets:
         for model in models:
-            output[(dataset, model)] = {
-                "clean": condition_name(dataset, model, "clean"),
-                "moderate": condition_name(dataset, model, "moderate_augmentation"),
-                **{
-                    role: condition_name(dataset, model, role)
-                    for role in TARGET_LABELS
-                },
+            conditions: dict[str, str] = {}
+            roles = {
+                "clean": "clean",
+                "moderate": "moderate_augmentation",
+                **{role: role for role in TARGET_LABELS},
             }
+            for role, directory_role in roles.items():
+                candidates = condition_name_candidates(dataset, model, directory_role)
+                conditions[role] = next(
+                    (candidate for candidate in candidates if available is not None and candidate in available),
+                    candidates[0],
+                )
+            output[(dataset, model)] = conditions
     return output
 
 
@@ -130,6 +155,7 @@ def estimate_profiles(
     conditions: list[str],
     epochs: list[int],
     counters: list[str] | None,
+    cv_folds: int,
 ) -> None:
     command = [
         sys.executable,
@@ -142,6 +168,10 @@ def estimate_profiles(
         *conditions,
         "--epochs",
         *(str(epoch) for epoch in epochs),
+        "--counter-normalization",
+        "per_instruction",
+        "--cv-folds",
+        str(cv_folds),
     ]
     if counters:
         command.extend(("--counters", *counters))
@@ -155,8 +185,16 @@ def ensure_profile_tables(args: argparse.Namespace, required: set[str]) -> tuple
     profiles_path = profile_dir / "profiles.csv"
     diagnostics_path = profile_dir / "diagnostics.csv"
     existing: set[str] = set()
+    compatible = False
     if profiles_path.exists():
-        existing = set(pd.read_csv(profiles_path, usecols=["condition"])["condition"].dropna().astype(str))
+        columns = pd.read_csv(profiles_path, nrows=0).columns
+        if "counter_normalization" in columns:
+            cached = pd.read_csv(profiles_path, usecols=["condition", "counter_normalization"])
+            compatible = cached["counter_normalization"].astype(str).eq("per_instruction").all()
+            if compatible:
+                existing = set(cached["condition"].dropna().astype(str))
+        if not compatible:
+            warnings.warn(f"Ignoring incompatible non-normalized profile cache: {profiles_path}")
     missing = required - existing
     if args.rebuild_profiles or missing:
         if args.no_auto_estimate:
@@ -169,6 +207,7 @@ def ensure_profile_tables(args: argparse.Namespace, required: set[str]) -> tuple
             sorted(required),
             list(args.epochs),
             args.counters,
+            args.profile_cv_folds,
         )
     if not profiles_path.exists() or not diagnostics_path.exists():
         raise FileNotFoundError(f"Missing profile tables below {profile_dir}")
@@ -199,13 +238,15 @@ def resample_profile(group: pd.DataFrame, progress: np.ndarray) -> tuple[np.ndar
     return mu, np.maximum(q, 0.0), max(tau2, 0.0)
 
 
-def representative_widths(diagnostics: pd.DataFrame) -> dict[tuple[str, str, int], float]:
+def representative_widths(diagnostics: pd.DataFrame) -> dict[tuple[str, str, str, int], float]:
     valid = diagnostics[diagnostics["status"].astype(str).eq("ok")].copy()
+    if "run_id" not in valid:
+        valid["run_id"] = "run_0"
     valid["representative_interval_width"] = pd.to_numeric(
         valid["representative_interval_width"], errors="coerce"
     )
     return {
-        (str(row.condition), str(row.counter), int(row.epoch)): float(row.representative_interval_width)
+        (str(row.condition), str(row.run_id), str(row.counter), int(row.epoch)): float(row.representative_interval_width)
         for row in valid.itertuples()
         if np.isfinite(row.representative_interval_width) and row.representative_interval_width > 0
     }
@@ -216,11 +257,16 @@ def profile_store(
     diagnostics: pd.DataFrame,
     progress: np.ndarray,
 ) -> dict[tuple[str, str, int], tuple[np.ndarray, np.ndarray]]:
+    profiles = profiles.copy()
+    if "run_id" not in profiles:
+        profiles["run_id"] = "run_0"
     widths = representative_widths(diagnostics)
-    store: dict[tuple[str, str, int], tuple[np.ndarray, np.ndarray]] = {}
-    for key, group in successful_rows(profiles).groupby(["condition", "counter", "epoch"], sort=False):
-        condition, counter, epoch = str(key[0]), str(key[1]), int(key[2])
-        width = widths.get((condition, counter, epoch))
+    run_store: dict[tuple[str, str, str, int], tuple[np.ndarray, np.ndarray]] = {}
+    for key, group in successful_rows(profiles).groupby(
+        ["condition", "run_id", "counter", "epoch"], sort=False
+    ):
+        condition, run_id, counter, epoch = str(key[0]), str(key[1]), str(key[2]), int(key[3])
+        width = widths.get((condition, run_id, counter, epoch))
         if width is None:
             warnings.warn(f"Skipping {key}: missing representative interval width")
             continue
@@ -232,7 +278,21 @@ def profile_store(
         # q is a variance density. Convert it to the variance of an interval
         # rate at the observed representative progress width before comparison.
         rate_variance = q / width + tau2 / (width * width)
-        store[(condition, counter, epoch)] = (mu, np.maximum(rate_variance, 0.0))
+        run_store[(condition, run_id, counter, epoch)] = (
+            mu,
+            np.maximum(rate_variance, 0.0),
+        )
+
+    grouped: dict[tuple[str, str, int], list[tuple[np.ndarray, np.ndarray]]] = {}
+    for (condition, _run_id, counter, epoch), distribution in run_store.items():
+        grouped.setdefault((condition, counter, epoch), []).append(distribution)
+
+    store: dict[tuple[str, str, int], tuple[np.ndarray, np.ndarray]] = {}
+    for key, distributions in grouped.items():
+        store[key] = aggregate_gaussians(
+            np.stack([distribution[0] for distribution in distributions]),
+            np.stack([distribution[1] for distribution in distributions]),
+        )
     return store
 
 
@@ -455,8 +515,8 @@ def plot_metric(
             zorder=3,
         )
 
-    mean_axis.set_ylabel("Mean counter rate")
-    sd_axis.set_ylabel("Representative-interval\nrate SD")
+    mean_axis.set_ylabel("Mean counter / instruction")
+    sd_axis.set_ylabel("Counter/instruction\nrate SD")
     distance_axis.set_ylabel("Gaussian W2 distance")
     distance_axis.set_xlabel("Relative retired-instruction progress")
     distance_axis.set_xlim(0.0, 1.0)
@@ -512,8 +572,8 @@ def main() -> int:
         raise FileExistsError(f"Output exists below {output_dir}; pass --overwrite")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    maps = requested_condition_map(list(args.datasets), list(args.models))
     raw_conditions = available_raw_conditions(input_dir)
+    maps = requested_condition_map(list(args.datasets), list(args.models), raw_conditions)
     usable_maps: dict[tuple[str, str], dict[str, str]] = {}
     required: set[str] = set()
     warnings_list: list[str] = []
@@ -539,6 +599,11 @@ def main() -> int:
     profiles_path, diagnostics_path = ensure_profile_tables(args, required)
     profiles = pd.read_csv(profiles_path)
     diagnostics = pd.read_csv(diagnostics_path)
+    runs_per_condition = (
+        profiles.groupby("condition")["run_id"].nunique().astype(int).to_dict()
+        if "run_id" in profiles
+        else {condition: 1 for condition in profiles["condition"].dropna().astype(str).unique()}
+    )
     profiles = profiles[profiles["condition"].isin(required) & profiles["epoch"].isin(args.epochs)]
     diagnostics = diagnostics[diagnostics["condition"].isin(required) & diagnostics["epoch"].isin(args.epochs)]
     if args.counters:
@@ -683,13 +748,16 @@ def main() -> int:
         "models": list(args.models),
         "epochs": list(args.epochs),
         "progress_points": args.progress_points,
+        "counter_normalization": "Per batch: interval counter increments divided by that batch's total retired instructions before progress-profile fitting",
         "normal_reference": "Equal-weight Gaussian moment match of clean and moderate augmentation at each epoch and progress point",
         "variance_conversion": "rate_variance(p; h) = q(p) / h + tau_squared / h^2, using each fitted epoch's representative interval width h",
         "global_statistic": "Integral over instruction progress of Gaussian 2-Wasserstein distance squared",
         "test": "Exact epoch-paired label-swap permutation test between the normal reference and each target distribution",
         "pointwise_correction": "Both BH-FDR and max-permutation FWER p-values are saved",
         "global_multiple_testing": "BH-FDR within each dataset/model across counters and target conditions",
-        "inference_scope": "Repeated epochs from one run per condition; not between-run population inference",
+        "run_aggregation": "For each condition/counter/epoch, independent run profiles are combined by Gaussian moment matching before epoch-paired comparison",
+        "runs_per_condition": runs_per_condition,
+        "inference_scope": "Epoch-paired comparison of profiles estimated from all available runs; epochs remain the permutation-test pairs",
         "warnings": warnings_list,
         "successful_comparisons": int(len(global_frame)),
         "globally_significant": int(global_frame["global_fdr_significant"].sum()),

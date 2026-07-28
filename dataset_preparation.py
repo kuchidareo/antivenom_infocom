@@ -93,6 +93,8 @@ DEFAULT_TARGET_LABEL_FLIP_TARGET_LABEL = _config_value(
 )
 DEFAULT_PARTITION_METHOD = _config_value("DEFAULT_PARTITION_METHOD", "iid")
 DEFAULT_NONIID_ALPHA = _config_value("DEFAULT_NONIID_ALPHA", 0.3)
+IID_PARTITION_GENERATION_VERSION = "iid_label_round_robin_v1"
+NONIID_PARTITION_GENERATION_VERSION = "balanced_dirichlet_v2"
 
 POISONING_METHOD_AVAILABILITY_SHORTCUTS = _config_value(
     "POISONING_METHOD_AVAILABILITY_SHORTCUTS", "availability_shortcuts"
@@ -176,10 +178,22 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 METADATA_NAME = "partition_metadata.csv"
 PREPARED_MARKER = "PREPARED"
 REFERENCE_DATASET_NAME = "kuchidareo/small_trashnet"
-MATERIALIZED_AUGMENTATION_DATASET_SLUGS = {"small_trashnet", "cifar10"}
+MATERIALIZED_AUGMENTATION_DATASET_SLUGS = {
+    "small_trashnet",
+    "chinese_trafficsign_dataset",
+    "cifar10",
+}
+MATERIALIZED_CLEAN_RESIZE_DATASET_SLUGS = {
+    "small_trashnet",
+    "chinese_trafficsign_dataset",
+}
 MATCH_REFERENCE_SIZE_DATASETS = {
     "kuchidareo/chinese_trafficsign_dataset",
     "uoft-cs/cifar10",
+}
+REFERENCE_SIZE_MULTIPLIERS = {
+    # About 2,022 train images per IID client: 16 DataLoader batches at bs=128.
+    "uoft-cs/cifar10": 10,
 }
 PREPARE_SCENARIO_ALL = "all"
 PREPARE_SCENARIOS = [
@@ -293,6 +307,24 @@ def _metadata_partition_method(rows: Sequence[Dict[str, Any]]) -> str:
     return next(iter(methods), "iid")
 
 
+def _partition_generation_version(partition_method: str) -> str:
+    if _canonical_partition_method(partition_method) == "iid":
+        return IID_PARTITION_GENERATION_VERSION
+    return NONIID_PARTITION_GENERATION_VERSION
+
+
+def _metadata_partition_generation_matches(
+    rows: Sequence[Dict[str, Any]], partition_method: str
+) -> bool:
+    expected = _partition_generation_version(partition_method)
+    clean_rows = [
+        row for row in rows if row.get("poisoning_method") == POISONING_METHOD_CLEAN
+    ]
+    return bool(clean_rows) and all(
+        row.get("partition_generation_version") == expected for row in clean_rows
+    )
+
+
 def _fill_partition_metadata(
     rows: Sequence[Dict[str, Any]],
     *,
@@ -328,11 +360,14 @@ def _resolve_metadata_image_path(
     raw = Path(image_path)
     slug = dataset_slug(dataset_name)
     candidates: List[Path] = []
+    parts = raw.parts
 
     if raw.is_absolute():
+        if slug in parts:
+            slug_idx = parts.index(slug)
+            candidates.append(root.joinpath(*parts[slug_idx + 1 :]))
         candidates.append(raw)
     else:
-        parts = raw.parts
         if slug in parts:
             slug_idx = parts.index(slug)
             candidates.append(root.joinpath(*parts[slug_idx + 1 :]))
@@ -355,14 +390,45 @@ def prepared_data_exists(
     if not (root / METADATA_NAME).exists() or not (root / PREPARED_MARKER).exists():
         return False
     rows = _read_metadata_rows(root)
+    if not _prepared_clean_size_matches(
+        rows,
+        data_dir=data_dir,
+        dataset_name=dataset_name or DATASET_NAME,
+    ):
+        return False
     if partition_method is not None and _metadata_partition_method(rows) != _canonical_partition_method(
         partition_method
+    ):
+        return False
+    if partition_method is not None and not _metadata_partition_generation_matches(
+        rows, partition_method
     ):
         return False
     if not any(
         row.get("poisoning_method") == POISONING_METHOD_CLEAN
         and row.get("dataset_split") == "test"
         for row in rows
+    ):
+        return False
+    clean_train_count = sum(
+        row.get("poisoning_method") == POISONING_METHOD_CLEAN
+        and row.get("dataset_split") == "train"
+        for row in rows
+    )
+    required_training_row_methods = (
+        POISONING_METHOD_UNLEARNABLE_EXAMPLES,
+        POISONING_METHOD_RANDOM_LABEL_FLIPPING,
+        POISONING_METHOD_TARGET_LABEL_FLIPPING,
+        POISONING_METHOD_AVAILABILITY_SHORTCUTS,
+    )
+    if any(
+        sum(
+            row.get("poisoning_method") == method
+            and row.get("dataset_split") == "train"
+            for row in rows
+        )
+        != clean_train_count
+        for method in required_training_row_methods
     ):
         return False
     shortcut_rows = [
@@ -453,6 +519,10 @@ def _should_match_reference_size(dataset_name: str) -> bool:
     return dataset_name in MATCH_REFERENCE_SIZE_DATASETS
 
 
+def _reference_size_multiplier(dataset_name: str) -> int:
+    return int(REFERENCE_SIZE_MULTIPLIERS.get(dataset_name, 1))
+
+
 def _reference_clean_split_counts(
     data_dir: str,
     reference_dataset_name: str = REFERENCE_DATASET_NAME,
@@ -479,6 +549,30 @@ def _reference_clean_split_counts(
             "test": test_count,
         }
     return raw_counts
+
+
+def _expected_clean_split_counts(data_dir: str, dataset_name: str) -> Dict[str, int]:
+    multiplier = _reference_size_multiplier(dataset_name)
+    return {
+        split: count * multiplier
+        for split, count in _reference_clean_split_counts(data_dir).items()
+    }
+
+
+def _prepared_clean_size_matches(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    data_dir: str,
+    dataset_name: str,
+) -> bool:
+    if not _should_match_reference_size(dataset_name):
+        return True
+    actual: Dict[str, int] = {}
+    for row in rows:
+        if row.get("poisoning_method") == POISONING_METHOD_CLEAN:
+            split = row.get("dataset_split", "train")
+            actual[split] = actual.get(split, 0) + 1
+    return actual == _expected_clean_split_counts(data_dir, dataset_name)
 
 
 def _balanced_subset_indices(ds: Any, target_count: int, seed: int) -> List[int]:
@@ -535,7 +629,7 @@ def _maybe_match_reference_split_size(
     if not _should_match_reference_size(dataset_name):
         return ds, source_indices
 
-    reference_counts = _reference_clean_split_counts(data_dir)
+    reference_counts = _expected_clean_split_counts(data_dir, dataset_name)
     if split == "train" and not has_explicit_test_split:
         target_count = sum(reference_counts.values())
     else:
@@ -570,7 +664,7 @@ def _assign_dirichlet_noniid_partitions(
     seed: int,
     alpha: float,
 ) -> Dict[int, str]:
-    """Assign label-skew partitions while guaranteeing non-empty clients."""
+    """Assign label-skew partitions with balanced client sample counts."""
     import numpy as np
     from collections import defaultdict
 
@@ -585,20 +679,27 @@ def _assign_dirichlet_noniid_partitions(
         by_label[label].append(idx)
 
     rng = np.random.default_rng(seed)
+    total_samples = sum(len(indices) for indices in by_label.values())
+    capacities = np.full(num_clients, total_samples // num_clients, dtype=np.int64)
+    capacities[: total_samples % num_clients] += 1
+    remaining = capacities.copy()
     client_indices: Dict[int, List[int]] = {idx: [] for idx in range(num_clients)}
     for label in sorted(by_label):
         indices = np.asarray(by_label[label], dtype=np.int64)
         rng.shuffle(indices)
         proportions = rng.dirichlet(np.full(num_clients, alpha, dtype=np.float64))
-        cuts = (np.cumsum(proportions)[:-1] * len(indices)).astype(int)
-        for client_idx, shard in enumerate(np.split(indices, cuts)):
-            client_indices[client_idx].extend(int(item) for item in shard)
+        for item_idx in indices:
+            available = remaining > 0
+            weights = proportions * available
+            if weights.sum() <= 0:
+                weights = remaining.astype(np.float64)
+            weights /= weights.sum()
+            client_idx = int(rng.choice(num_clients, p=weights))
+            client_indices[client_idx].append(int(item_idx))
+            remaining[client_idx] -= 1
 
-    for empty_client in [idx for idx, values in client_indices.items() if not values]:
-        donor = max(client_indices, key=lambda idx: len(client_indices[idx]))
-        if len(client_indices[donor]) <= 1:
-            raise ValueError("Could not rebalance non-IID partitions without empty clients.")
-        client_indices[empty_client].append(client_indices[donor].pop())
+    if np.any(remaining != 0):
+        raise RuntimeError(f"Balanced non-IID assignment left capacities: {remaining.tolist()}")
 
     return {
         item_idx: f"client_{client_idx}"
@@ -635,6 +736,64 @@ def _save_jpeg(
     if subsampling is not None:
         options["subsampling"] = subsampling
     image.convert("RGB").save(path, **options)
+
+
+def _clean_image_for_storage(
+    image: Image.Image,
+    *,
+    dataset_name: str,
+    resize: Sequence[int],
+) -> Image.Image:
+    """Materialize clean images at training resolution when required."""
+    if dataset_slug(dataset_name) not in MATERIALIZED_CLEAN_RESIZE_DATASET_SLUGS:
+        return image
+    if len(resize) != 2 or any(int(value) <= 0 for value in resize):
+        raise ValueError(f"Clean resize must contain two positive dimensions, got {resize!r}.")
+    height, width = (int(resize[0]), int(resize[1]))
+    return image.convert("RGB").resize((width, height), resample=Image.Resampling.BILINEAR)
+
+
+def _materialize_existing_clean_resize(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    data_dir: str,
+    dataset_name: str,
+    resize: Sequence[int],
+) -> int:
+    """Upgrade metadata-referenced clean JPEGs to the configured stored size."""
+    if dataset_slug(dataset_name) not in MATERIALIZED_CLEAN_RESIZE_DATASET_SLUGS:
+        return 0
+    if len(resize) != 2 or any(int(value) <= 0 for value in resize):
+        raise ValueError(f"Clean resize must contain two positive dimensions, got {resize!r}.")
+
+    height, width = (int(resize[0]), int(resize[1]))
+    expected_size = (width, height)
+    resized_count = 0
+    seen: set[Path] = set()
+    for row in rows:
+        if row.get("poisoning_method") != POISONING_METHOD_CLEAN:
+            continue
+        path = Path(
+            _resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)
+        )
+        resolved_path = path.resolve()
+        if resolved_path in seen:
+            continue
+        seen.add(resolved_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Missing clean image referenced by metadata: {path}")
+        with Image.open(path) as source:
+            if source.size == expected_size:
+                continue
+            resized = source.convert("RGB").resize(
+                expected_size,
+                resample=Image.Resampling.BILINEAR,
+            )
+        temporary_path = path.with_name(f".{path.stem}.resize.tmp{path.suffix}")
+        _save_jpeg(resized, temporary_path)
+        os.replace(temporary_path, path)
+        resized_count += 1
+    return resized_count
 
 
 def _read_metadata_rows(root: Path) -> List[Dict[str, Any]]:
@@ -687,6 +846,16 @@ def prune_unreferenced_images(*, data_dir: str, dataset_name: str) -> int:
         Path(_resolve_metadata_image_path(row["image_path"], data_dir, dataset_name)).resolve()
         for row in rows
     }
+    for row in rows:
+        if (
+            row.get("poisoning_method") != POISONING_METHOD_CLEAN
+            or row.get("dataset_split") != "train"
+        ):
+            continue
+        for profile_name in AUGMENTATION_VARIANT_NAMES:
+            augmented_path = _augmented_clean_path(root, profile_name, row)
+            if augmented_path.exists():
+                referenced.add(augmented_path.resolve())
     removed = 0
     image_paths = (
         path
@@ -1807,6 +1976,17 @@ def prepare_dataset(
         metadata_changed = True
     if metadata_changed:
         _write_metadata_rows(root, existing_rows)
+    resized_clean_images = _materialize_existing_clean_resize(
+        existing_rows,
+        data_dir=data_dir,
+        dataset_name=dataset_name,
+        resize=resize,
+    )
+    if resized_clean_images:
+        print(
+            f"Resized {resized_clean_images} existing clean images to "
+            f"{int(resize[1])}x{int(resize[0])} in {root}"
+        )
     if existing_rows and not any(
         row.get("poisoning_method") == POISONING_METHOD_CLEAN
         and row.get("dataset_split") == "test"
@@ -1828,6 +2008,7 @@ def prepare_dataset(
                     "test_seed": test_seed,
                     "partition_method": partition_method,
                     "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                    "reference_size_multiplier": _reference_size_multiplier(dataset_name),
                 }
             )
         )
@@ -1854,8 +2035,16 @@ def prepare_dataset(
         data_dir=data_dir,
         dataset_name=dataset_name,
     )
-    if clean_records_from_existing and _mode_complete(root, "clean", num_clients) and (
-        not force or POISONING_METHOD_CLEAN not in requested_scenarios
+    if (
+        clean_records_from_existing
+        and _mode_complete(root, "clean", num_clients)
+        and _prepared_clean_size_matches(
+            existing_rows,
+            data_dir=data_dir,
+            dataset_name=dataset_name,
+        )
+        and _metadata_partition_generation_matches(existing_rows, partition_method)
+        and (not force or POISONING_METHOD_CLEAN not in requested_scenarios)
     ):
         missing_or_requested = [
             scenario
@@ -1914,6 +2103,7 @@ def prepare_dataset(
                     "test_seed": test_seed,
                     "partition_method": partition_method,
                     "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                    "reference_size_multiplier": _reference_size_multiplier(dataset_name),
                 }
             )
         )
@@ -1963,7 +2153,14 @@ def prepare_dataset(
             client_id = assignments[idx]
             relative_path = Path(_safe_class_name(class_name)) / f"{split}_{source_index:06d}.jpeg"
             clean_path = root / "clean" / client_id / relative_path
-            _save_jpeg(image, clean_path)
+            _save_jpeg(
+                _clean_image_for_storage(
+                    image,
+                    dataset_name=dataset_name,
+                    resize=resize,
+                ),
+                clean_path,
+            )
             record = {
                 "source_index": source_index,
                 "image_path": str(clean_path),
@@ -1991,6 +2188,10 @@ def prepare_dataset(
                 "partition_id": client_id,
                 "partition_method": partition_method,
                 "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                "partition_generation_version": _partition_generation_version(
+                    partition_method
+                ),
+                "reference_size_multiplier": _reference_size_multiplier(dataset_name),
                 "dataset_split": split,
                 "is_poisoned": False,
                 "poisoning_method": POISONING_METHOD_CLEAN,
@@ -2048,6 +2249,7 @@ def prepare_dataset(
                 "test_seed": test_seed,
                 "partition_method": partition_method,
                 "noniid_alpha": noniid_alpha if partition_method != "iid" else "",
+                "reference_size_multiplier": _reference_size_multiplier(dataset_name),
             }
         )
     )
@@ -2619,15 +2821,21 @@ def get_dataloader(
     badsampler_run_name: str = "run",
     badsampler_device: Optional[Any] = None,
     badsampler_num_epochs: int = 1,
+    max_samples: int = 0,
+    subset_seed: int = 0,
 ) -> Any:
     _, _, DataLoader, _ = _require_torch()
+    from torch.utils.data import Subset
+
+    if max_samples < 0:
+        raise ValueError(f"max_samples must be >= 0, got {max_samples}")
     augmentation_profile = str(
         augment.get("_profile", DEFAULT_AUGMENTATION_PROFILE)
     )
     loader_augment = augment
     if augmentation_profile != DEFAULT_AUGMENTATION_PROFILE and split == "train":
         loader_augment = evaluation_augment_from_training(augment)
-    dataset = LocalImageDataset(
+    base_dataset = LocalImageDataset(
         data_dir=data_dir,
         dataset_name=dataset_name,
         client_id=client_id,
@@ -2636,6 +2844,17 @@ def get_dataloader(
         split=split,
         transform=build_transform(loader_augment),
     )
+    selected_records = list(base_dataset.records)
+    dataset: Any = base_dataset
+    if max_samples and len(base_dataset) > max_samples:
+        rng = random.Random(subset_seed)
+        selected_indices = sorted(rng.sample(range(len(base_dataset)), max_samples))
+        selected_records = [base_dataset.records[index] for index in selected_indices]
+        dataset = Subset(base_dataset, selected_indices)
+        print(
+            f"Selected deterministic training subset: {len(dataset)}/{len(base_dataset)} "
+            f"samples seed={subset_seed}"
+        )
     if poisoning_method != POISONING_METHOD_BADSAMPLING:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
     if surrogate_model is None:
@@ -2655,7 +2874,7 @@ def get_dataloader(
     ranking_path = _write_badsampler_runtime_ranking(
         root=_dataset_root(data_dir, dataset_name),
         client_id=client_id,
-        records=dataset.records,
+        records=selected_records,
         losses=losses,
         hard_positions=hard_positions,
         batch_size=batch_size,
@@ -2719,6 +2938,11 @@ def main() -> None:
         action="store_true",
         help="Delete image files under this dataset root that are not referenced by metadata.",
     )
+    parser.add_argument(
+        "--skip-augmentation-variants",
+        action="store_true",
+        help="Do not materialize moderate/strong clean augmentation variants.",
+    )
     args = parser.parse_args()
     augment = augment_from_args(args)
     resize = augment.get("resize", [64, 64])
@@ -2753,6 +2977,7 @@ def main() -> None:
     has_augmentation_variants = (
         _materialized_augmentation_supported(args.dataset)
         and POISONING_METHOD_CLEAN in requested_scenarios
+        and not args.skip_augmentation_variants
     )
     if has_augmentation_variants:
         prepare_augmentation_variants(

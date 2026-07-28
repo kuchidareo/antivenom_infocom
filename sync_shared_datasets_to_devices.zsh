@@ -10,7 +10,7 @@ SSH_PORT="${SSH_PORT:-22}"
 CONNECT_TIMEOUT_SEC="${CONNECT_TIMEOUT_SEC:-5}"
 
 DATASET_DIRS=(iid-data non-iid-data)
-DEVICES=(
+DEFAULT_DEVICES=(
   192.168.0.112
   192.168.0.113
   192.168.0.114
@@ -24,6 +24,12 @@ DEVICES=(
   192.168.0.141
   192.168.0.142
 )
+
+if (( $# > 0 )); then
+  DEVICES=("$@")
+else
+  DEVICES=("${DEFAULT_DEVICES[@]}")
+fi
 
 for dataset_dir in "${DATASET_DIRS[@]}"; do
   if [[ ! -d "${SCRIPT_DIR}/${dataset_dir}" ]]; then
@@ -75,16 +81,16 @@ for host in "${DEVICES[@]}"; do
   for dataset_dir in "${DATASET_DIRS[@]}"; do
     local_dir="${SCRIPT_DIR}/${dataset_dir}"
     remote_dir="${REMOTE_REPO_DIR}/${dataset_dir}"
-    echo "    replacing ${remote_dir}"
+    echo "    syncing ${remote_dir}"
 
     if ! "${SSH_CMD[@]}" "${remote}" \
-      "rm -rf '${remote_dir}' && mkdir -p '${remote_dir}'"; then
-      echo "    error: could not replace ${remote_dir}" >&2
+      "mkdir -p '${remote_dir}'"; then
+      echo "    error: could not create ${remote_dir}" >&2
       host_failed=1
       break
     fi
 
-    if ! rsync -az --delete \
+    if ! rsync -az --partial --delay-updates --delete-delay \
       -e "${RSYNC_RSH}" \
       "${local_dir}/" \
       "${remote}:${remote_dir}/"; then

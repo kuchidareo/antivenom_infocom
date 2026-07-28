@@ -70,6 +70,7 @@ INVALID_TEXT = {"", "nan", "none", "<not counted>", "<not supported>"}
 class RunFiles:
     condition: str
     run_id: str
+    trial_id: str
     perf_path: Path
     metrics_path: Path | None
     hardware_path: Path | None
@@ -138,10 +139,13 @@ def discover_runs(input_dir: Path) -> list[RunFiles]:
         metrics_path = perf_path.with_name(f"{prefix}_metrics.csv")
         hardware_path = perf_path.with_name(f"{prefix}.csv")
         metadata = read_first_row(perf_path)
+        experiment_id = str(metadata.get("experiment_id") or perf_path.parent.name)
+        trial_id = str(metadata.get("trial_id") or prefix)
         runs.append(
             RunFiles(
                 condition=perf_path.parent.name,
-                run_id=str(metadata.get("experiment_id") or prefix),
+                run_id=f"{experiment_id}:{trial_id}:{prefix}",
+                trial_id=trial_id,
                 perf_path=perf_path,
                 metrics_path=metrics_path if metrics_path.is_file() else None,
                 hardware_path=hardware_path if hardware_path.is_file() else None,
@@ -285,8 +289,11 @@ def build_forward_observations(
     partial: set[tuple[int, int]],
     include_partial: bool,
     pmu_scaling: str,
+    counter_normalization: str = "raw",
     nonnegative: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
+    if counter_normalization not in {"raw", "per_instruction"}:
+        raise ValueError(f"Unsupported counter normalization: {counter_normalization}")
     schema = resolve_structural_columns(frame.columns)
     required = (schema["epoch"], schema["batch_idx"], schema["phase"], schema["timestamp"])
     if any(column is None for column in required):
@@ -331,6 +338,9 @@ def build_forward_observations(
             valid_counter &= counters >= 0
         invalid_counter_rows += int((~valid_counter).sum())
         for position in np.flatnonzero(valid_counter):
+            observed_value = float(counters[position])
+            if counter_normalization == "per_instruction":
+                observed_value /= total
             records.append(
                 {
                     "epoch": epoch,
@@ -340,7 +350,9 @@ def build_forward_observations(
                     "b": float(ends[position]),
                     "width": float(ends[position] - starts[position]),
                     "instructions": float(instructions[position]),
-                    "observed_increment": float(counters[position]),
+                    "batch_total_instructions": total,
+                    "raw_counter_increment": float(counters[position]),
+                    "observed_increment": observed_value,
                 }
             )
     observations = pd.DataFrame.from_records(records)
@@ -355,6 +367,12 @@ def build_forward_observations(
             observations.groupby("batch_idx").size().astype(int).to_dict() if not observations.empty else {}
         ),
         "scaling": scaling,
+        "counter_normalization": counter_normalization,
+        "observation_units": (
+            "counter_per_batch_instruction"
+            if counter_normalization == "per_instruction"
+            else "raw_counter_increment"
+        ),
     }
     return observations, diagnostics
 
@@ -678,6 +696,7 @@ def inspect_runs(runs: Sequence[RunFiles], phase: str) -> dict[str, object]:
             {
                 "condition": run.condition,
                 "run_id": run.run_id,
+                "trial_id": run.trial_id,
                 "files": {
                     "perf": str(run.perf_path),
                     "metrics": str(run.metrics_path) if run.metrics_path else None,

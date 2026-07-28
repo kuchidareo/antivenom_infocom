@@ -163,6 +163,27 @@ class ObservationConstructionTests(unittest.TestCase):
         self.assertTrue(observations.empty)
         self.assertEqual(diagnostics["used_interval_observations"], 0)
 
+    def test_per_instruction_normalization_is_independent_of_batch_total(self) -> None:
+        frame = self.frame()
+        frame["perf_cycles"] = 2.0 * frame["perf_instructions"]
+        observations, diagnostics = build_forward_observations(
+            frame,
+            epoch=0,
+            phase="forward",
+            instruction_column="perf_instructions",
+            counter_column="perf_cycles",
+            partial=set(),
+            include_partial=True,
+            pmu_scaling="auto",
+            counter_normalization="per_instruction",
+        )
+        np.testing.assert_allclose(
+            observations["observed_increment"] / observations["width"],
+            2.0,
+        )
+        self.assertEqual(diagnostics["counter_normalization"], "per_instruction")
+        self.assertEqual(set(observations["batch_total_instructions"]), {10.0, 60.0})
+
     def test_missing_counter_alias_is_reported_without_exception(self) -> None:
         resolved = resolve_counter_columns(["epoch", "perf_instructions"])
         self.assertEqual(resolved["instructions"], "perf_instructions")

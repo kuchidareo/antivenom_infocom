@@ -130,22 +130,7 @@ check_environment() {
       echo 'remote running_ml.py does not support --stage-epochs' >&2
       exit 4
     }
-    CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' -c "
-from pathlib import Path
-import torch
-from dataset_preparation import get_num_classes, load_metadata_records
-assert not torch.cuda.is_available()
-clean_train = load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='$CLIENT_ID', poisoning_method='clean', split='train')
-clean_test = load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='all', poisoning_method='clean', split='test')
-shortcut_train = load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='$CLIENT_ID', poisoning_method='availability_shortcuts', split='train')
-assert clean_train and clean_test and shortcut_train
-assert Path('$REMOTE_DATA_DIR/cifar10/augmented/strong/PREPARED').is_file()
-print('device=cpu')
-print('num_classes=', get_num_classes('$REMOTE_DATA_DIR', '$DATASET_NAME'))
-print('clean_train_client=', len(clean_train))
-print('shortcut_train_client=', len(shortcut_train))
-print('global_clean_test=', len(clean_test))
-"
+    CUDA_VISIBLE_DEVICES='' '$REMOTE_PYTHON' -c \"from pathlib import Path; import torch; from dataset_preparation import get_num_classes, load_metadata_records; assert not torch.cuda.is_available(); clean_train=load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='$CLIENT_ID', poisoning_method='clean', split='train'); clean_test=load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='all', poisoning_method='clean', split='test'); shortcut_train=load_metadata_records(data_dir='$REMOTE_DATA_DIR', dataset_name='$DATASET_NAME', client_id='$CLIENT_ID', poisoning_method='availability_shortcuts', split='train'); assert clean_train and clean_test and shortcut_train; assert Path('$REMOTE_DATA_DIR/cifar10/augmented/strong/PREPARED').is_file(); print('device=cpu'); print('num_classes=', get_num_classes('$REMOTE_DATA_DIR', '$DATASET_NAME')); print('clean_train_client=', len(clean_train)); print('shortcut_train_client=', len(shortcut_train)); print('global_clean_test=', len(clean_test))\"
   "
   enable_and_check_perf
 }

@@ -52,6 +52,37 @@ class DistributionAggregationTests(unittest.TestCase):
         np.testing.assert_allclose(mean, [1.0, 3.0])
         np.testing.assert_allclose(variance, [2.0, 2.0])
 
+    def test_profile_store_moment_matches_multiple_runs(self) -> None:
+        profiles = pd.DataFrame(
+            {
+                "condition": ["clean"] * 4,
+                "run_id": ["trial_0", "trial_0", "trial_1", "trial_1"],
+                "counter": ["cycles"] * 4,
+                "epoch": [0] * 4,
+                "bin_index": [0, 1, 0, 1],
+                "progress_start": [0.0, 0.5, 0.0, 0.5],
+                "progress_end": [0.5, 1.0, 0.5, 1.0],
+                "estimated_mean_rate": [10.0, 30.0, 20.0, 40.0],
+                "estimated_variance_rate": [1.0] * 4,
+                "tau_squared": [0.0] * 4,
+                "optimizer_success": [True] * 4,
+            }
+        )
+        diagnostics = pd.DataFrame(
+            {
+                "condition": ["clean", "clean"],
+                "run_id": ["trial_0", "trial_1"],
+                "counter": ["cycles", "cycles"],
+                "epoch": [0, 0],
+                "status": ["ok", "ok"],
+                "representative_interval_width": [0.5, 0.5],
+            }
+        )
+        store = MODULE.profile_store(profiles, diagnostics, np.array([0.25, 0.75]))
+        mean, variance = store[("clean", "cycles", 0)]
+        np.testing.assert_allclose(mean, [15.0, 35.0])
+        np.testing.assert_allclose(variance, [27.0, 27.0])
+
 
 class DistributionPermutationTests(unittest.TestCase):
     def arrays(self, shift: float) -> tuple[np.ndarray, ...]:

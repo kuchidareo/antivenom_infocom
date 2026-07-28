@@ -13,13 +13,13 @@ REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-${REMOTE_REPO_DIR}/M260727-motivationa
 REMOTE_PYTHON="${REMOTE_PYTHON:-${REMOTE_REPO_DIR}/venv/bin/python}"
 REMOTE_IID_DATA_DIR="${REMOTE_IID_DATA_DIR:-${REMOTE_REPO_DIR}/iid-data}"
 LOCAL_IID_DATA_DIR="${LOCAL_IID_DATA_DIR:-${LOCAL_REPO_DIR}/iid-data}"
-REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-logs/motivational_0727_rpi4_cpu/${DEVICE_HOST}}"
-LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${SCRIPT_DIR}/collected_logs}"
+REMOTE_LOG_BASE="${REMOTE_LOG_BASE:-logs/motivational_0727_30_trials}"
+LOCAL_LOG_BASE="${LOCAL_LOG_BASE:-${SCRIPT_DIR}/collected_logs_30_trials}"
 
 MONITORING_FPS="${MONITORING_FPS:-10}"
 PERF_FPS="${PERF_FPS:-$MONITORING_FPS}"
 HARDWARE_FPS="${HARDWARE_FPS:-$MONITORING_FPS}"
-TRIALS="${TRIALS:-1}"
+TRIALS="${TRIALS:-30}"
 LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 BASE_SEED="${BASE_SEED:-260727}"
@@ -32,6 +32,7 @@ REFERENCE_TRIALS=0
 NUM_ROUNDS=10
 
 RPI_PERF_EVENTS="${RPI_PERF_EVENTS:-cycles,instructions,task-clock,context-switches,cpu-migrations,page-faults,branches,branch-misses,l1d_cache_rd,l1d_cache_refill_rd,l1d_cache_wr,l1d_cache_refill_wr,l2d_cache_rd,l2d_cache_refill_rd,l2d_cache_wr,l2d_cache_refill_wr,bus_access_rd,bus_access_wr,mem_access,ase_spec,vfp_spec,inst_spec}"
+JETSON_PERF_EVENTS="${JETSON_PERF_EVENTS:-cycles,instructions,task-clock,context-switches,cpu-migrations,page-faults,br_retired,br_mis_pred_retired,l1d_cache,l1d_cache_refill,l1d_cache_wb,l2d_cache,l2d_cache_refill,l2d_cache_wb,bus_access,mem_access,inst_spec}"
 
 # label|poisoning_method|augmentation_profile|model|model_depth
 STAGE_SPECS=(
@@ -55,7 +56,7 @@ Usage:
 Default `both` flow:
   git pull -> sync IID CIFAR-10 -> check -> run -> collect
 
-The eight stages run sequentially on the Raspberry Pi 4 at 192.168.0.112:
+The eight stages run on the Raspberry Pi 4 at 192.168.0.112:
   SimpleCNN: clean, moderate augmentation, strong augmentation,
              availability shortcut
   TinyViT:   clean, moderate augmentation, strong augmentation,
@@ -63,13 +64,37 @@ The eight stages run sequentially on the Raspberry Pi 4 at 192.168.0.112:
 
 Defaults:
   client partition: client_0
-  trials:           1
+  trials:           30 per condition
   epochs:           10
   batch size:       16
   learning rate:    0.001
   perf/psutil:      10 Hz
   compute:          CPU (CUDA_VISIBLE_DEVICES is empty)
 EOF
+}
+
+remote_log_root() {
+  print -r -- "${REMOTE_LOG_BASE}/${DEVICE_HOST}"
+}
+
+local_log_dir() {
+  print -r -- "${LOCAL_LOG_BASE}/${DEVICE_HOST}"
+}
+
+perf_events_for_device() {
+  if [[ "$DEVICE_HOST" == "192.168.0.141" ]]; then
+    print -r -- "$JETSON_PERF_EVENTS"
+  else
+    print -r -- "$RPI_PERF_EVENTS"
+  fi
+}
+
+device_label() {
+  if [[ "$DEVICE_HOST" == "192.168.0.141" ]]; then
+    print -r -- "Jetson"
+  else
+    print -r -- "Raspberry Pi 4"
+  fi
 }
 
 ssh_base_cmd() {
@@ -121,11 +146,12 @@ sync_dataset() {
 }
 
 enable_and_check_perf() {
-  print "==> checking Raspberry Pi 4 perf events"
+  local perf_events="$(perf_events_for_device)"
+  print "==> checking $(device_label) perf events on ${DEVICE_HOST}"
   ssh_run "
     set -e
     printf '%s\n' '$SSH_PASSWORD' | sudo -S sysctl kernel.perf_event_paranoid=-1 >/dev/null
-    perf stat -e '$RPI_PERF_EVENTS' -- '$REMOTE_PYTHON' -c 'sum(i*i for i in range(20000000))' >/dev/null
+    perf stat -e '$perf_events' -- '$REMOTE_PYTHON' -c 'sum(i*i for i in range(20000000))' >/dev/null
   "
 }
 
@@ -160,7 +186,8 @@ run_stage() {
   local augmentation_profile="${fields[3]}"
   local model_name="${fields[4]}"
   local model_depth="${fields[5]}"
-  local log_dir="${REMOTE_LOG_ROOT}/${label}"
+  local log_dir="$(remote_log_root)/${label}"
+  local perf_events="$(perf_events_for_device)"
   local augment_json="{\"enabled\":true,\"_profile\":\"${augmentation_profile}\",\"resize\":[32,32],\"horizontal_flip\":false,\"normalize\":true}"
 
   print "==> stage ${label}"
@@ -188,7 +215,7 @@ run_stage() {
       --num-rounds '$NUM_ROUNDS' \\
       --learning-rate '$LEARNING_RATE' \\
       --seed '$BASE_SEED' \\
-      --perf-events '$RPI_PERF_EVENTS' \\
+      --perf-events '$perf_events' \\
       --perf-fps '$PERF_FPS' \\
       --hardware-fps '$HARDWARE_FPS' \\
       --augment '$augment_json' \\
@@ -214,7 +241,7 @@ run_stage() {
 }
 
 run_experiments() {
-  print "Running ${#STAGE_SPECS} motivational-study stages sequentially on ${DEVICE_HOST} Raspberry Pi 4 CPU"
+  print "Running ${#STAGE_SPECS} motivational-study stages sequentially on ${DEVICE_HOST} $(device_label) CPU"
   print "  client=${CLIENT_ID} trials=${TRIALS} epochs=${LOCAL_EPOCHS} batch_size=${BATCH_SIZE}"
   print "  perf_fps=${PERF_FPS} hardware_fps=${HARDWARE_FPS}"
   local spec
@@ -225,15 +252,17 @@ run_experiments() {
 }
 
 collect_logs() {
-  mkdir -p "$LOCAL_LOG_DIR"
+  local remote_log_root="$(remote_log_root)"
+  local local_log_dir="$(local_log_dir)"
+  mkdir -p "$local_log_dir"
   local -a rsync_command
   rsync_command=(
     rsync -az --partial --stats --human-readable
     -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-    "${SSH_USER}@${DEVICE_HOST}:${REMOTE_PROJECT_DIR}/${REMOTE_LOG_ROOT}/"
-    "${LOCAL_LOG_DIR}/"
+    "${SSH_USER}@${DEVICE_HOST}:${REMOTE_PROJECT_DIR}/${remote_log_root}/"
+    "${local_log_dir}/"
   )
-  print "==> collecting logs into ${LOCAL_LOG_DIR}"
+  print "==> collecting ${DEVICE_HOST} logs into ${local_log_dir}"
   if [[ -n "$SSH_PASSWORD" ]]; then
     sshpass -p "$SSH_PASSWORD" "${rsync_command[@]}"
   else
