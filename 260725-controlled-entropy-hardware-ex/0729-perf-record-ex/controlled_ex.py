@@ -1,14 +1,16 @@
-"""Controlled ReLU/MaxPool/Conv entropy replay with replay-only PMU logging.
+"""Controlled Conv entropy-chain replay with replay-only PMU logging.
 
 One process executes one condition. Tensor generation, entropy analysis, and
 warm-up finish before the internal PhasePerfLogger enables counters around the
 replay. The JSON and matching ``*_perf.csv`` share the same run ID, trial ID,
 and device ID.
 
-The measured replay does not generate masks, allocate outputs intentionally,
-or calculate entropy. All conditions use the same tensor shape, active rate,
-and nonzero FP32 value multiset for a given seed. Only the zero/nonzero spatial
-arrangement changes across low/mid/high.
+The measured replay is either Conv2d with autograd enabled, or Conv2d followed
+by detach, inference-only ReLU, and inference-only MaxPool2d. It does not
+generate tensors or masks, calculate entropy, run backward, or calculate the
+checksum. All conditions use the same shape, active rate, and nonzero FP32
+value multiset for a given seed. Only the zero/nonzero spatial arrangement
+changes across low/mid/high.
 """
 
 from __future__ import annotations
@@ -42,8 +44,8 @@ from perf_logger import (
 @dataclass(frozen=True)
 class Config:
     operator: str
+    chain: str
     regime: str
-    temporal: str
     seed: int
     trial_id: str
     device_id: str
@@ -59,6 +61,7 @@ class Config:
     conv_stride: int
     conv_padding: int
     bank_size: int
+    warmup_bank_size: int
     warmup: int
     repeats: int
     threads: int
@@ -68,13 +71,30 @@ class Config:
     perf_events: str
     perf_binary: str
     enable_perf: bool
+    perf_control_fifo: str
+    perf_control_ack_fifo: str
 
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser()
-    p.add_argument("--operator", choices=("relu", "maxpool", "conv"), required=True)
+    p.add_argument(
+        "--operator", choices=("relu", "maxpool", "conv"), required=True
+    )
+    p.add_argument(
+        "--chain",
+        choices=(
+            "relu_only",
+            "maxpool_only",
+            "conv_only",
+            "conv_relu_pool",
+            "conv_relu_pool_autograd",
+        ),
+        default="conv_only",
+    )
     p.add_argument("--regime", choices=("low", "mid", "high"), required=True)
-    p.add_argument("--temporal", choices=("stable", "changing"), default="stable")
+    # Accepted only so older launchers fail gracefully while the single-tensor
+    # behavior is removed. Every run now uses the dataset-style input bank.
+    p.add_argument("--temporal", choices=("stable", "changing"), help=argparse.SUPPRESS)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--trial-id", default="trial_0")
     p.add_argument(
@@ -91,12 +111,14 @@ def parse_args() -> Config:
     p.add_argument("--conv-kernel-size", type=int, default=3)
     p.add_argument("--conv-stride", type=int, default=1)
     p.add_argument("--conv-padding", type=int, default=1)
-    p.add_argument("--bank-size", type=int, default=16,
-                   help="Number of prebuilt tensors used only in changing mode")
+    p.add_argument("--bank-size", type=int, default=250,
+                   help="Number of unique prebuilt measurement tensors")
+    p.add_argument("--warmup-bank-size", type=int, default=16,
+                   help="Number of tensors reserved exclusively for warm-up")
     p.add_argument("--warmup", type=int, default=None,
                    help="Default: 1000 for ReLU/MaxPool and 100 for Conv")
     p.add_argument("--repeats", type=int, default=None,
-                   help="Default: 50000 for ReLU/MaxPool and 1000 for Conv")
+                   help="Default: 50000 for ReLU/MaxPool and 250 for Conv")
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--start-delay", type=float, default=0.0,
                    help="Seconds to wait after READY before the replay starts")
@@ -110,14 +132,31 @@ def parse_args() -> Config:
     )
     p.add_argument("--perf-binary", default="perf")
     p.add_argument("--disable-perf", dest="enable_perf", action="store_false")
+    p.add_argument(
+        "--perf-control-fifo", default="",
+        help="perf-record control FIFO used to enable counters around replay only",
+    )
+    p.add_argument(
+        "--perf-control-ack-fifo", default="",
+        help="Acknowledgement FIFO paired with --perf-control-fifo",
+    )
     p.set_defaults(enable_perf=True)
     a = p.parse_args()
+    expected_operator = {
+        "relu_only": "relu",
+        "maxpool_only": "maxpool",
+        "conv_only": "conv",
+        "conv_relu_pool": "conv",
+        "conv_relu_pool_autograd": "conv",
+    }[a.chain]
+    if a.operator != expected_operator:
+        p.error(f"chain {a.chain} requires --operator {expected_operator}")
     if not 0 < a.activation_rate < 1:
         p.error("activation-rate must be in (0, 1)")
     for name in (
         "batch_size", "channels", "height", "width", "pool_size",
         "pool_stride", "conv_out_channels", "conv_kernel_size", "conv_stride",
-        "bank_size", "threads",
+        "bank_size", "warmup_bank_size", "threads",
     ):
         if getattr(a, name) <= 0:
             p.error(f"{name.replace('_', '-')} must be positive")
@@ -126,16 +165,41 @@ def parse_args() -> Config:
     if a.warmup is None:
         a.warmup = 100 if a.operator == "conv" else 1_000
     if a.repeats is None:
-        a.repeats = 1_000 if a.operator == "conv" else 50_000
+        a.repeats = 250 if a.operator == "conv" else 1_000
     if a.warmup < 0 or a.start_delay < 0:
         p.error("warmup and start-delay must be nonnegative")
     if a.repeats <= 0:
         p.error("repeats must be positive")
-    if a.operator == "maxpool" and (
+    if a.bank_size < a.repeats:
+        p.error(
+            "Conv requires bank-size >= repeats so every measured call uses "
+            "a unique input tensor"
+        )
+    if a.operator == "conv":
+        conv_height = (
+            a.height + 2 * a.conv_padding - a.conv_kernel_size
+        ) // a.conv_stride + 1
+        conv_width = (
+            a.width + 2 * a.conv_padding - a.conv_kernel_size
+        ) // a.conv_stride + 1
+        if conv_height <= 0 or conv_width <= 0:
+            p.error("Conv configuration produces an empty output")
+        if (
+            a.chain != "conv_only"
+            and (a.pool_size > conv_height or a.pool_size > conv_width)
+        ):
+            p.error("pool-size must fit within the Conv output height and width")
+    elif a.operator == "maxpool" and (
         a.pool_size > a.height or a.pool_size > a.width
     ):
         p.error("pool-size must fit within the input height and width")
-    return Config(**vars(a))
+    if bool(a.perf_control_fifo) != bool(a.perf_control_ack_fifo):
+        p.error("perf control and acknowledgement FIFOs must be specified together")
+    if a.enable_perf and a.perf_control_fifo:
+        p.error("internal perf and external perf-record control cannot both be enabled")
+    values = vars(a)
+    values.pop("temporal", None)
+    return Config(**values)
 
 
 def seed_everything(seed: int) -> None:
@@ -174,13 +238,16 @@ def shared_value_multisets(shape: tuple[int, int, int, int], rate: float, seed: 
     return positives, negatives
 
 
-def materialize_tensor(mask: torch.Tensor, positives: list[torch.Tensor], negatives: list[torch.Tensor], operator: str) -> torch.Tensor:
-    """ReLU gets signed values; MaxPool/Conv get ReLU-like zeros/positives."""
+def materialize_tensor(
+    mask: torch.Tensor,
+    positives: list[torch.Tensor],
+) -> torch.Tensor:
+    """Place an identical positive FP32 multiset on each regime's active mask."""
     result = torch.empty(mask.shape, dtype=torch.float32)
     for sample in range(mask.shape[0]):
         flat_mask = mask[sample].reshape(-1); flat = result[sample].reshape(-1)
         flat[flat_mask] = positives[sample]
-        flat[~flat_mask] = negatives[sample] if operator == "relu" else 0.0
+        flat[~flat_mask] = 0.0
     return result.contiguous()
 
 
@@ -286,64 +353,245 @@ def conv_patch_metrics(mask: torch.Tensor, kernel: int, stride: int,
     }
 
 
-def make_bank(cfg: Config) -> tuple[list[torch.Tensor], list[dict[str, float]]]:
+def make_bank(
+    cfg: Config,
+    count: int,
+    *,
+    seed_offset: int,
+    metadata_samples: int,
+) -> tuple[torch.Tensor, list[dict[str, float]]]:
+    """Build a dataset-like bank whose tensors have distinct values and layouts.
+
+    The value seed does not depend on the entropy regime. Consequently, tensor i
+    in low and high runs has the same FP32 value multiset; only its spatial mask
+    differs. Metadata is intentionally sampled because exact Conv patch analysis
+    over every large bank item would dominate experiment preparation.
+    """
     shape = (cfg.batch_size, cfg.channels, cfg.height, cfg.width)
-    positives, negatives = shared_value_multisets(shape, cfg.activation_rate, cfg.seed)
-    count = 1 if cfg.temporal == "stable" else cfg.bank_size
-    tensors, metadata = [], []
+    tensors = torch.empty((count, *shape), dtype=torch.float32)
+    metadata: list[dict[str, float]] = []
     for index in range(count):
-        mask = exact_rate_mask(shape, cfg.activation_rate, cfg.regime, cfg.seed + 100_003 * index)
-        tensor = materialize_tensor(mask, positives, negatives, cfg.operator)
-        row = {"bank_index": index, **mask_metrics(mask, "input")}
-        if cfg.operator == "relu":
-            output = F.relu(tensor)
-            row.update(mask_metrics(output != 0, "relu_output"))
-        elif cfg.operator == "maxpool":
-            row.update(pool_argmax_metrics(tensor, cfg.pool_size, cfg.pool_stride))
-        else:
-            row.update(conv_patch_metrics(mask, cfg.conv_kernel_size,
-                                          cfg.conv_stride, cfg.conv_padding))
-        tensors.append(tensor); metadata.append(row)
+        item_seed = cfg.seed + seed_offset + 100_003 * index
+        positives, _ = shared_value_multisets(
+            shape, cfg.activation_rate, item_seed
+        )
+        mask = exact_rate_mask(shape, cfg.activation_rate, cfg.regime, item_seed)
+        tensor = materialize_tensor(mask, positives)
+        tensors[index].copy_(tensor)
+        if index < metadata_samples:
+            row = {"bank_index": index, **mask_metrics(mask, "input")}
+            if cfg.operator == "relu":
+                row.update(mask_metrics(F.relu(tensor) != 0, "relu_output"))
+            elif cfg.operator == "maxpool":
+                row.update(
+                    pool_argmax_metrics(tensor, cfg.pool_size, cfg.pool_stride)
+                )
+            else:
+                row.update(conv_patch_metrics(mask, cfg.conv_kernel_size,
+                                              cfg.conv_stride, cfg.conv_padding))
+            metadata.append(row)
     return tensors, metadata
 
 
+def make_replay_order(count: int, seed: int) -> list[int]:
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randperm(count, generator=generator).tolist()
+
+
 def make_operator(cfg: Config):
-    """Build the timed operator once. Conv weights are identical across regimes."""
-    if cfg.operator == "relu": return F.relu, {}
+    """Build the selected chain once; Conv uses deterministic shared weights."""
+    if cfg.operator == "relu":
+        return F.relu, None, {}
     if cfg.operator == "maxpool":
-        return (lambda x: F.max_pool2d(x, cfg.pool_size, cfg.pool_stride)), {}
+        operator = lambda x: F.max_pool2d(
+            x, kernel_size=cfg.pool_size, stride=cfg.pool_stride
+        )
+        return operator, None, {}
+
     generator = torch.Generator().manual_seed(cfg.seed + 7_000_003)
     weight = torch.empty(cfg.conv_out_channels, cfg.channels,
                          cfg.conv_kernel_size, cfg.conv_kernel_size)
     bound = 1 / math.sqrt(cfg.channels * cfg.conv_kernel_size * cfg.conv_kernel_size)
     weight.uniform_(-bound, bound, generator=generator)
     weight = weight.contiguous()
-    operator = lambda x: F.conv2d(x, weight, None, cfg.conv_stride, cfg.conv_padding)
-    metadata = {"conv_weight_l2": float(weight.norm()),
-                "conv_weight_sum": float(weight.sum()),
-                "conv_weight_shape": list(weight.shape)}
-    return operator, metadata
+    weight.requires_grad_(True)
+
+    def operator(x: torch.Tensor) -> torch.Tensor:
+        conv_output = F.conv2d(
+            x,
+            weight,
+            bias=None,
+            stride=cfg.conv_stride,
+            padding=cfg.conv_padding,
+        )
+        if cfg.chain == "conv_only":
+            return conv_output
+        if cfg.chain == "conv_relu_pool_autograd":
+            relu_output = F.relu(conv_output)
+            return F.max_pool2d(
+                relu_output,
+                kernel_size=cfg.pool_size,
+                stride=cfg.pool_stride,
+            )
+        detached = conv_output.detach()
+        with torch.no_grad():
+            relu_output = F.relu(detached)
+            return F.max_pool2d(
+                relu_output,
+                kernel_size=cfg.pool_size,
+                stride=cfg.pool_stride,
+            )
+
+    metadata = {"conv_weight_l2": float(weight.detach().norm()),
+                "conv_weight_sum": float(weight.detach().sum()),
+                "conv_weight_shape": list(weight.shape),
+                "conv_weight_requires_grad": weight.requires_grad}
+    return operator, weight, metadata
 
 
-@torch.inference_mode()
-def warmup(cfg: Config, bank: list[torch.Tensor], operator) -> None:
-    for index in range(cfg.warmup):
-        operator(bank[index % len(bank)])
+def prepare_replay_bank(bank: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Prepare gradient-requiring leaf inputs before the measured replay."""
+    return tuple(tensor.detach().requires_grad_(True) for tensor in bank.unbind(0))
 
 
-@torch.inference_mode()
-def replay(cfg: Config, bank: list[torch.Tensor], operator) -> tuple[float, float]:
+def validate_autograd_boundaries(
+    cfg: Config,
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+) -> dict[str, object]:
+    """Assert the selected chain's autograd state before warm-up and PMU use."""
+    assert x.requires_grad
+
+    if cfg.operator == "relu":
+        with torch.enable_grad():
+            relu_output = F.relu(x)
+        assert relu_output.requires_grad
+        assert relu_output.grad_fn is not None
+        metadata = {
+            "chain": cfg.chain,
+            "conv_autograd_enabled": False,
+            "relu_autograd_enabled": True,
+            "maxpool_autograd_enabled": False,
+            "conv_output_shape": None,
+            "relu_output_shape": list(relu_output.shape),
+            "pool_output_shape": None,
+            "conv_output_requires_grad": False,
+            "relu_output_requires_grad": True,
+            "pool_output_requires_grad": False,
+        }
+        del relu_output
+        return metadata
+
+    if cfg.operator == "maxpool":
+        with torch.enable_grad():
+            pool_output = F.max_pool2d(
+                x, kernel_size=cfg.pool_size, stride=cfg.pool_stride
+            )
+        assert pool_output.requires_grad
+        assert pool_output.grad_fn is not None
+        metadata = {
+            "chain": cfg.chain,
+            "conv_autograd_enabled": False,
+            "relu_autograd_enabled": False,
+            "maxpool_autograd_enabled": True,
+            "conv_output_shape": None,
+            "relu_output_shape": None,
+            "pool_output_shape": list(pool_output.shape),
+            "conv_output_requires_grad": False,
+            "relu_output_requires_grad": False,
+            "pool_output_requires_grad": True,
+        }
+        del pool_output
+        return metadata
+
+    assert weight is not None
+    assert weight.requires_grad
+
+    with torch.enable_grad():
+        conv_output = F.conv2d(
+            x,
+            weight,
+            bias=None,
+            stride=cfg.conv_stride,
+            padding=cfg.conv_padding,
+        )
+    assert conv_output.requires_grad
+    assert conv_output.grad_fn is not None
+
+    if cfg.chain == "conv_relu_pool_autograd":
+        relu_output = F.relu(conv_output)
+        pool_output = F.max_pool2d(
+            relu_output,
+            kernel_size=cfg.pool_size,
+            stride=cfg.pool_stride,
+        )
+        assert relu_output.requires_grad
+        assert pool_output.requires_grad
+        assert relu_output.grad_fn is not None
+        assert pool_output.grad_fn is not None
+        relu_autograd_enabled = True
+        maxpool_autograd_enabled = True
+    else:
+        detached = conv_output.detach()
+        assert not detached.requires_grad
+        assert detached.grad_fn is None
+
+        with torch.no_grad():
+            relu_output = F.relu(detached)
+            pool_output = F.max_pool2d(
+                relu_output,
+                kernel_size=cfg.pool_size,
+                stride=cfg.pool_stride,
+            )
+        assert not relu_output.requires_grad
+        assert not pool_output.requires_grad
+        assert relu_output.grad_fn is None
+        assert pool_output.grad_fn is None
+        relu_autograd_enabled = False
+        maxpool_autograd_enabled = False
+
+    metadata = {
+        "chain": cfg.chain,
+        "conv_autograd_enabled": True,
+        "relu_autograd_enabled": relu_autograd_enabled,
+        "maxpool_autograd_enabled": maxpool_autograd_enabled,
+        "conv_output_shape": list(conv_output.shape),
+        "relu_output_shape": list(relu_output.shape),
+        "pool_output_shape": list(pool_output.shape),
+        "conv_output_requires_grad": conv_output.requires_grad,
+        "relu_output_requires_grad": relu_output.requires_grad,
+        "pool_output_requires_grad": pool_output.requires_grad,
+    }
+    del pool_output, relu_output, conv_output
+    return metadata
+
+
+def warmup(cfg: Config, bank, operator) -> None:
+    with torch.enable_grad():
+        for index in range(cfg.warmup):
+            output = operator(bank[index % len(bank)])
+    if cfg.warmup:
+        del output
+
+
+def replay(
+    cfg: Config,
+    bank,
+    replay_order: list[int],
+    operator,
+) -> tuple[float, torch.Tensor]:
 
     # This is the target replay region. Tensor generation, entropy analysis,
     # JSON serialization, and RNG are all outside it.
-    start = time.perf_counter_ns()
-    for index in range(cfg.repeats):
-        output = operator(bank[index % len(bank)])
-    elapsed = (time.perf_counter_ns() - start) / 1e9
-    # PyTorch eager operators execute immediately, so no anti-DCE operation is
-    # needed inside the replay. Compute a checksum only after the timed region.
-    checksum = float(output.sum())
-    return elapsed, checksum
+    with torch.enable_grad():
+        start = time.perf_counter_ns()
+        for index in range(cfg.repeats):
+            bank_index = replay_order[index % len(replay_order)]
+            output = operator(bank[bank_index])
+        elapsed = (time.perf_counter_ns() - start) / 1e9
+    # Earlier iteration graphs are released when output is overwritten. Only
+    # the final output survives so checksum can be calculated after PMU disable.
+    return elapsed, output
 
 
 def detected_host() -> str:
@@ -394,7 +642,7 @@ def selected_perf_events(cfg: Config, host: str) -> tuple[list[str], dict[str, s
 
 def run_identifier(cfg: Config) -> str:
     run_id = (
-        f"{cfg.operator}_{cfg.regime}_{cfg.temporal}_seed{cfg.seed}_{cfg.trial_id}_"
+        f"{cfg.operator}_{cfg.chain}_{cfg.regime}_dataset_seed{cfg.seed}_{cfg.trial_id}_"
         f"b{cfg.batch_size}_c{cfg.channels}_h{cfg.height}_w{cfg.width}"
     )
     if cfg.operator == "conv":
@@ -403,6 +651,27 @@ def run_identifier(cfg: Config) -> str:
             f"s{cfg.conv_stride}_p{cfg.conv_padding}"
         )
     return run_id
+
+
+def controlled_perf_record_replay(
+    cfg: Config,
+    bank,
+    replay_order: list[int],
+    operator,
+) -> tuple[float, torch.Tensor]:
+    """Enable an externally launched perf-record process for replay only."""
+    with open(cfg.perf_control_fifo, "w", buffering=1) as control:
+        control.write("enable\n")
+        with open(cfg.perf_control_ack_fifo, "r", buffering=1) as acknowledgement:
+            if acknowledgement.readline().strip() != "ack":
+                raise RuntimeError("perf record did not acknowledge enable")
+        try:
+            return replay(cfg, bank, replay_order, operator)
+        finally:
+            control.write("disable\n")
+            with open(cfg.perf_control_ack_fifo, "r", buffering=1) as acknowledgement:
+                if acknowledgement.readline().strip() != "ack":
+                    raise RuntimeError("perf record did not acknowledge disable")
 
 
 def main() -> None:
@@ -417,10 +686,28 @@ def main() -> None:
     run_id = run_identifier(cfg)
     host = detected_host()
 
-    bank, entropy_rows = make_bank(cfg)
-    operator, operator_metadata = make_operator(cfg)
+    bank_build_start = time.perf_counter()
+    bank, entropy_rows = make_bank(
+        cfg,
+        cfg.bank_size,
+        seed_offset=0,
+        metadata_samples=min(4, cfg.bank_size),
+    )
+    warmup_bank, _ = make_bank(
+        cfg,
+        cfg.warmup_bank_size,
+        seed_offset=1_000_000_007,
+        metadata_samples=0,
+    )
+    bank_build_seconds = time.perf_counter() - bank_build_start
+    replay_order = make_replay_order(cfg.bank_size, cfg.seed + 8_000_003)
+    operator, weight, operator_metadata = make_operator(cfg)
+    replay_bank = prepare_replay_bank(bank)
+    warmup_replay_bank = prepare_replay_bank(warmup_bank)
     entropy_summary: dict[str, float] = {}
     for key in entropy_rows[0]:
+        if key == "bank_index":
+            continue
         values = [
             row[key] for row in entropy_rows
             if isinstance(row.get(key), (int, float))
@@ -430,15 +717,21 @@ def main() -> None:
 
     print("RUN_ID", run_id, flush=True)
     print("ENTROPY", json.dumps(entropy_summary, sort_keys=True), flush=True)
-    warmup(cfg, bank, operator)
+    chain_metadata = validate_autograd_boundaries(
+        cfg, warmup_replay_bank[0], weight
+    )
+    print("AUTOGRAD_BOUNDARIES", json.dumps(chain_metadata, sort_keys=True), flush=True)
+    warmup(cfg, warmup_replay_bank, operator)
 
     state = TrainingState(round=0, epoch=0, batch_idx=0, phase="replay")
     condition = {
-        "experiment_id": "controlled_relu_maxpool_conv_entropy",
+        "experiment_id": "controlled_entropy_operator_chain",
         "run_id": run_id,
         "operator": cfg.operator,
+        "chain": cfg.chain,
         "regime": cfg.regime,
-        "temporal": cfg.temporal,
+        "temporal": "dataset_bank",
+        **chain_metadata,
         "seed": cfg.seed,
         "trial_id": cfg.trial_id,
         "device_id": cfg.device_id,
@@ -455,6 +748,12 @@ def main() -> None:
         "conv_stride": cfg.conv_stride,
         "conv_padding": cfg.conv_padding,
         "bank_size": len(bank),
+        "warmup_bank_size": len(warmup_bank),
+        "bank_tensor_bytes": int(bank[0].numel() * bank.element_size()),
+        "bank_working_set_bytes": int(bank.numel() * bank.element_size()),
+        "unique_inputs_consumed": min(cfg.repeats, len(bank)),
+        "maximum_input_reuse_count": math.ceil(cfg.repeats / len(bank)),
+        "entropy_metadata_sample_count": len(entropy_rows),
         "warmup": cfg.warmup,
         "repeats": cfg.repeats,
         "threads": cfg.threads,
@@ -495,14 +794,22 @@ def main() -> None:
         time.sleep(cfg.start_delay)
 
     try:
-        if logger is None:
-            elapsed, checksum = replay(cfg, bank, operator)
+        if cfg.perf_control_fifo:
+            elapsed, output = controlled_perf_record_replay(
+                cfg, replay_bank, replay_order, operator
+            )
+        elif logger is None:
+            elapsed, output = replay(cfg, replay_bank, replay_order, operator)
         else:
             with logger.measure_phase():
-                elapsed, checksum = replay(cfg, bank, operator)
+                elapsed, output = replay(cfg, replay_bank, replay_order, operator)
     finally:
         if logger is not None:
             logger.stop()
+
+    # Checksum and graph teardown occur after external/internal PMU disable.
+    checksum = float(output.detach().sum())
+    del output
 
     result = {
         "run_id": run_id,
@@ -513,7 +820,11 @@ def main() -> None:
         "perf_csv": str(perf_path) if cfg.enable_perf else None,
         "entropy_mean": entropy_summary,
         "operator_metadata": operator_metadata,
+        "chain_metadata": chain_metadata,
+        **chain_metadata,
         "entropy_per_bank_tensor": entropy_rows,
+        "condition": condition,
+        "bank_build_seconds": bank_build_seconds,
         "elapsed_seconds": elapsed,
         "nanoseconds_per_call": elapsed * 1e9 / cfg.repeats,
         "checksum": checksum,

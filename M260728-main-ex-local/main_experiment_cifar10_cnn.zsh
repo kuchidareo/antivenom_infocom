@@ -9,4 +9,15 @@ export TRIALS="${TRIALS:-3}"
 export LOCAL_EPOCHS="${LOCAL_EPOCHS:-10}"
 export REFERENCE_TRIALS=0
 
-exec "$SCRIPT_DIR/main_experiment_local.zsh" cifar10-cnn
+case "${1:-run}" in
+  run)
+    exec "$SCRIPT_DIR/main_experiment_local.zsh" cifar10-cnn
+    ;;
+  collect)
+    exec "$SCRIPT_DIR/main_experiment_local.zsh" cifar10-cnn-collect
+    ;;
+  *)
+    print -u2 "Usage: ./main_experiment_cifar10_cnn.zsh [run|collect]"
+    exit 2
+    ;;
+esac

@@ -89,11 +89,13 @@ Usage:
   ./main_experiment.zsh run
   ./main_experiment.zsh collect
   ./main_experiment.zsh cifar10-cnn
+  ./main_experiment.zsh cifar10-cnn-collect
   ./main_experiment.zsh both
 
 `both` performs: pull -> rsync prepared datasets -> check -> pilot gate -> full run -> collect.
 `run` performs: check -> pilot gate -> full run.
 `cifar10-cnn` pulls the repository and runs only Phase 1 without check/pilot.
+`cifar10-cnn-collect` collects only the focused Phase 1 logs.
 
 Dataset preparation is not run here. `sync` copies the server's existing
 `iid-data/` and `non-iid-data/` trees to every reachable Raspberry Pi.
@@ -673,6 +675,34 @@ collect_logs() {
   print "Logs collected under $LOCAL_LOG_BASE"
 }
 
+collect_cifar10_cnn_logs() {
+  refresh_active_devices
+  mkdir -p "$LOCAL_LOG_BASE"
+  local -a job_pids
+  local spec host destination
+  for spec in "${ACTIVE_DEVICE_SPECS[@]}"; do
+    host="${spec#*|}"
+    destination="$LOCAL_LOG_BASE/$host/full/phase1_cifar10_cnn"
+    (
+      mkdir -p "$destination"
+      local -a command=(
+        rsync -az --partial --stats --human-readable
+        -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12"
+        "${SSH_USER}@${host}:${REMOTE_PROJECT_DIR}/${REMOTE_LOG_BASE}/${host}/phase1_cifar10_cnn/"
+        "$destination/"
+      )
+      if [[ -n "$SSH_PASSWORD" ]]; then
+        sshpass -p "$SSH_PASSWORD" "${command[@]}"
+      else
+        "${command[@]}"
+      fi
+    ) &
+    job_pids+=("$!")
+  done
+  wait_for_jobs "${job_pids[@]}"
+  print "Focused CIFAR-10 logs collected under $LOCAL_LOG_BASE"
+}
+
 cleanup() {
   stop_bg_workload
 }
@@ -705,6 +735,9 @@ case "$ACTION" in
     refresh_active_devices
     print "Focused experiment: CIFAR-10 + SimpleCNN, 6 conditions, $TRIALS trials, $LOCAL_EPOCHS epochs"
     run_phase1
+    ;;
+  cifar10-cnn-collect)
+    collect_cifar10_cnn_logs
     ;;
   both)
     pull_repositories

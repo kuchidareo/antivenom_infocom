@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot forward cache counters and batch loss for clean and shortcut training."""
+"""Plot reliability-filtered forward counters and batch loss by global batch."""
 
 from __future__ import annotations
 
@@ -51,8 +51,21 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Restrict the plot to a device ID; repeat for multiple devices.",
     )
+    parser.add_argument(
+        "--minimum-running-pct",
+        type=float,
+        default=20.0,
+        help=(
+            "Reject a batch metric when any contributing perf interval ran its "
+            "required PMU event for less than this percentage of the interval. "
+            "Counts are already multiplex-scaled by perf and are not rescaled."
+        ),
+    )
     parser.add_argument("--dpi", type=int, default=180)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0.0 <= args.minimum_running_pct <= 100.0:
+        parser.error("--minimum-running-pct must be between 0 and 100")
+    return args
 
 
 def parse_bool(value: object) -> bool:
@@ -144,7 +157,53 @@ def discover_runs(
     }
 
 
-def load_batch_data(run: dict[str, object]) -> pd.DataFrame:
+def summarize_perf_batch(group: pd.DataFrame, minimum_running_pct: float) -> pd.Series:
+    instructions = group["perf_instructions"]
+    instruction_running = group["perf_instructions_enabled_pct"]
+    l1d_accesses = group["perf_l1d_cache"]
+    l1d_running = group["perf_l1d_cache_enabled_pct"]
+
+    instruction_reliable = bool(
+        instructions.notna().all()
+        and instructions.ge(0).all()
+        and instruction_running.notna().all()
+        and instruction_running.ge(minimum_running_pct).all()
+    )
+    l1d_reliable = bool(
+        l1d_accesses.notna().all()
+        and l1d_accesses.ge(0).all()
+        and l1d_running.notna().all()
+        and l1d_running.ge(minimum_running_pct).all()
+    )
+
+    instruction_total = float(instructions.sum()) if instruction_reliable else np.nan
+    l1d_total = float(l1d_accesses.sum()) if l1d_reliable else np.nan
+    jointly_reliable = instruction_reliable and l1d_reliable
+    ratio = (
+        l1d_total / instruction_total
+        if jointly_reliable and instruction_total > 0
+        else np.nan
+    )
+    return pd.Series(
+        {
+            "l1d_accesses": l1d_total,
+            "instructions": instruction_total,
+            "l1d_accesses_per_instruction": ratio,
+            "perf_intervals": len(group),
+            "instructions_reliable": instruction_reliable,
+            "l1d_accesses_reliable": l1d_reliable,
+            "jointly_reliable": jointly_reliable,
+            "instructions_running_pct_min": instruction_running.min(skipna=True),
+            "instructions_running_pct_mean": instruction_running.mean(skipna=True),
+            "l1d_running_pct_min": l1d_running.min(skipna=True),
+            "l1d_running_pct_mean": l1d_running.mean(skipna=True),
+        }
+    )
+
+
+def load_batch_data(
+    run: dict[str, object], minimum_running_pct: float
+) -> pd.DataFrame:
     perf_path = Path(run["perf_path"])
     perf_header = set(pd.read_csv(perf_path, nrows=0).columns)
     required = {
@@ -153,7 +212,9 @@ def load_batch_data(run: dict[str, object]) -> pd.DataFrame:
         "phase",
         "perf_status",
         "perf_l1d_cache",
+        "perf_l1d_cache_enabled_pct",
         "perf_instructions",
+        "perf_instructions_enabled_pct",
     }
     missing = required - perf_header
     if missing:
@@ -161,21 +222,28 @@ def load_batch_data(run: dict[str, object]) -> pd.DataFrame:
 
     perf = pd.read_csv(perf_path, usecols=sorted(required))
     perf = perf[(perf["phase"] == "forward") & (perf["perf_status"] == "ok")].copy()
-    for column in ("epoch", "batch_idx", "perf_l1d_cache", "perf_instructions"):
+    for column in (
+        "epoch",
+        "batch_idx",
+        "perf_l1d_cache",
+        "perf_l1d_cache_enabled_pct",
+        "perf_instructions",
+        "perf_instructions_enabled_pct",
+    ):
         perf[column] = pd.to_numeric(perf[column], errors="coerce")
-    perf = perf.dropna(
-        subset=["epoch", "batch_idx", "perf_l1d_cache", "perf_instructions"]
-    )
+    perf = perf.dropna(subset=["epoch", "batch_idx"])
 
-    # perf stat -I reports interval counter increments. Summing the intervals gives
-    # the counter total attributed to this forward pass.
+    # perf stat has already scaled each multiplexed interval count by
+    # time_enabled/time_running. Percentage-running is therefore a reliability
+    # check only; scaling these values again would double-correct them.
     batches = (
-        perf.groupby(["epoch", "batch_idx"], as_index=False)
-        .agg(
-            l1d_accesses=("perf_l1d_cache", "sum"),
-            instructions=("perf_instructions", "sum"),
-            perf_intervals=("perf_instructions", "size"),
+        perf.groupby(["epoch", "batch_idx"], sort=True)
+        .apply(
+            summarize_perf_batch,
+            minimum_running_pct=minimum_running_pct,
+            include_groups=False,
         )
+        .reset_index()
         .sort_values(["epoch", "batch_idx"])
     )
 
@@ -203,9 +271,6 @@ def load_batch_data(run: dict[str, object]) -> pd.DataFrame:
     joined["batch_idx"] = joined["batch_idx"].astype(int)
     joined = joined.sort_values(["epoch", "batch_idx"]).reset_index(drop=True)
     joined["global_batch_idx"] = np.arange(1, len(joined) + 1)
-    joined["l1d_accesses_per_instruction"] = (
-        joined["l1d_accesses"] / joined["instructions"].replace(0, np.nan)
-    )
     joined["device_id"] = str(run["device_id"])
     joined["method"] = str(run["method"])
     joined["trial_id"] = str(run["trial_id"])
@@ -246,7 +311,13 @@ def epoch_boundaries(data: pd.DataFrame) -> tuple[list[float], list[tuple[float,
     return boundaries, labels
 
 
-def plot(data: pd.DataFrame, summary: pd.DataFrame, output_path: Path, dpi: int) -> None:
+def plot(
+    data: pd.DataFrame,
+    summary: pd.DataFrame,
+    output_path: Path,
+    dpi: int,
+    minimum_running_pct: float,
+) -> None:
     figure, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
     boundaries, epoch_labels = epoch_boundaries(data)
 
@@ -319,7 +390,9 @@ def plot(data: pd.DataFrame, summary: pd.DataFrame, output_path: Path, dpi: int)
     device_count = data["device_id"].nunique()
     figure.suptitle(
         "Clean vs availability-shortcut training: forward L1D behavior and loss\n"
-        f"Small TrashNet, IID, SimpleCNN, batch size 16; mean across {device_count} device(s)",
+        f"Small TrashNet, IID, SimpleCNN, batch size 16; mean across {device_count} device(s)\n"
+        f"perf-scaled counts; complete batches require every event interval >= "
+        f"{minimum_running_pct:g}% running",
         y=0.992,
         fontsize=13,
     )
@@ -337,7 +410,7 @@ def main() -> None:
     frames = []
     selected_rows = []
     for (device, method), run in sorted(runs.items()):
-        frame = load_batch_data(run)
+        frame = load_batch_data(run, args.minimum_running_pct)
         frames.append(frame)
         selected_rows.append(
             {
@@ -347,6 +420,10 @@ def main() -> None:
                 "perf_path": run["perf_path"],
                 "metrics_path": run["metrics_path"],
                 "joined_batches": len(frame),
+                "reliable_instruction_batches": int(frame["instructions_reliable"].sum()),
+                "reliable_l1d_batches": int(frame["l1d_accesses_reliable"].sum()),
+                "jointly_reliable_batches": int(frame["jointly_reliable"].sum()),
+                "minimum_running_pct": args.minimum_running_pct,
             }
         )
 
@@ -357,7 +434,7 @@ def main() -> None:
     summary.to_csv(output_dir / "forward_batch_cache_vs_loss_summary.csv", index=False)
     pd.DataFrame(selected_rows).to_csv(output_dir / "selected_runs.csv", index=False)
     output_path = output_dir / "forward_batch_cache_vs_loss.png"
-    plot(data, summary, output_path, args.dpi)
+    plot(data, summary, output_path, args.dpi, args.minimum_running_pct)
 
     batches_per_epoch = (
         data.groupby(["device_id", "method", "epoch"])["batch_idx"]

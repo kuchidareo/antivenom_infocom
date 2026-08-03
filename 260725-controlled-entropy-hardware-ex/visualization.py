@@ -23,10 +23,13 @@ from matplotlib.ticker import ScalarFormatter
 
 
 REGIMES = ("low", "mid", "high")
-OPERATORS = ("relu", "maxpool")
+OPERATORS = ("relu", "maxpool", "conv")
 TEMPORALS = ("stable", "changing")
 COLORS = {"low": "#2878B5", "mid": "#E07A1F", "high": "#C23B4A"}
 PANEL_COLORS = {"stable": "#2878B5", "changing": "#C23B4A"}
+OPERATOR_COLORS = {"relu": "#2878B5", "maxpool": "#C23B4A", "conv": "#2F855A"}
+OPERATOR_MARKERS = {"relu": "o", "maxpool": "s", "conv": "^"}
+OPERATOR_LABELS = {"relu": "ReLU", "maxpool": "MaxPool", "conv": "Conv2D"}
 
 PERF_METADATA_COLUMNS = {
     "perf_pid",
@@ -92,6 +95,16 @@ ENTROPY_METRICS = (
     "entropy_input_channel_flip_rate",
     "entropy_input_nchw_memory_flip_rate",
     "entropy_input_conv3x3_patch_flip_rate",
+    "entropy_conv_patch_active_count_std",
+    "entropy_conv_patch_active_count_entropy_bits",
+    "entropy_conv_exact_patch_entropy_bits",
+    "entropy_conv_exact_patch_unique_fraction",
+    "entropy_conv_exact_patch_collision_probability",
+    "entropy_conv_duplicate_patch_occurrence_fraction",
+    "entropy_conv_adjacent_exact_patch_same_fraction",
+    "entropy_conv_adjacent_patch_jaccard",
+    "entropy_conv_patch_stream_conditional_entropy_bits",
+    "entropy_conv_patch_stream_flip_rate",
 )
 
 ENTROPY_LABELS = {
@@ -106,6 +119,16 @@ ENTROPY_LABELS = {
     "entropy_input_channel_flip_rate": "Channel flip rate",
     "entropy_input_nchw_memory_flip_rate": "NCHW flip rate",
     "entropy_input_conv3x3_patch_flip_rate": "3x3 patch flip rate",
+    "entropy_conv_patch_active_count_std": "Conv patch active-count SD",
+    "entropy_conv_patch_active_count_entropy_bits": "Conv patch active-count entropy (bits)",
+    "entropy_conv_exact_patch_entropy_bits": "Exact Conv patch entropy (bits)",
+    "entropy_conv_exact_patch_unique_fraction": "Unique Conv patch fraction",
+    "entropy_conv_exact_patch_collision_probability": "Exact Conv patch collision probability",
+    "entropy_conv_duplicate_patch_occurrence_fraction": "Duplicate Conv patch occurrence fraction",
+    "entropy_conv_adjacent_exact_patch_same_fraction": "Adjacent exact Conv patch match fraction",
+    "entropy_conv_adjacent_patch_jaccard": "Adjacent Conv patch Jaccard",
+    "entropy_conv_patch_stream_conditional_entropy_bits": "Conv patch-stream entropy (bits)",
+    "entropy_conv_patch_stream_flip_rate": "Conv patch-stream flip rate",
 }
 
 
@@ -187,6 +210,10 @@ def load_runs(input_dir: Path) -> pd.DataFrame:
                 "activation_rate": config["activation_rate"],
                 "pool_size": config["pool_size"],
                 "pool_stride": config["pool_stride"],
+                "conv_out_channels": config.get("conv_out_channels", 64),
+                "conv_kernel_size": config.get("conv_kernel_size", 3),
+                "conv_stride": config.get("conv_stride", 1),
+                "conv_padding": config.get("conv_padding", 1),
                 "bank_size": 1 if config["temporal"] == "stable" else config["bank_size"],
                 "warmup": config["warmup"],
                 "repeats": config["repeats"],
@@ -326,7 +353,7 @@ def plot_metric_grid(
     panels = [(operator, temporal) for operator in OPERATORS for temporal in TEMPORALS]
     figure, axes = plt.subplots(
         len(metrics), len(panels),
-        figsize=(15, max(3.2, 2.35 * len(metrics))),
+        figsize=(4.0 * len(panels), max(3.2, 2.35 * len(metrics))),
         squeeze=False,
         constrained_layout=True,
     )
@@ -336,7 +363,7 @@ def plot_metric_grid(
             plot_condition_panel(axis, frame, metric, operator, temporal)
             if row_index == 0:
                 axis.set_title(
-                    f"{operator.upper() if operator == 'relu' else 'MaxPool'} | {temporal.title()}",
+                    f"{OPERATOR_LABELS[operator]} | {temporal.title()}",
                     fontsize=10,
                 )
             if column_index == 0:
@@ -382,7 +409,9 @@ def plot_entropy(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
         for column_index, temporal in enumerate(TEMPORALS):
             axis = axes[row_index, column_index]
             subset = frame[frame["temporal"] == temporal]
-            for operator, marker in (("relu", "o"), ("maxpool", "s")):
+            for operator in OPERATORS:
+                marker = OPERATOR_MARKERS[operator]
+                color = OPERATOR_COLORS[operator]
                 means = []
                 deviations = []
                 for x_index, regime in enumerate(REGIMES):
@@ -403,7 +432,7 @@ def plot_entropy(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
                         )
                         axis.scatter(
                             x_index + np.asarray(jitter), values, marker=marker,
-                            color="#2878B5" if operator == "relu" else "#C23B4A",
+                            color=color,
                             s=20, alpha=0.45, linewidths=0, zorder=3,
                         )
                 means_array = np.asarray(means)
@@ -411,19 +440,19 @@ def plot_entropy(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
                 x_values = np.arange(len(REGIMES))
                 axis.plot(
                     x_values, means_array, marker=marker, markersize=4,
-                    linewidth=1.25, color="#2878B5" if operator == "relu" else "#C23B4A",
-                    label="ReLU" if operator == "relu" else "MaxPool",
+                    linewidth=1.25, color=color,
+                    label=OPERATOR_LABELS[operator],
                 )
                 axis.errorbar(
                     x_values, means_array, yerr=deviations_array, fmt="none",
-                    ecolor="#2878B5" if operator == "relu" else "#C23B4A",
+                    ecolor=color,
                     elinewidth=0.9, capsize=3, capthick=0.9,
                 )
                 if np.any(deviations_array > 0):
                     axis.fill_between(
                         x_values, means_array - deviations_array,
                         means_array + deviations_array,
-                        color="#2878B5" if operator == "relu" else "#C23B4A",
+                        color=color,
                         alpha=0.10, linewidth=0,
                     )
             axis.set_xticks(range(len(REGIMES)), [item.title() for item in REGIMES])
@@ -443,7 +472,10 @@ def plot_entropy(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
 def plot_runtime(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
     metrics = ("elapsed_seconds", "nanoseconds_per_call")
     labels = ("Replay elapsed time (s)", "Nanoseconds / operator call")
-    figure, axes = plt.subplots(2, 2, figsize=(9, 6.5), squeeze=False, constrained_layout=True)
+    figure, axes = plt.subplots(
+        2, len(OPERATORS), figsize=(4.5 * len(OPERATORS), 6.5),
+        squeeze=False, constrained_layout=True,
+    )
     for row_index, (metric, label) in enumerate(zip(metrics, labels)):
         for column_index, operator in enumerate(OPERATORS):
             axis = axes[row_index, column_index]
@@ -493,7 +525,7 @@ def plot_runtime(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
             axis.set_xticks(range(len(REGIMES)), [item.title() for item in REGIMES])
             style_axis(axis)
             if row_index == 0:
-                axis.set_title("ReLU" if operator == "relu" else "MaxPool", fontsize=10)
+                axis.set_title(OPERATOR_LABELS[operator], fontsize=10)
             if column_index == 0:
                 axis.set_ylabel(label, fontsize=9)
             axis.legend(frameon=False, fontsize=8)
@@ -505,14 +537,20 @@ def plot_runtime(frame: pd.DataFrame, output_path: Path, dpi: int) -> None:
 def validate_configuration(frame: pd.DataFrame, device_id: str) -> None:
     columns = [
         "batch_size", "channels", "height", "width", "activation_rate",
-        "pool_size", "pool_stride", "warmup", "repeats", "threads",
+        "pool_size", "pool_stride", "conv_out_channels", "conv_kernel_size",
+        "conv_stride", "conv_padding", "warmup", "repeats", "threads",
     ]
-    varying = [column for column in columns if frame[column].nunique(dropna=False) > 1]
-    if varying:
-        raise ValueError(
-            f"Device {device_id} has mixed controlled configurations in: "
-            f"{', '.join(varying)}. Use a separate input directory for each configuration."
-        )
+    for operator, subset in frame.groupby("operator", observed=True):
+        varying = [
+            column for column in columns
+            if subset[column].nunique(dropna=False) > 1
+        ]
+        if varying:
+            raise ValueError(
+                f"Device {device_id}, operator {operator} has mixed controlled "
+                f"configurations in: {', '.join(varying)}. Use a separate input "
+                "directory for each configuration."
+            )
 
 
 def render_device(
