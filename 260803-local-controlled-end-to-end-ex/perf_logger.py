@@ -36,16 +36,49 @@ from experiment_config import CONDITION_COLUMNS
 DEFAULT_PERF_EVENTS = [
     "cycles",
     "instructions",
-    "branches",
-    "branch-misses",
+    "branch-loads",
+    "branch-load-misses",
     "L1-dcache-loads",
     "L1-dcache-load-misses",
 ]
+PERF_EVENT_PRESETS = {
+    "basic": list(DEFAULT_PERF_EVENTS),
+    "translation": [
+        "arm_l1i_cache_access",
+        "arm_l1i_cache_refill",
+        "arm_itlb_access",
+        "arm_itlb_refill",
+        "arm_dtlb_load_refill",
+        "arm_ld_spec",
+    ],
+    "translation_x86": [
+        "instructions",
+        "iTLB-load-misses",
+        "dTLB-load-misses",
+        "L1-icache-load-misses",
+        "mem_inst_retired.all_loads",
+    ],
+    "dtlb_x86": [
+        "dTLB-loads",
+        "dTLB-load-misses",
+        "dTLB-stores",
+        "dTLB-store-misses",
+    ],
+    "dtlb_jetson": [
+        "dTLB-loads",
+        "dTLB-load-misses",
+    ],
+    "dtlb_rpi": [
+        "dTLB-load-misses",
+        "dTLB-store-misses",
+    ],
+}
 MAX_PERF_EVENTS = 6
 
 PERF_TYPE_HARDWARE = 0
 PERF_TYPE_SOFTWARE = 1
 PERF_TYPE_HW_CACHE = 3
+PERF_TYPE_RAW = 4
 PERF_FORMAT_TOTAL_TIME_ENABLED = 1 << 0
 PERF_FORMAT_TOTAL_TIME_RUNNING = 1 << 1
 PERF_FLAG_FD_CLOEXEC = 1 << 3
@@ -127,6 +160,20 @@ GENERIC_PERF_EVENT_SPECS = {
     "L1-dcache-load-misses": (PERF_TYPE_HW_CACHE, 1 << 16),
     "L1-dcache-stores": (PERF_TYPE_HW_CACHE, 1 << 8),
     "L1-dcache-store-misses": (PERF_TYPE_HW_CACHE, (1 << 8) | (1 << 16)),
+    "dTLB-loads": (PERF_TYPE_HW_CACHE, 3),
+    "dTLB-load-misses": (PERF_TYPE_HW_CACHE, 3 | (1 << 16)),
+    "dTLB-stores": (PERF_TYPE_HW_CACHE, 3 | (1 << 8)),
+    "dTLB-store-misses": (PERF_TYPE_HW_CACHE, 3 | (1 << 8) | (1 << 16)),
+}
+
+# Arm PMUv3 architectural/common event numbers. Meaningful only on Arm CPUs.
+ARM_RAW_PERF_EVENT_CONFIGS = {
+    "arm_l1i_cache_access": 0x14,
+    "arm_l1i_cache_refill": 0x01,
+    "arm_itlb_access": 0x26,
+    "arm_itlb_refill": 0x02,
+    "arm_dtlb_load_refill": 0x2D,
+    "arm_ld_spec": 0x70,
 }
 
 
@@ -144,6 +191,14 @@ def parse_perf_events(value: str) -> List[str]:
     if len(set(events)) != len(events):
         raise ValueError("Perf event names must be unique.")
     return events
+
+
+def perf_events_for_preset(preset: str) -> List[str]:
+    try:
+        return list(PERF_EVENT_PRESETS[preset])
+    except KeyError as exc:
+        choices = ", ".join(sorted(PERF_EVENT_PRESETS))
+        raise ValueError(f"Unknown perf preset {preset!r}; choose from: {choices}.") from exc
 
 
 def _perf_event_open_syscall_number() -> int:
@@ -169,6 +224,15 @@ def resolve_perf_event_spec(event: str, perf_binary: str = "perf") -> PerfEventS
     generic = GENERIC_PERF_EVENT_SPECS.get(event)
     if generic is not None:
         return PerfEventSpec(event, *generic)
+
+    arm_config = ARM_RAW_PERF_EVENT_CONFIGS.get(event)
+    if arm_config is not None:
+        machine = platform.machine().lower()
+        if machine not in {"aarch64", "arm64", "armv8l", "armv7l"}:
+            raise ValueError(
+                f"Perf event {event!r} is Arm-specific and cannot be used on {machine}."
+            )
+        return PerfEventSpec(event, PERF_TYPE_RAW, arm_config)
 
     if shutil.which(perf_binary) is None:
         raise FileNotFoundError(f"perf binary not found: {perf_binary}")
@@ -396,6 +460,7 @@ class LayerPerfLogger:
         pid: Optional[int] = None,
         perf_binary: str = "perf",
         strict_batch_layers: bool = True,
+        observer: Any = None,
     ) -> None:
         self.model = model
         self.path = Path(path)
@@ -404,6 +469,7 @@ class LayerPerfLogger:
         self.pid = int(pid or os.getpid())
         self.perf_binary = perf_binary
         self.strict_batch_layers = strict_batch_layers
+        self.observer = observer
         self.columns = [*BASE_COLUMNS, *_event_columns(self.events)]
         self.leaf_modules: List[Tuple[str, torch.nn.Module]] = [
             (name, module)
@@ -476,6 +542,8 @@ class LayerPerfLogger:
                 self._file.close()
                 self._file = None
                 self._writer = None
+            if self.observer is not None:
+                self.observer.close()
 
     def begin_batch(self, *, epoch: int, batch_idx: int, round_id: Any = 0) -> None:
         with self._lock:
@@ -486,6 +554,8 @@ class LayerPerfLogger:
             self._phase_order = {"forward": 0, "backward": 0}
             self._invocations = {}
             self._batch_active = True
+            if self.observer is not None:
+                self.observer.begin_batch(epoch=epoch, batch_idx=batch_idx, round_id=round_id)
 
     def flush_batch(self) -> None:
         with self._lock:
@@ -503,6 +573,8 @@ class LayerPerfLogger:
                     "Incomplete layer PMU batch: "
                     f"expected {expected} forward and backward rows, got {counts}."
                 )
+            if self.observer is not None:
+                self.observer.end_batch()
             assert self._writer is not None and self._file is not None
             self._writer.writerows(self._pending_rows)
             self._file.flush()
@@ -513,6 +585,8 @@ class LayerPerfLogger:
             if self._active_region is not None:
                 self._disable_groups()
                 self._active_region = None
+            if self.observer is not None:
+                self.observer.abort_batch()
             self._clear_batch()
 
     def _clear_batch(self) -> None:
@@ -554,6 +628,17 @@ class LayerPerfLogger:
         context["output_dtype"] = _tensor_dtype(output)
         self._pending_rows.append(self._end_region(context))
 
+        if self.observer is not None:
+            self.observer.capture_forward(
+                module=module,
+                layer_index=context["layer_index"],
+                layer_name=context["layer_name"],
+                layer_type=context["layer_type"],
+                invocation_index=context["invocation_index"],
+                inputs=inputs,
+                output=output,
+            )
+
         output_tensor = _first_tensor(output)
         node = None if output_tensor is None else output_tensor.grad_fn
         if node is None:
@@ -583,6 +668,12 @@ class LayerPerfLogger:
             grad_inputs: Tuple[Any, ...], grad_outputs: Tuple[Any, ...]
         ) -> Tuple[Any, ...]:
             self._pending_rows.append(self._end_region(dict(self._active_region or {})))
+            if self.observer is not None:
+                self.observer.capture_backward(
+                    layer_index=backward_context["layer_index"],
+                    invocation_index=backward_context["invocation_index"],
+                    grad_outputs=grad_outputs,
+                )
             return grad_inputs
 
         self._node_handles.append(node.register_prehook(backward_pre_hook))
@@ -702,9 +793,14 @@ class LayerPerfLogger:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate direct layer perf events.")
     parser.add_argument("--check-events", default=",".join(DEFAULT_PERF_EVENTS))
+    parser.add_argument("--check-preset", choices=sorted(PERF_EVENT_PRESETS))
     parser.add_argument("--perf-binary", default="perf")
     args = parser.parse_args()
-    events = parse_perf_events(args.check_events)
+    events = (
+        perf_events_for_preset(args.check_preset)
+        if args.check_preset
+        else parse_perf_events(args.check_events)
+    )
     validate_perf_events(events, args.perf_binary)
     print(f"perf events ok ({len(events)}): {','.join(events)}")
 

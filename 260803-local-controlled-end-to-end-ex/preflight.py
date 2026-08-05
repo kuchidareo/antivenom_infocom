@@ -1,7 +1,10 @@
 import argparse
+import csv
+import json
 import math
+from pathlib import Path
 
-from dataset_preparation import get_dataloader, get_num_classes
+from dataset_preparation import dataset_slug, get_dataloader, get_num_classes
 from models import get_model
 from perf_logger import DEFAULT_PERF_EVENTS, parse_perf_events, validate_perf_events
 
@@ -20,7 +23,13 @@ def main() -> None:
     validate_perf_events(events)
 
     results = {}
-    for profile in ("baseline", "strong"):
+    loader_scenarios = (
+        ("baseline", "baseline", "clean"),
+        ("moderate_augmentation", "moderate", "clean"),
+        ("strong_augmentation", "strong", "clean"),
+        ("availability_shortcuts", "baseline", "availability_shortcuts"),
+    )
+    for scenario, profile, poisoning_method in loader_scenarios:
         augment = {
             "enabled": True,
             "_profile": profile,
@@ -32,7 +41,7 @@ def main() -> None:
             data_dir=args.data_dir,
             dataset_name=args.dataset,
             client_id=args.client_id,
-            poisoning_method="clean",
+            poisoning_method=poisoning_method,
             split="train",
             augment=augment,
             batch_size=args.batch_size,
@@ -42,10 +51,36 @@ def main() -> None:
         batch_count = math.ceil(sample_count / args.batch_size)
         images, labels = next(iter(loader))
         if tuple(images.shape[1:]) != (3, 32, 32):
-            raise ValueError(f"Unexpected {profile} input shape: {tuple(images.shape)}")
+            raise ValueError(f"Unexpected {scenario} input shape: {tuple(images.shape)}")
         if images.shape[0] != labels.shape[0]:
-            raise ValueError(f"Image/label batch mismatch for profile={profile}.")
-        results[profile] = (sample_count, batch_count)
+            raise ValueError(f"Image/label batch mismatch for scenario={scenario}.")
+        results[scenario] = (sample_count, batch_count)
+
+    root = Path(args.data_dir) / dataset_slug(args.dataset)
+    metadata_path = root / "partition_metadata.csv"
+    with metadata_path.open(newline="") as file:
+        metadata_rows = list(csv.DictReader(file))
+    clean_records = [
+        row
+        for row in metadata_rows
+        if row.get("client_id") == args.client_id
+        and row.get("dataset_split") == "train"
+        and row.get("partition_method", "iid") == "iid"
+        and row.get("poisoning_method") == "clean"
+    ]
+    plan_path = root / "poisoned" / "badsampling" / args.client_id / "sampling_plan.json"
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"BadSampler plan is missing: {plan_path}")
+    plan = json.loads(plan_path.read_text())
+    candidate_count = len(plan.get("candidates", []))
+    if candidate_count != len(clean_records):
+        raise ValueError(
+            f"BadSampler candidates={candidate_count}, clean records={len(clean_records)}"
+        )
+    results["badsampler"] = (
+        len(clean_records),
+        math.ceil(len(clean_records) / args.batch_size),
+    )
 
     if args.expected_batches > 0:
         unexpected = {
@@ -70,8 +105,8 @@ def main() -> None:
         raise ValueError(f"Expected 15 SimpleCNN leaf modules, got {len(leaves)}: {leaves}")
 
     print(f"perf_events={','.join(events)}")
-    for profile, (samples, batches) in results.items():
-        print(f"profile={profile} samples={samples} batches={batches}")
+    for scenario, (samples, batches) in results.items():
+        print(f"scenario={scenario} samples={samples} batches={batches}")
     print(f"leaf_layers={len(leaves)} names={','.join(leaves)}")
 
 

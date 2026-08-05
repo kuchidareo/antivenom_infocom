@@ -31,6 +31,7 @@ from experiment_config import (
     set_all_seeds,
     yyyymmddhhmmss_log_path,
 )
+from entropy_logger import LayerEntropyLogger
 from metrics_logger import MetricsLogger
 from models import get_model
 from perf_logger import DEFAULT_PERF_EVENTS, LayerPerfLogger, parse_perf_events
@@ -93,14 +94,19 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
         target_pam_mb=args.model_target_pam_mb,
         pam_calibration_steps=args.model_pam_calibration_steps,
     )
+    initial_model_state = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+    }
     checkpoint_path = (
         Path(args.checkpoint_path)
         if args.checkpoint_path
         else Path(args.log_dir) / f"{args.trial_id}_final_model.pt"
     )
     args.checkpoint_path = str(checkpoint_path)
+    checkpoint_payload = None
     if args.experiment_mode == "frozen_replay":
-        load_checkpoint(
+        checkpoint_payload = load_checkpoint(
             model=model,
             path=checkpoint_path,
             expected_model=args.model,
@@ -113,11 +119,18 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     )
     args.resolved_model_estimated_pam_mb = model_metadata.get("model_estimated_pam_mb", "")
     args.resolved_model_parameter_count = model_metadata.get("model_parameter_count", "")
-    surrogate_model = (
-        copy.deepcopy(model)
-        if poisoning_method == POISONING_METHOD_BADSAMPLING
-        else None
-    )
+    surrogate_model = None
+    if poisoning_method == POISONING_METHOD_BADSAMPLING:
+        surrogate_model = copy.deepcopy(model)
+        sampling_state = initial_model_state
+        if args.experiment_mode == "frozen_replay":
+            assert checkpoint_payload is not None
+            sampling_state = checkpoint_payload.get("sampling_surrogate_state_dict")
+            if sampling_state is None:
+                raise ValueError(
+                    "BadSampler checkpoint is missing its initial sampling surrogate state."
+                )
+        surrogate_model.load_state_dict(sampling_state, strict=True)
     train_loader = get_dataloader(
         data_dir=args.data_dir,
         dataset_name=args.dataset,
@@ -173,17 +186,23 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     metrics_path = layer_perf_path.with_name(
         layer_perf_path.name.replace("_layer_perf.csv", "_metrics.csv")
     )
+    entropy_path = layer_perf_path.with_name(
+        layer_perf_path.name.replace("_layer_perf.csv", "_entropy_summary.csv")
+    )
     metrics_logger = MetricsLogger(path=metrics_path, condition=condition)
     events = parse_perf_events(args.perf_events)
+    entropy_logger = LayerEntropyLogger(path=entropy_path, condition=condition)
     with LayerPerfLogger(
         model=model,
         path=layer_perf_path,
         condition=condition,
         events=events,
+        observer=entropy_logger,
     ) as layer_perf_logger:
         print(
             f"layer_perf={layer_perf_path} leaf_layers={len(layer_perf_logger.leaf_modules)} "
             f"rows_per_batch={layer_perf_logger.expected_rows_per_batch} "
+            f"entropy_summary={entropy_path} "
             f"torch_threads={torch.get_num_threads()} "
             f"torch_interop_threads={torch.get_num_interop_threads()}"
         )
@@ -245,6 +264,11 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
             num_classes=num_classes,
             input_size=input_size,
             condition=condition,
+            sampling_surrogate_state=(
+                initial_model_state
+                if poisoning_method == POISONING_METHOD_BADSAMPLING
+                else None
+            ),
         )
         print(f"saved_final_model={checkpoint_path}")
     return str(layer_perf_path)
@@ -258,6 +282,7 @@ def save_checkpoint(
     num_classes: int,
     input_size: tuple[int, int],
     condition: dict,
+    sampling_surrogate_state: dict | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -268,6 +293,7 @@ def save_checkpoint(
             "input_size": list(input_size),
             "state_dict": model.state_dict(),
             "condition": condition,
+            "sampling_surrogate_state_dict": sampling_surrogate_state,
         },
         path,
     )
@@ -280,7 +306,7 @@ def load_checkpoint(
     expected_model: str,
     expected_num_classes: int,
     expected_input_size: tuple[int, int],
-) -> None:
+) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Frozen replay checkpoint is missing: {path}")
     try:
@@ -296,6 +322,7 @@ def load_checkpoint(
     if tuple(payload.get("input_size", ())) != expected_input_size:
         raise ValueError("Checkpoint input size does not match the current augmentation.")
     model.load_state_dict(payload["state_dict"], strict=True)
+    return payload
 
 
 def warm_up_cpu_workers(
