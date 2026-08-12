@@ -39,9 +39,10 @@ X86_TRANSLATION_PERF_EVENTS="instructions,iTLB-load-misses,dTLB-load-misses,L1-i
 X86_DTLB_PERF_EVENTS="dTLB-loads,dTLB-load-misses,dTLB-stores,dTLB-store-misses"
 JETSON_DTLB_PERF_EVENTS="dTLB-loads,dTLB-load-misses"
 RPI_DTLB_PERF_EVENTS="dTLB-load-misses,dTLB-store-misses"
+MARKOV_PERF_EVENTS="cycles,instructions,branch-loads,branch-load-misses,L1-dcache-loads,L1-dcache-load-misses"
 
 case "$PERF_PRESET" in
-  basic|translation|dtlb) ;;
+  basic|translation|dtlb|markov) ;;
   custom)
     [[ -n "$PERF_EVENTS_OVERRIDE" ]] || {
       print -u2 "PERF_PRESET=custom requires PERF_EVENTS with at most six events."
@@ -49,7 +50,7 @@ case "$PERF_PRESET" in
     }
     ;;
   *)
-    print -u2 "Unknown PERF_PRESET=${PERF_PRESET}; use basic, translation, dtlb, or custom."
+    print -u2 "Unknown PERF_PRESET=${PERF_PRESET}; use basic, translation, dtlb, markov, or custom."
     exit 2
     ;;
 esac
@@ -60,6 +61,8 @@ select_perf_events_for_target() {
     PERF_EVENTS="$PERF_EVENTS_OVERRIDE"
   elif [[ "$PERF_PRESET" == basic ]]; then
     PERF_EVENTS="$BASIC_PERF_EVENTS"
+  elif [[ "$PERF_PRESET" == markov ]]; then
+    PERF_EVENTS="$MARKOV_PERF_EVENTS"
   elif [[ "$PERF_PRESET" == translation ]]; then
     if [[ "$target" == local ]]; then
       PERF_EVENTS="$X86_TRANSLATION_PERF_EVENTS"
@@ -105,6 +108,7 @@ PMU presets:
   PERF_PRESET=basic ./run_experiment.zsh all
   PERF_PRESET=translation ./run_experiment.zsh all
   PERF_PRESET=dtlb ./run_experiment.zsh all
+  PERF_PRESET=markov ./run_experiment.zsh all
   PERF_PRESET=custom PERF_EVENTS=e1,e2,... ./run_experiment.zsh all
 
 `all` runs local, Raspberry Pi 4 (.112), and Jetson CPU (.141) concurrently.
@@ -119,6 +123,8 @@ The translation preset uses architecture-specific event encodings: Arm PMUv3
 events on rpi112/jetson141 and supported Intel equivalents on local x86.
 The dtlb preset uses load/store access and miss events on local x86, load
 access/miss events on jetson141, and load/store miss events on rpi112.
+The markov preset uses one PyTorch thread and instruments only MaxPool2d layers.
+It records per-batch position-aware comparison entropy and branch PMU counters.
 EOF
 }
 
@@ -267,7 +273,11 @@ run_command() {
     --experiment-id "layer_e2e_${RUN_TIMESTAMP}_${target}_${PERF_PRESET}_${scenario}_${experiment_mode}"
     --augment "$augment"
     --perf-events "$PERF_EVENTS"
+    --torch-threads "$TORCH_THREADS"
   )
+  if [[ "$PERF_PRESET" == markov ]]; then
+    command+=(--maxpool-markov-only)
+  fi
   print -r -- "${(q)command[@]}"
 }
 
@@ -368,6 +378,11 @@ run_all() {
 }
 
 ACTION="${1:-all}"
+if [[ "$PERF_PRESET" == markov ]]; then
+  TORCH_THREADS="${TORCH_THREADS:-1}"
+else
+  TORCH_THREADS="${TORCH_THREADS:-0}"
+fi
 print "PMU preset: ${PERF_PRESET}"
 if [[ -n "$PERF_EVENTS_OVERRIDE" ]]; then
   print "PMU event override: ${PERF_EVENTS_OVERRIDE}"
@@ -375,6 +390,9 @@ elif [[ "$PERF_PRESET" == translation ]]; then
   print "PMU events: architecture-specific Arm and Intel translation sets"
 elif [[ "$PERF_PRESET" == dtlb ]]; then
   print "PMU events: architecture-specific dTLB sets"
+elif [[ "$PERF_PRESET" == markov ]]; then
+  print "PMU events: ${MARKOV_PERF_EVENTS}"
+  print "MaxPool Markov mode: torch_threads=${TORCH_THREADS}, MaxPool2d layers only"
 else
   print "PMU events: ${BASIC_PERF_EVENTS}"
 fi

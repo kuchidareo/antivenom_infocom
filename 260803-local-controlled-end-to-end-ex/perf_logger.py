@@ -461,6 +461,7 @@ class LayerPerfLogger:
         perf_binary: str = "perf",
         strict_batch_layers: bool = True,
         observer: Any = None,
+        module_types: Optional[Tuple[type, ...]] = None,
     ) -> None:
         self.model = model
         self.path = Path(path)
@@ -470,17 +471,29 @@ class LayerPerfLogger:
         self.perf_binary = perf_binary
         self.strict_batch_layers = strict_batch_layers
         self.observer = observer
+        self.module_types = module_types
         self.columns = [*BASE_COLUMNS, *_event_columns(self.events)]
-        self.leaf_modules: List[Tuple[str, torch.nn.Module]] = [
+        all_leaf_modules: List[Tuple[str, torch.nn.Module]] = [
             (name, module)
             for name, module in model.named_modules()
             if name and not any(module.children())
         ]
+        selected_leaf_modules = [
+            (index, name, module)
+            for index, (name, module) in enumerate(all_leaf_modules)
+            if self.module_types is None or isinstance(module, self.module_types)
+        ]
+        self.leaf_modules = [
+            (name, module) for _, name, module in selected_leaf_modules
+        ]
         if not self.leaf_modules:
-            raise ValueError("The model does not contain any named leaf modules.")
+            requested = "all leaf types" if self.module_types is None else self.module_types
+            raise ValueError(
+                f"The model does not contain named leaf modules matching {requested}."
+            )
         self._layer_by_module = {
             module: (index, name, type(module).__name__)
-            for index, (name, module) in enumerate(self.leaf_modules)
+            for index, name, module in selected_leaf_modules
         }
         self._specs: List[PerfEventSpec] = []
         self._groups: List[CounterGroup] = []

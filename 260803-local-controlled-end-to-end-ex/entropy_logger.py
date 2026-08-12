@@ -1,4 +1,4 @@
-"""Epoch-level activation and activation-gradient entropy summaries.
+"""Layer entropy summaries and batch-level MaxPool Markov measurements.
 
 Tensor references are captured at layer boundaries, but entropy is calculated
 only after the complete forward/backward PMU batch has finished. This keeps the
@@ -39,6 +39,33 @@ SUMMARY_COLUMNS = [
     "batches",
 ]
 
+MAXPOOL_MARKOV_COLUMNS = [
+    "timestamp",
+    "timestamp_unix",
+    *CONDITION_COLUMNS,
+    "condition",
+    "round",
+    "epoch",
+    "batch_idx",
+    "phase",
+    "layer_index",
+    "layer_name",
+    "layer_type",
+    "invocation_index",
+    "input_shape",
+    "windows",
+    "logical_comparisons",
+    "position_p1_b1",
+    "position_p1_b2",
+    "position_p1_b3",
+    "position_p1_b4",
+    "comparison_entropy_rate_bits",
+    "position_markov_entropy_rate_bits",
+    "position_markov_bayes_error_rate",
+    "position_only_entropy_rate_bits",
+    "position_only_bayes_error_rate",
+]
+
 
 @dataclass
 class RunningStatistics:
@@ -65,6 +92,7 @@ class ForwardRecord:
     layer_index: int
     layer_name: str
     layer_type: str
+    invocation_index: int
     input_tensor: torch.Tensor
     output_tensor: torch.Tensor
 
@@ -207,16 +235,160 @@ def maxpool_winner_metrics(x: torch.Tensor, pool: torch.nn.MaxPool2d) -> Dict[st
     }
 
 
+def _binary_entropy(probability: float) -> float:
+    if probability <= 0.0 or probability >= 1.0:
+        return 0.0
+    return -probability * math.log2(probability) - (1.0 - probability) * math.log2(
+        1.0 - probability
+    )
+
+
+@torch.no_grad()
+def _maxpool_comparison_outcomes(
+    x: torch.Tensor, pool: torch.nn.MaxPool2d
+) -> torch.Tensor:
+    """Return PyTorch NCHW scalar comparison outcomes as [windows, 4]."""
+    kernel = _pair(pool.kernel_size)
+    stride = _pair(pool.stride, fallback=pool.kernel_size)
+    padding = _pair(pool.padding)
+    dilation = _pair(pool.dilation)
+    if kernel != (2, 2) or stride != (2, 2):
+        raise ValueError(
+            "MaxPool Markov logging requires kernel_size=2 and stride=2; "
+            f"got kernel={kernel}, stride={stride}."
+        )
+    if padding != (0, 0) or dilation != (1, 1) or pool.ceil_mode:
+        raise ValueError(
+            "MaxPool Markov logging requires padding=0, dilation=1, ceil_mode=False."
+        )
+    tensor = x.detach()
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected NCHW MaxPool input, got shape={tuple(tensor.shape)}")
+    if not tensor.is_contiguous(memory_format=torch.contiguous_format):
+        raise ValueError("MaxPool Markov logging requires contiguous NCHW input.")
+    if not bool(torch.isfinite(tensor).all().item()):
+        raise ValueError("MaxPool Markov logging requires finite input values.")
+
+    batch, channels = tensor.shape[:2]
+    patches = F.unfold(
+        tensor,
+        kernel_size=pool.kernel_size,
+        dilation=pool.dilation,
+        padding=pool.padding,
+        stride=pool.stride,
+    )
+    output_positions = patches.shape[-1]
+    windows = (
+        patches.reshape(batch, channels, 4, output_positions)
+        .permute(0, 1, 3, 2)
+        .reshape(-1, 4)
+    )
+
+    outcomes = torch.empty_like(windows, dtype=torch.bool)
+    current_max = torch.full_like(windows[:, 0], -torch.inf)
+    for position in range(4):
+        take = windows[:, position] > current_max
+        outcomes[:, position] = take
+        current_max = torch.where(take, windows[:, position], current_max)
+    if not bool(outcomes[:, 0].all().item()):
+        raise RuntimeError("The first finite MaxPool comparison must always be taken.")
+    return outcomes
+
+
+@torch.no_grad()
+def maxpool_position_markov_metrics(
+    x: torch.Tensor, pool: torch.nn.MaxPool2d, laplace: float = 0.5
+) -> Dict[str, float]:
+    """Compute the same position-aware comparison metrics as the controlled test."""
+    outcomes = _maxpool_comparison_outcomes(x, pool)
+    if outcomes.shape[0] < 2:
+        raise ValueError("At least two MaxPool windows are required for Markov analysis.")
+
+    position_entropies = []
+    position_bayes_errors = []
+    position_only_entropies = []
+    position_only_bayes_errors = []
+    for position in range(4):
+        if position == 0:
+            previous = outcomes[:-1, 3]
+            current = outcomes[1:, 0]
+        else:
+            previous = outcomes[:, position - 1]
+            current = outcomes[:, position]
+        encoded = previous.long() * 2 + current.long()
+        counts = torch.bincount(encoded, minlength=4).reshape(2, 2).double()
+        probabilities = counts + laplace
+        probabilities /= probabilities.sum(dim=1, keepdim=True)
+        previous_probability = torch.bincount(
+            previous.long(), minlength=2
+        ).double()
+        previous_probability /= previous_probability.sum()
+
+        conditional = 0.0
+        bayes = 0.0
+        for state in range(2):
+            probability_one = float(probabilities[state, 1].item())
+            state_mass = float(previous_probability[state].item())
+            conditional += state_mass * _binary_entropy(probability_one)
+            bayes += state_mass * float(probabilities[state].min().item())
+        position_entropies.append(conditional)
+        position_bayes_errors.append(bayes)
+
+        marginal_one = float(current.double().mean().item())
+        position_only_entropies.append(_binary_entropy(marginal_one))
+        position_only_bayes_errors.append(min(marginal_one, 1.0 - marginal_one))
+
+    flat = outcomes.reshape(1, -1).long()
+    comparison_entropy = conditional_entropy(flat, 2)
+    position_p1 = outcomes.double().mean(dim=0).tolist()
+    return {
+        "windows": int(outcomes.shape[0]),
+        "logical_comparisons": int(outcomes.numel()),
+        "position_p1_b1": position_p1[0],
+        "position_p1_b2": position_p1[1],
+        "position_p1_b3": position_p1[2],
+        "position_p1_b4": position_p1[3],
+        "comparison_entropy_rate_bits": comparison_entropy,
+        "position_markov_entropy_rate_bits": float(
+            sum(position_entropies) / len(position_entropies)
+        ),
+        "position_markov_bayes_error_rate": float(
+            sum(position_bayes_errors) / len(position_bayes_errors)
+        ),
+        "position_only_entropy_rate_bits": float(
+            sum(position_only_entropies) / len(position_only_entropies)
+        ),
+        "position_only_bayes_error_rate": float(
+            sum(position_only_bayes_errors) / len(position_only_bayes_errors)
+        ),
+    }
+
+
 class LayerEntropyLogger:
     """Collect online epoch summaries for Conv, ReLU, and MaxPool tensors."""
 
-    def __init__(self, *, path: Path, condition: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        condition: Dict[str, Any],
+        maxpool_markov_only: bool = False,
+    ) -> None:
         self.path = Path(path)
+        if self.path.name.endswith("_entropy_summary.csv"):
+            batch_name = self.path.name.replace(
+                "_entropy_summary.csv", "_maxpool_markov.csv"
+            )
+        else:
+            batch_name = f"{self.path.stem}_maxpool_markov.csv"
+        self.maxpool_markov_path = self.path.with_name(batch_name)
         self.condition = dict(condition)
+        self.maxpool_markov_only = maxpool_markov_only
         self._batch_context: Dict[str, Any] = {}
         self._forward: Dict[Tuple[int, int], ForwardRecord] = {}
         self._gradients: Dict[Tuple[int, int], torch.Tensor] = {}
         self._statistics: Dict[Tuple[Any, ...], RunningStatistics] = {}
+        self._maxpool_markov_rows = []
         self._closed = False
 
     def begin_batch(self, *, epoch: int, batch_idx: int, round_id: Any = 0) -> None:
@@ -251,6 +423,7 @@ class LayerEntropyLogger:
             layer_index=layer_index,
             layer_name=layer_name,
             layer_type=layer_type,
+            invocation_index=invocation_index,
             input_tensor=input_tensor.detach(),
             output_tensor=output_tensor.detach(),
         )
@@ -274,35 +447,70 @@ class LayerEntropyLogger:
         for key in sorted(self._forward):
             record = self._forward[key]
             family = self._family(record.module)
-            output_metrics = zero_nonzero_rates(record.output_tensor)
-            self._update(record, family, "forward", "output_zero_rate", output_metrics["zero_rate"])
-            self._update(
-                record, family, "forward", "output_nonzero_rate", output_metrics["nonzero_rate"]
-            )
-            if isinstance(record.module, torch.nn.ReLU):
+            if not self.maxpool_markov_only:
+                output_metrics = zero_nonzero_rates(record.output_tensor)
                 self._update(
                     record,
                     family,
                     "forward",
-                    "mask_conditional_entropy_bits",
-                    binary_mask_conditional_entropy(record.output_tensor),
+                    "output_zero_rate",
+                    output_metrics["zero_rate"],
                 )
-            elif isinstance(record.module, torch.nn.Conv2d):
                 self._update(
                     record,
                     family,
                     "forward",
-                    "input_mask_conditional_entropy_bits",
-                    conv_input_conditional_entropy(record.input_tensor, record.module),
+                    "output_nonzero_rate",
+                    output_metrics["nonzero_rate"],
                 )
-            elif isinstance(record.module, torch.nn.MaxPool2d):
-                for metric, value in maxpool_winner_metrics(
+                if isinstance(record.module, torch.nn.ReLU):
+                    self._update(
+                        record,
+                        family,
+                        "forward",
+                        "mask_conditional_entropy_bits",
+                        binary_mask_conditional_entropy(record.output_tensor),
+                    )
+                elif isinstance(record.module, torch.nn.Conv2d):
+                    self._update(
+                        record,
+                        family,
+                        "forward",
+                        "input_mask_conditional_entropy_bits",
+                        conv_input_conditional_entropy(record.input_tensor, record.module),
+                    )
+                elif isinstance(record.module, torch.nn.MaxPool2d):
+                    for metric, value in maxpool_winner_metrics(
+                        record.input_tensor, record.module
+                    ).items():
+                        self._update(record, family, "forward", metric, value)
+            if isinstance(record.module, torch.nn.MaxPool2d):
+                markov_metrics = maxpool_position_markov_metrics(
                     record.input_tensor, record.module
-                ).items():
-                    self._update(record, family, "forward", metric, value)
+                )
+                for metric, value in markov_metrics.items():
+                    if metric not in {"windows", "logical_comparisons"}:
+                        self._update(record, family, "forward", metric, float(value))
+                now = datetime.now()
+                self._maxpool_markov_rows.append(
+                    {
+                        "timestamp": now.isoformat(timespec="microseconds"),
+                        "timestamp_unix": now.timestamp(),
+                        **self.condition,
+                        "condition": self.condition.get("scenario", ""),
+                        **self._batch_context,
+                        "phase": "forward",
+                        "layer_index": record.layer_index,
+                        "layer_name": record.layer_name,
+                        "layer_type": record.layer_type,
+                        "invocation_index": record.invocation_index,
+                        "input_shape": str(list(record.input_tensor.shape)),
+                        **markov_metrics,
+                    }
+                )
 
             gradient = self._gradients.get(key)
-            if gradient is not None:
+            if gradient is not None and not self.maxpool_markov_only:
                 gradient_metrics = binary_mask_metrics(gradient)
                 self._update(
                     record,
@@ -371,6 +579,16 @@ class LayerEntropyLogger:
                 }
                 writer.writerow(row)
         temporary.replace(self.path)
+        markov_temporary = self.maxpool_markov_path.with_suffix(
+            self.maxpool_markov_path.suffix + ".tmp"
+        )
+        with markov_temporary.open("w", newline="") as file:
+            writer = csv.DictWriter(
+                file, fieldnames=MAXPOOL_MARKOV_COLUMNS, extrasaction="ignore"
+            )
+            writer.writeheader()
+            writer.writerows(self._maxpool_markov_rows)
+        markov_temporary.replace(self.maxpool_markov_path)
         self._closed = True
 
     def _update(

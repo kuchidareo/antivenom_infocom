@@ -191,18 +191,24 @@ def run_one_local(args: argparse.Namespace, poisoning_method: str) -> str:
     )
     metrics_logger = MetricsLogger(path=metrics_path, condition=condition)
     events = parse_perf_events(args.perf_events)
-    entropy_logger = LayerEntropyLogger(path=entropy_path, condition=condition)
+    entropy_logger = LayerEntropyLogger(
+        path=entropy_path,
+        condition=condition,
+        maxpool_markov_only=args.maxpool_markov_only,
+    )
     with LayerPerfLogger(
         model=model,
         path=layer_perf_path,
         condition=condition,
         events=events,
         observer=entropy_logger,
+        module_types=(torch.nn.MaxPool2d,) if args.maxpool_markov_only else None,
     ) as layer_perf_logger:
         print(
             f"layer_perf={layer_perf_path} leaf_layers={len(layer_perf_logger.leaf_modules)} "
             f"rows_per_batch={layer_perf_logger.expected_rows_per_batch} "
             f"entropy_summary={entropy_path} "
+            f"maxpool_markov={entropy_logger.maxpool_markov_path} "
             f"torch_threads={torch.get_num_threads()} "
             f"torch_interop_threads={torch.get_num_interop_threads()}"
         )
@@ -358,8 +364,24 @@ def main() -> None:
             f"{','.join(DEFAULT_PERF_EVENTS)}"
         ),
     )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=0,
+        help="Set PyTorch intra-op threads; 0 keeps the environment default.",
+    )
+    parser.add_argument(
+        "--maxpool-markov-only",
+        action="store_true",
+        help="Instrument only MaxPool2d layers and write batch-level Markov metrics.",
+    )
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+
+    if args.torch_threads < 0:
+        parser.error("--torch-threads must be >= 0")
+    if args.torch_threads:
+        torch.set_num_threads(args.torch_threads)
 
     device = get_device_config(args.client_id)
     if not args.host:
